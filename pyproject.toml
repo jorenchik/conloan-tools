@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conloan-tools"
+version = "0.1.0"
+description = "Utilities for parsing and processing loanword datasets for NLP"
+readme = "README.md"
+requires-python = ">=3.8"
+# dependencies = [
+#     "transformers",
+#     "torch",
+# ]
+
+[project.scripts]
+conloan-parse = "src.conloan_tools.parse_conloan:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
