@@ -1,31 +1,45 @@
 
-# [build-system]
-# requires = ["setuptools>=61.0"]
-# build-backend = "setuptools.build_meta"
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "conloan-tools"
 version = "0.1.0"
 description = "Utilities for parsing and processing loanword datasets for NLP"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 dependencies = [
-    "transformers",
+    "transformers==5.1.0",
+    "torch",
+    "torchvision",
+    "markupsafe==2.1.5",
+    "requests",
+    "datasets", 
+    "pyarrow",
+    "accelerate",
+    "huggingface-hub",
+    "seqeval",
+    "protobuf",
 ]
 
 [project.optional-dependencies]
-# Selection by pip install -e ".[cpu]" or ".[gpu]"
-cpu = [
-    "torch --extra-index-url https://download.pytorch.org/whl/cpu"
-]
-gpu = [
+torch = [
     "torch",
-    "accelerate" 
+    "torchvision",
 ]
 
 [project.scripts]
-conloan-parse = "src.conloan_tools.parse_conloan:main"
+# NOTE: removed src.
+conloan-parse = "conloan_tools.parse_conloan:main"
+conloan-train = "conloan_tools.train_classifier:main"
+conloan-eval = "conloan_tools.eval_classifier:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+where = ["src"]
+include = ["conloan_tools"]
+
+[tool.setuptools]
+# Map the empty prefix to the "src" directory
+package-dir = {"" = "src"}
+
