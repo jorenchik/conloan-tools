@@ -21,6 +21,7 @@ dependencies = [
     "huggingface-hub",
     "seqeval",
     "protobuf",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +35,7 @@ torch = [
 conloan-parse = "conloan_tools.parse_conloan:main"
 conloan-train = "conloan_tools.train_classifier:main"
 conloan-eval = "conloan_tools.eval_classifier:main"
+wikt-extract = "conloan_tools.wiktionary.extract_entries:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
