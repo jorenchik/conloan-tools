@@ -22,6 +22,16 @@ dependencies = [
     "seqeval",
     "protobuf",
     "tqdm",
+    "click",
+    "xlsxwriter",
+    "openpyxl",
+
+    # NLP 
+    "stanza",
+
+    # OPUS MT
+    "sentencepiece",
+    "sacremoses",
 ]
 
 [project.optional-dependencies]
@@ -31,11 +41,7 @@ torch = [
 ]
 
 [project.scripts]
-# NOTE: removed src.
-conloan-parse = "conloan_tools.parse_conloan:main"
-conloan-train = "conloan_tools.train_classifier:main"
-conloan-eval = "conloan_tools.eval_classifier:main"
-wikt-extract = "conloan_tools.wiktionary.extract_entries:main"
+conloan = "conloan_tools.cli:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -45,3 +51,5 @@ include = ["conloan_tools"]
 # Map the empty prefix to the "src" directory
 package-dir = {"" = "src"}
 
+[tool.setuptools.package-data]
+"conloan_tools.wiktionary" = ["wiktionary_languages.csv"]
