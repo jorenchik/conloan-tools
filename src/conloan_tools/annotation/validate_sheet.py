@@ -8,28 +8,53 @@ def get_tag_stats(text: str, label: str) -> tuple[List[str], List[str]]:
     """Returns list of opening tags and list of errors regarding malformed tags."""
     if not isinstance(text, str) or pd.isna(text):
         return [], []
+
+    if "\n" in text or "\r" in text:
+        return [], [f"{label}: Sentence contains forbidden line breaks."]
     
     errors = []
-    # Find all opening and closing tags
     open_tags = re.findall(r"<([A-Z]+\d+)>", text)
-    close_tags = re.findall(r"</([A-Z]+\d+)>", text)
     
-    # 1. Structural check: Every opening tag must have a matching closing tag
-    if len(open_tags) != len(close_tags):
-        errors.append(f"{label}: Unbalanced tags (Open: {len(open_tags)}, Close: {len(close_tags)})")
-    
-    # 2. Correct nesting/closure check (simple sequence check)
-    all_tags = re.findall(r"</?([A-Z]+\d+)>", text)
-    stack = []
-    for tag_match in re.finditer(r"<(/?)([A-Z]+\d+)>", text):
+    # Find all tags including illegal ones (e.g., <UNK>) to detect malformed structures
+    stack = []  # Stores (tag_id, full_match_string)
+    for tag_match in re.finditer(r"<(/?)([A-Z]+\d*)>", text):
+        full_tag = tag_match.group(0)
         is_closing = tag_match.group(1) == "/"
         tag_id = tag_match.group(2)
+        # full_tag = tag_match.group(0)
+        # full_content = tag_match.group(1)
+        # is_closing = tag_match.group(1) == "/"
+        # is_closing = full_content.startswith("/")
+        # tag_id = full_content.lstrip("/")
+
         if not is_closing:
-            stack.append(tag_id)
+            if stack:
+                errors.append(f"{label}: Nested tags are forbidden (<{tag_id}> inside <{stack[-1]}>)")
+            stack.append((tag_id, tag_match.group(0)))
         else:
-            if not stack or stack.pop() != tag_id:
-                errors.append(f"{label}: Tag <{tag_id}> closed incorrectly or out of order.")
-                
+            if not stack:
+                errors.append(f"{label}: Closing tag </{tag_id}> has no opening tag.")
+            else:
+                last_open_id, last_open_full = stack.pop()
+                if last_open_id != tag_id:
+                    errors.append(
+                        f"{label}: Tag {last_open_full} closed by incorrect tag </{tag_id}>."
+                    )
+
+    # Remaining items in stack are unclosed tags
+    for unclosed_id, unclosed_full in stack:
+        errors.append(f"{label}: Tag {unclosed_full} is never closed.")
+
+    # 3. Punctuation inside tags: <L1>word.</L1>
+    bad_internal_punct = re.findall(r"<([A-Z]+\d+)>.*?[,.!?;]</\1>", text)
+    if bad_internal_punct:
+        errors.append(f"{label}: Punctuation caught inside tags: {bad_internal_punct}")
+
+    # 4. Fused tags: </L1>word instead of </L1> word
+    fused_tags = re.findall(r"</[A-Z]+\d+>[^\s,.!?;\"')\]}]", text)
+    if fused_tags:
+        errors.append(f"{label}: Missing space/punctuation after closing tag: {fused_tags}")
+
     return open_tags, errors
 
 def validate_row(row: pd.Series, mode: str) -> List[str]:
@@ -53,18 +78,23 @@ def validate_row(row: pd.Series, mode: str) -> List[str]:
     else:  # code_switch
         l_allowed, n_allowed = {"L", "CS"}, {"N", "CN"}
 
-    # 4. Check for duplicates and illegal types
-    def check_tags(tags: List[str], allowed: Set[str], label: str):
+    # 4. Global illegal tag check (catches <UNK>, <FOO1>, etc.)
+    all_found_tags = re.findall(r"</?([A-Z]+\d*)>", loan_sent + native_sent)
+    all_allowed = {"L", "N", "CS", "CN"} if mode != "base" else {"L", "N"}
+    
+    for t in all_found_tags:
+        prefix = re.match(r"([A-Z]+)", t).group(1)
+        if prefix not in all_allowed:
+            errors.append(f"Illegal tag detected: <{t}>")
+
+    def check_tag_logic(tags: List[str], allowed: Set[str], label: str):
         counts = Counter(tags)
         prefix_map = defaultdict(list)
-
         for tag, count in counts.items():
-            prefix = re.match(r"([A-Z]+)", tag).group(1)
-            num = int(tag.replace(prefix, ""))
+            match = re.match(r"([A-Z]+)(\d+)", tag)
+            if not match: continue
+            prefix, num = match.group(1), int(match.group(2))
             prefix_map[prefix].append(num)
-
-            if prefix not in allowed:
-                errors.append(f"{label} contains illegal tag type: {tag}")
             if count > 1:
                 errors.append(f"{label} contains duplicate tag: {tag}")
 
@@ -80,30 +110,23 @@ def validate_row(row: pd.Series, mode: str) -> List[str]:
 
         return set(tags)
 
-    l_set = check_tags(loan_tags, l_allowed, "Loanword")
-    n_set = check_tags(native_tags, n_allowed, "Native")
+    l_set = check_tag_logic(loan_tags, l_allowed, "Loanword")
+    n_set = check_tag_logic(native_tags, n_allowed, "Native")
 
     # 5. Structural Parity (L <-> N and CS <-> CN)
     # Rules: For every <LX> there is <NX>. For every <CSX> there is <CNX>.
     mapping = {"L": "N", "CS": "CN"}
     
-    # Check Loan -> Native
-    for l_tag in l_set:
-        prefix = re.match(r"([A-Z]+)", l_tag).group(1)
-        num = l_tag.replace(prefix, "")
-        expected_n = f"{mapping[prefix]}{num}"
-        if expected_n not in n_set:
-            errors.append(f"Missing corresponding tag {expected_n} in Native")
+    # 6. Parity Count Check (Simplified)
+    l_prefixes = Counter(re.match(r"([A-Z]+)", t).group(1) for t in l_set)
+    n_prefixes = Counter(re.match(r"([A-Z]+)", t).group(1) for t in n_set)
 
-    # Check Native -> Loan (orphans)
-    for n_tag in n_set:
-        prefix = re.match(r"([A-Z]+)", n_tag).group(1)
-        # Reverse mapping search
-        inv_map = {v: k for k, v in mapping.items()}
-        num = n_tag.replace(prefix, "")
-        expected_l = f"{inv_map[prefix]}{num}"
-        if expected_l not in l_set:
-            errors.append(f"Orphan tag {n_tag} in Native (no {expected_l})")
+    for l_pref, n_pref in mapping.items():
+        if l_prefixes[l_pref] != n_prefixes[n_pref]:
+            errors.append(
+                f"Count mismatch: {l_pref} tags ({l_prefixes[l_pref]}) vs "
+                f"{n_pref} tags ({n_prefixes[n_pref]})"
+            )
 
     return errors
 

@@ -16,13 +16,15 @@ class ColumnSpec:
     width_cm: float = 6.4
 
 
+WIDTH_WIDE     = 12
+WIDTH_CHECKBOX = 2
+
 DEFAULT_ANNOTATION_COLUMNS: list[ColumnSpec] = [
-    ColumnSpec("Loanword sentence", 6.4),
-    ColumnSpec("Native sentence", 6.4),
-    ColumnSpec("Target", 6.4),
-    ColumnSpec("Valid.", 1.8),
-    ColumnSpec("Suggestions", 6.4),
-    ColumnSpec("Etymology", 10.0),
+    ColumnSpec("Loanword sentence", WIDTH_WIDE),
+    ColumnSpec("Native sentence", WIDTH_WIDE),
+    ColumnSpec("Target", WIDTH_WIDE),
+    ColumnSpec("Valid", WIDTH_CHECKBOX),
+    ColumnSpec("Suggestions", WIDTH_WIDE),
 ]
 
 CM_TO_EXCEL_WIDTH = 3.89

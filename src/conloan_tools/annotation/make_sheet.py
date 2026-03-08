@@ -10,7 +10,8 @@ from conloan_tools.corpus.query import (
     query_cqp,
     parse_cqp_line,
     score_sentence,
-    count_loanwords_in_sentence,
+    count_hits_in_sentence,
+    load_scoring_config,
     DEFAULT_CQP_BIN,
 )
 from conloan_tools.annotation import annotation
@@ -94,22 +95,6 @@ def create_native_template(sentence_with_loan_tags):
     )
 
 
-def format_etymology(tagged_lemmas, lemma_to_lang_info, char_limit=450):
-    """Format etymology for each loanword, with character limit."""
-    lines = []
-    for tag_num in sorted(tagged_lemmas.keys()):
-        word = tagged_lemmas[tag_num]
-        lang_info = lemma_to_lang_info.get(word.lower(), "").strip()
-        if lang_info:
-            if len(lang_info) > char_limit:
-                lang_info = lang_info[: char_limit - 3] + "..."
-            lines.append(f"L{tag_num} ({word}): {lang_info}")
-        else:
-            lines.append(f"L{tag_num} ({word}):")
-
-    return "\n".join(lines)
-
-
 def build_row(
     rec_word,
     sentence_loan,
@@ -128,15 +113,13 @@ def build_row(
     tagged_lemmas = get_tagged_lemmas(
         parsed_result, lemma_set_lower, rec_word
     )
-    etymology = format_etymology(tagged_lemmas, lemma_to_lang_info)
 
     return {
         "Loanword sentence": sentence_loan,
         "Native sentence": sentence_native,
         "Target": "",
-        "Valid.": "",
+        "Valid": "",
         "Suggestions": "",
-        "Etymology": etymology,
     }, found
 
 
@@ -147,51 +130,57 @@ def build_or_query(lemmas):
 
 
 def mine_and_select(
-    input_rows,
-    args,
+    corpus,
+    query_limit,
+    cqp_bin,
+    registry_dir,
+    scoring_config_path,
     lemma_set_lower,
     lemma_to_lang_info,
     max_sentences_per_lemma=1,
+    use_scoring=True,
 ):
     """Bulk-mine a large candidate pool, then greedily select the best
     sentences by density score, respecting per-lemma usage limits."""
     all_target_lemmas = list(lemma_set_lower.values())
 
     click.echo(
-        f"Mining pool from {args.corpus} "
+        f"Querying from {corpus} "
         f"({len(all_target_lemmas)} target lemmas, "
-        f"limit={args.query_limit})…"
+        f"limit={query_limit})…"
     )
     raw_output = query_cqp(
-        args.corpus,
-        build_or_query(all_target_lemmas),
-        args.query_limit,
-        args.cqp_bin,
+        corpus=corpus,
+        query=build_or_query(all_target_lemmas),
+        limit=query_limit,
+        cqp_bin=cqp_bin,
+        registry_dir=registry_dir,
     )
 
+    cfg = load_scoring_config(scoring_config_path)
     unique_candidates = {}
     lines = raw_output.split("\n")
     raw_hit_count = 0
-    for line in tqdm(lines, desc="Parsing raw hits", unit="line"):
+    for line in tqdm(lines, desc="Parsing results, computing hit count", unit="line"):
         parsed = parse_cqp_line(line)
         if not parsed:
             continue
         raw_hit_count += 1
-        score = score_sentence(parsed, lemma_set_lower)
+        hits = count_hits_in_sentence(parsed, set(lemma_set_lower.keys()))
+        score_val = score_sentence(parsed, hits, cfg).score_total if use_scoring else 0
         sent_text = parsed.text
-        if (
-            sent_text not in unique_candidates
-            or score > unique_candidates[sent_text][0]
-        ):
-            unique_candidates[sent_text] = (score, parsed)
+        if sent_text not in unique_candidates:
+            unique_candidates[sent_text] = (score_val, parsed)
 
     click.echo(
-        f"Raw hits: {raw_hit_count} → "
-        f"{len(unique_candidates)} unique candidates after dedup."
+        f"Results: {raw_hit_count} → "
+        f"{len(unique_candidates)} results after dedup."
     )
-
     sorted_pool = sorted(
         unique_candidates.values(), key=lambda x: x[0], reverse=True
+    )
+    click.echo(
+        "Results sorted by scoring"
     )
 
     final_rows = []
@@ -200,11 +189,11 @@ def mine_and_select(
     skipped = 0
 
     for score, parsed in tqdm(
-        sorted_pool, desc="Greedy selection", unit="sent"
+        sorted_pool, desc="Greedy selection (mining for samples)", unit="sent"
     ):
-        matched_in_sent = count_loanwords_in_sentence(
-            parsed, lemma_set_lower
-        )
+        matched_in_sent = {
+            t.lemma.lower() for t in parsed.tokens if t.lemma.lower() in lemma_set_lower
+        }
 
         can_use = all(
             lemma_usage_count[l] < max_sentences_per_lemma
@@ -276,8 +265,27 @@ def mine_and_select(
     show_default=True,
     help="Max sentences per loanword",
 )
+@click.option(
+    "--registry-dir",
+    default=None,
+    help="Path to cwb directory.",
+)
+@click.option(
+    "--scoring-config",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="TOML file overriding default scoring parameters.",
+)
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
-def make_sheet(corpus, inputs, output, query_limit, max_per_lemma, cqp_bin):
+@click.option(
+    "--scoring/--no-scoring",
+    default=True,
+    show_default=True,
+    help="Enable or disable sentence density scoring.",
+)
+def make_sheet(
+    corpus, inputs, output, query_limit, max_per_lemma, registry_dir, scoring_config, cqp_bin, scoring
+):
     """Generate a ConLoan annotation sheet via global corpus mining.
 
     Run ``inject-suggestions`` afterwards to populate the Suggestions
@@ -285,14 +293,6 @@ def make_sheet(corpus, inputs, output, query_limit, max_per_lemma, cqp_bin):
 
     Run ``translate`` afterwards to populate the Target using NT.
     """
-
-    class Args:
-        pass
-
-    args = Args()
-    args.corpus = corpus
-    args.query_limit = query_limit
-    args.cqp_bin = cqp_bin
 
     input_rows = []
     for file_path in inputs:
@@ -313,11 +313,15 @@ def make_sheet(corpus, inputs, output, query_limit, max_per_lemma, cqp_bin):
     )
     click.echo(f"Mining {query_limit} sentences using OR strategy…")
     found_rows = mine_and_select(
-        input_rows=input_rows,
-        args=args,
+        corpus=corpus,
+        query_limit=query_limit,
+        cqp_bin=cqp_bin,
+        registry_dir=registry_dir,
+        scoring_config_path=scoring_config,
         lemma_set_lower=lemma_set_lower,
         lemma_to_lang_info=lemma_to_lang_info,
         max_sentences_per_lemma=max_per_lemma,
+        use_scoring=scoring,
     )
 
     visited_lemmas = set()
