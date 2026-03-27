@@ -7,13 +7,11 @@ from collections import defaultdict
 from tqdm import tqdm
 
 from conloan_tools.corpus.query import (
-    query_cqp,
     parse_cqp_line,
-    score_sentence,
-    count_hits_in_sentence,
-    load_scoring_config,
     DEFAULT_CQP_BIN,
+    query_by_lemmas,
 )
+
 from conloan_tools.annotation import annotation
 from .excel import write_sheet 
 
@@ -123,13 +121,7 @@ def build_row(
     }, found
 
 
-def build_or_query(lemmas):
-    """Creates the CQP pipe-separated regex for bulk retrieval."""
-    escaped = [re.escape(l) for l in lemmas]
-    return f'[lemma="{"|".join(escaped)}"]'
-
-
-def mine_and_select(
+def select_greedy(
     corpus,
     query_limit,
     cqp_bin,
@@ -145,54 +137,37 @@ def mine_and_select(
     all_target_lemmas = list(lemma_set_lower.values())
 
     click.echo(
-        f"Querying from {corpus} "
-        f"({len(all_target_lemmas)} target lemmas, "
-        f"limit={query_limit})…"
-    )
-    raw_output = query_cqp(
-        corpus=corpus,
-        query=build_or_query(all_target_lemmas),
-        limit=query_limit,
-        cqp_bin=cqp_bin,
-        registry_dir=registry_dir,
+       f"Querying from {corpus} "
+       f"({len(all_target_lemmas)} target lemmas, limit={query_limit})…"
     )
 
-    cfg = load_scoring_config(scoring_config_path)
-    unique_candidates = {}
-    lines = raw_output.split("\n")
-    raw_hit_count = 0
-    for line in tqdm(lines, desc="Parsing results, computing hit count", unit="line"):
-        parsed = parse_cqp_line(line)
-        if not parsed:
-            continue
-        raw_hit_count += 1
-        hits = count_hits_in_sentence(parsed, set(lemma_set_lower.keys()))
-        score_val = score_sentence(parsed, hits, cfg).score_total if use_scoring else 0
-        sent_text = parsed.text
-        if sent_text not in unique_candidates:
-            unique_candidates[sent_text] = (score_val, parsed)
-
-    click.echo(
-        f"Results: {raw_hit_count} → "
-        f"{len(unique_candidates)} results after dedup."
-    )
-    sorted_pool = sorted(
-        unique_candidates.values(), key=lambda x: x[0], reverse=True
-    )
-    click.echo(
-        "Results sorted by scoring"
+    # Returns deduplicated, sorted List[ScoredResult]
+    sorted_pool = query_by_lemmas(
+        corpus,
+        all_target_lemmas,
+        query_limit,
+        cqp_bin,
+        registry_dir,
+        scoring_config_path,
+        verbose=False,
     )
 
-    final_rows = []
+    # --- Greedy selection: annotation pipeline concern ---
     lemma_usage_count = defaultdict(int)
     cluster_id_counter = 0
+    final_rows = []
     skipped = 0
 
-    for score, parsed in tqdm(
-        sorted_pool, desc="Greedy selection (mining for samples)", unit="sent"
+    for result in tqdm(
+        sorted_pool,
+        desc="Greedy selection (mining for samples)",
+        unit="sent"
     ):
+
         matched_in_sent = {
-            t.lemma.lower() for t in parsed.tokens if t.lemma.lower() in lemma_set_lower
+            t.lemma.lower()
+            for t in result.tokens
+            if t.lemma.lower() in lemma_set_lower
         }
 
         can_use = all(
@@ -201,20 +176,20 @@ def mine_and_select(
         )
 
         if can_use and matched_in_sent:
-            cluster_id = f"cluster_{cluster_id_counter}"
-            cluster_id_counter += 1
 
             primary = list(matched_in_sent)[0]
             output_row, found = build_row(
                 rec_word=primary,
                 sentence_loan=tag_all_loanwords(
-                    parsed, lemma_set_lower, primary
+                    result, lemma_set_lower, primary
                 ),
-                parsed_result=parsed,
+                parsed_result=result,
                 lemma_set_lower=lemma_set_lower,
                 lemma_to_lang_info=lemma_to_lang_info,
             )
 
+            cluster_id = f"cluster_{cluster_id_counter}"
+            cluster_id_counter += 1
             output_row["Cluster_ID"] = cluster_id
             output_row["Matched_Lemmas"] = "|".join(
                 sorted(matched_in_sent)
@@ -236,6 +211,8 @@ def mine_and_select(
         f"{skipped} skipped. "
         f"Covered {covered}/{len(lemma_set_lower)} target lemmas."
     )
+
+    click.echo(f"[*] Parsed and scored {len(final_rows)} results.")
 
     return final_rows
 
@@ -283,8 +260,9 @@ def mine_and_select(
     show_default=True,
     help="Enable or disable sentence density scoring.",
 )
+@click.option("--missing-placeholder", default=False)
 def make_sheet(
-    corpus, inputs, output, query_limit, max_per_lemma, registry_dir, scoring_config, cqp_bin, scoring
+    corpus, inputs, output, query_limit, max_per_lemma, registry_dir, scoring_config, cqp_bin, scoring, missing_placeholder
 ):
     """Generate a ConLoan annotation sheet via global corpus mining.
 
@@ -312,7 +290,7 @@ def make_sheet(
         f"from {len(inputs)} input file(s)."
     )
     click.echo(f"Mining {query_limit} sentences using OR strategy…")
-    found_rows = mine_and_select(
+    found_rows = select_greedy(
         corpus=corpus,
         query_limit=query_limit,
         cqp_bin=cqp_bin,
@@ -328,28 +306,33 @@ def make_sheet(
     for row in found_rows:
         for l in row.get("Matched_Lemmas", "").split("|"):
             visited_lemmas.add(l.lower())
-
-    missing_lemmas = [
-        l for l in lemma_set_lower if l not in visited_lemmas
-    ]
-    not_found_rows = []
-    for lemma_low in missing_lemmas:
-        row, _ = build_row(
-            rec_word=lemma_set_lower[lemma_low],
-            sentence_loan=None,
-            parsed_result=None,
-            lemma_set_lower=lemma_set_lower,
-            lemma_to_lang_info=lemma_to_lang_info,
-        )
-        not_found_rows.append(row)
-
-    rows_to_write = found_rows + not_found_rows
-
+            
     click.echo(
         f"Selected {len(found_rows)} sentences "
         f"covering {len(visited_lemmas)}/{len(lemma_set_lower)} lemmas. "
-        f"{len(missing_lemmas)} lemmas not found (placeholder rows added)."
     )
+
+    if missing_placeholder:
+        missing_lemmas = [
+            l for l in lemma_set_lower if l not in visited_lemmas
+        ]
+        not_found_rows = []
+        for lemma_low in missing_lemmas:
+            row, _ = build_row(
+                rec_word=lemma_set_lower[lemma_low],
+                sentence_loan=None,
+                parsed_result=None,
+                lemma_set_lower=lemma_set_lower,
+                lemma_to_lang_info=lemma_to_lang_info,
+            )
+            not_found_rows.append(row)
+        rows_to_write = found_rows + not_found_rows
+        click.echo(
+            f"{len(missing_lemmas)} lemmas not found (placeholder rows added)."
+        )
+    else:
+        rows_to_write = found_rows
+
     click.echo(f"Generating {output}…")
 
     write_sheet(rows_to_write, output)

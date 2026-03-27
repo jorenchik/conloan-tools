@@ -6,6 +6,8 @@ from conloan_tools.wordnet import wordnet
 from conloan_tools.annotation import annotation 
 from conloan_tools.stz import stz 
 from conloan_tools.translate import translate 
+from conloan_tools.wb import wb 
+from conloan_tools.ner import ner
 
 @click.group()
 def cli():
@@ -17,6 +19,8 @@ cli.add_command(wordnet)
 cli.add_command(annotation)
 cli.add_command(stz)
 cli.add_command(translate)
+cli.add_command(wb)
+cli.add_command(ner)
 
 if __name__ == "__main__":
     cli()
