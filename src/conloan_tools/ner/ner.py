@@ -224,7 +224,10 @@ def build_ner_model(
 
     tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(model_name)
     model: AutoModelForTokenClassification = (
-        AutoModelForTokenClassification.from_pretrained(model_name).to(device)
+        AutoModelForTokenClassification.from_pretrained(
+            model_name, 
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32
+        ).to(device)
     )
 
     return NERModel(

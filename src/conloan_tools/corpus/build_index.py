@@ -294,7 +294,19 @@ def build_ner_index(
     id2label: dict[int, str] = {int(k): v for k, v in model.id2label.items()}
     num_labels = len(id2label)
 
-    scores_dtype = np.float32 if ner_output == "logits" else np.uint8
+    import torch
+    model_torch_dtype = next(model.model.parameters()).dtype
+    scores_dtype = None
+    if ner_output == "logits":
+        if model_torch_dtype == torch.float16:
+            scores_dtype = np.float16 
+        elif model_torch_dtype == torch.float16:
+            scores_dtype = np.float32
+        else:
+            raise Exception(f"Unexpected model dtype {model_torch_dtype}")
+    else:
+        scores_dtype = np.uint8 
+
     num_labels_arg = num_labels if ner_output == "logits" else None
 
     meta = {
@@ -303,7 +315,7 @@ def build_ner_index(
         "model":      getattr(model.model.config, "_name_or_path", "unknown"),
         "input":      str(input_path),
         "date":       datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "dtype":      "float32" if ner_output == "logits" else "uint8",
+        "dtype":      str(scores_dtype) if ner_output == "logits" else "uint8",
         "num_labels": num_labels,
         "id2label":   id2label,
         "store_spos": store_spos,
@@ -435,6 +447,7 @@ def build_ner_index_command(
     """Score every token in a .vert corpus with NER. Streams to HDF5."""
     from conloan_tools.ner.ner import build_ner_model
 
+    click.echo(f"Device {device}")
     _model = build_ner_model(model_name=model_name, device=device)
     h5_path = build_ner_index(
         model=_model,
