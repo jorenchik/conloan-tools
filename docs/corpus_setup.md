@@ -4,6 +4,10 @@ Corpus Workbench offers various tools for handling and querying `.vert` (corpus
 files). Conloan uses `cwb` and the `cqp` utility specifically to query the
 sentences from a corpus.
 
+## Converting OPUS to VERT (CWB)
+
+TODO.
+
 ## Install
 
 To get the official release of `cwb`, refer to the official [install
