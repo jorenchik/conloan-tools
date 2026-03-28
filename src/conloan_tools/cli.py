@@ -8,6 +8,7 @@ from conloan_tools.stz import stz
 from conloan_tools.translate import translate 
 from conloan_tools.wb import wb 
 from conloan_tools.ner import ner
+from conloan_tools.classifier import classifier
 
 @click.group()
 def cli():
@@ -21,6 +22,7 @@ cli.add_command(stz)
 cli.add_command(translate)
 cli.add_command(wb)
 cli.add_command(ner)
+cli.add_command(classifier)
 
 if __name__ == "__main__":
     cli()
