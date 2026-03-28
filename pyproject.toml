@@ -1,7 +1,7 @@
-
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+requires-python = ">=3.11, <3.12"
 
 [project]
 name = "conloan-tools"
@@ -10,34 +10,31 @@ description = "Utilities for parsing and processing loanword datasets for NLP"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "transformers==5.1.0",
-    "torch",
-    "torchvision",
-    "markupsafe==2.1.5",
-    "requests",
-    "datasets", 
-    "pyarrow",
-    "accelerate",
-    "huggingface-hub",
-    "seqeval",
-    "protobuf",
-    "tqdm",
-    "click",
-    "xlsxwriter",
+    "click==8.2.1",
+    "h5py",
+    "numpy",
     "openpyxl",
-
-    # NLP 
-    "stanza",
-
-    # OPUS MT
-    "sentencepiece",
-    "sacremoses",
+    "pandas",
+    "requests",
+    "tqdm",
+    "xlsxwriter",
 ]
 
 [project.optional-dependencies]
-torch = [
-    "torch",
-    "torchvision",
+models = [
+    "accelerate>=1.1.0",   # Required to run 'Trainer' with 'PyTorch'.
+    "datasets", 
+    "huggingface-hub",
+    "markupsafe==2.1.5",
+    "sacremoses",          # Suggested for MarianTokenizer.
+    "sentencepiece",       # Required  for MarianTokenizer.
+    "seqeval",
+    "stanza",
+    "torch>=2.4",
+    "transformers==5.1.0", 
+]
+docs = [
+    "mkdocs"
 ]
 
 [project.scripts]
@@ -45,7 +42,7 @@ conloan = "conloan_tools.cli:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["conloan_tools"]
+include = ["conloan_tools*"]
 
 [tool.setuptools]
 # Map the empty prefix to the "src" directory
