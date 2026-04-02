@@ -144,18 +144,53 @@ def _find_consecutive_runs(
     return runs
 
 
-def _load_scores(bin_path: Path) -> np.ndarray:
-    return np.fromfile(bin_path, dtype=np.float32)
+def _load_scores(h5_path: Path) -> np.ndarray:
+    """Load flat token scores from HDF5 /scores/data, cast to float32."""
+    import h5py
+
+    with h5py.File(h5_path, "r") as f:
+        return f["scores"]["data"][:].astype(np.float32)
 
 
-def _load_index_records(idx_path: Path) -> list[IndexRecord]:
-    records: list[IndexRecord] = []
-    for line in idx_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        rec = json.loads(line)
-        records.append(IndexRecord(offset=rec["offset"], count=rec["count"]))
-    return records
+def _load_index_records(h5_path: Path) -> list[IndexRecord]:
+    """Load sentence index records from HDF5 /index/cpos + /index/count."""
+    import h5py
+
+    with h5py.File(h5_path, "r") as f:
+        cpos  = f["index"]["cpos"][:]
+        count = f["index"]["count"][:]
+    return [
+        IndexRecord(offset=int(c), count=int(n))
+        for c, n in zip(cpos, count)
+    ]
+
+
+def _load_ner_labels(h5_path: Path) -> tuple[np.ndarray, list[IndexRecord], dict[int, str]]:
+    """
+    Load NER label index from HDF5.
+    Returns (flat_label_array uint8, index_records, id2label).
+    Raises ValueError for logits-mode files.
+    """
+    import h5py
+
+    with h5py.File(h5_path, "r") as f:
+        ner_output = f.attrs.get("ner_output", "labels")
+        if ner_output != "labels":
+            raise click.UsageError(
+                f"{h5_path.name} was built with ner_output='{ner_output}'. "
+                "Re-build the index with --ner-output labels."
+            )
+        labels = f["scores"]["data"][:]
+        cpos   = f["index"]["cpos"][:]
+        count  = f["index"]["count"][:]
+        raw_id2label = json.loads(f.attrs["id2label"])
+
+    id2label = {int(k): v for k, v in raw_id2label.items()}
+    records  = [
+        IndexRecord(offset=int(c), count=int(n))
+        for c, n in zip(cpos, count)
+    ]
+    return labels, records, id2label
 
 
 def _render_code_switch_results(
@@ -492,6 +527,7 @@ def scan_anomaly_candidates(
     threshold: float,
     min_consecutive: int,
     max_results: int = 100,
+    limit_sentences: int | None = None,
 ) -> list[tuple[int, list[int], list[float]]]:
     """
     Scan pre-loaded scores against pre-parsed index records.
@@ -502,7 +538,8 @@ def scan_anomaly_candidates(
     """
     candidates: list[tuple[int, list[dict]]] = []
 
-    for sent_idx, record in enumerate(index_records):
+    records = index_records[:limit_sentences] if limit_sentences else index_records
+    for sent_idx, record in enumerate(tqdm(records, desc="Scanning surprisal", unit="sent")):
         sent_scores = scores[record.offset : record.offset + record.count]
         runs = _find_consecutive_runs(sent_scores, threshold, min_consecutive)
         if runs:
@@ -534,6 +571,7 @@ def find_code_switch_sequences(
     max_results: int = DEFAULT_RESULTS,
     cqp_bin: str = DEFAULT_CQP_BIN,
     registry_dir: Optional[str] = None,
+    limit_sentences: int | None = None,
 ) -> list[CodeSwitchRun]:
     """
     Full code-switch detection pipeline.
@@ -560,6 +598,7 @@ def find_code_switch_sequences(
         threshold=threshold,
         min_consecutive=min_consecutive,
         max_results=max_results,
+        limit_sentences=limit_sentences,
     )
 
     if not candidates:
@@ -639,7 +678,7 @@ def query_group():
 
 @query_group.command("code-switch")
 @click.argument("corpus_name")
-@click.argument("input_prefix")
+@click.argument("input_h5", type=click.Path(exists=True, dir_okay=False))
 @click.option(
     "--threshold",
     type=float,
@@ -667,35 +706,35 @@ def query_group():
     help="CWB registry dir. Falls back to CORPUS_REGISTRY env var.",
 )
 @scoring_config_option
+@click.option(
+    "--limit-sentences",
+    type=int,
+    default=None,
+    help="Cap the number of sentences scanned. Scans all if omitted.",
+)
 def query_code_switch(
     corpus_name: str,
-    input_prefix: str,
+    input_h5: str,
     threshold: float,
     min_consecutive: int,
     max_results: int,
     cqp_bin: str,
     registry_dir: Optional[str],
     scoring_config: Optional[str],
+    limit_sentences: int | None,
 ) -> None:
     """Find code-switch sequences in CORPUS_NAME using a pre-scored index.
 
     INPUT_PREFIX: base path for .bin/.idx files (e.g. 'output' → output.bin/output.idx)
     """
-    bin_path = Path(input_prefix).with_suffix(".bin")
-    idx_path = Path(input_prefix).with_suffix(".idx")
-
-    if not bin_path.exists():
-        raise click.FileError(str(bin_path), hint="Binary score file not found.")
-    if not idx_path.exists():
-        raise click.FileError(str(idx_path), hint="Index file not found.")
-
+    h5_path = Path(input_h5)
     click.echo("[*] Loading scores and index into memory...")
-    scores = _load_scores(bin_path)
-    index_records = _load_index_records(idx_path)
+    scores = _load_scores(h5_path)
+    index_records = _load_index_records(h5_path)
     cfg = load_scoring_config(scoring_config)
 
     click.echo(
-        f"[*] Scanning {bin_path.name} for ≥{min_consecutive} "
+        f"[*] Scanning {h5_path.name} for ≥{min_consecutive} "
         f"consecutive tokens > {threshold:.2f}"
     )
 
@@ -709,6 +748,7 @@ def query_code_switch(
         max_results=max_results,
         cqp_bin=cqp_bin,
         registry_dir=registry_dir,
+        limit_sentences=limit_sentences,
     )
 
     click.echo(f"[*] Found {len(results)} candidate sequences")
@@ -793,6 +833,123 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
             # Simple text reconstruction for display
             text = " ".join([t.word for t in parsed.tokens])
             click.echo(f"[{parsed.cqp_id}] {text}")
+
+
+@query_group.command("ner-entities")
+@click.argument("corpus_name")
+@click.argument("ner_h5", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--label",
+    "labels",
+    multiple=True,
+    help=(
+        "NE label(s) to match (e.g. PER, LOC). "
+        "Repeatable. Omit to match any non-O label."
+    ),
+)
+@click.option(
+    "--max-results",
+    type=int,
+    default=DEFAULT_RESULTS,
+    show_default=True,
+    help="Maximum sentences to retrieve.",
+)
+@click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
+@click.option(
+    "--registry-dir",
+    default=None,
+    help="CWB registry dir. Falls back to CORPUS_REGISTRY env var.",
+)
+@click.option(
+    "--limit-sentences",
+    type=int,
+    default=None,
+    help="Cap the number of sentences scanned. Scans all if omitted.",
+)
+def query_ner_entities(
+    corpus_name: str,
+    ner_h5: str,
+    labels: tuple[str, ...],
+    max_results: int,
+    cqp_bin: str,
+    registry_dir: Optional[str],
+    limit_sentences: int | None,
+) -> None:
+    """Find sentences containing named entities from a NER label index.
+
+    NER_H5: HDF5 index built with `build-index ner --ner-output labels`.
+    """
+    h5_path = Path(ner_h5)
+    click.echo("[*] Loading NER index...")
+    flat_labels, index_records, id2label = _load_ner_labels(h5_path)
+
+    # Build the set of label IDs we care about (everything except O).
+    o_ids = {k for k, v in id2label.items() if v == "O"}
+    if labels:
+        want = {k for k, v in id2label.items() if v in set(labels)}
+        if not want:
+            available = sorted(set(id2label.values()) - {"O"})
+            raise click.UsageError(
+                f"None of {list(labels)!r} found in index. "
+                f"Available labels: {available}"
+            )
+    else:
+        want = set(id2label.keys()) - o_ids
+
+    click.echo(
+        f"[*] Scanning {h5_path.name} for labels: "
+        f"{sorted(id2label[k] for k in want)}"
+    )
+
+    # Collect sentence indices that contain at least one matching token.
+    matching: list[int] = []
+    records = index_records[:limit_sentences] if limit_sentences else index_records
+    for sent_idx, record in enumerate(
+        tqdm(records, desc="Scanning NER labels", unit="sent")
+    ):
+        chunk = flat_labees[record.offset : record.offset + record.count]
+        if np.any(np.isin(chunk, list(want))):
+            matching.append(sent_idx)
+        if max_results > 0 and len(matching) >= max_results:
+            break
+
+    click.echo(f"[*] Found {len(matching)} candidate sentence(s)")
+    if not matching:
+        return
+
+    raw_output = fetch_corpus_sentences(
+        corpus=corpus_name,
+        indices=matching,
+        mode="spos",
+        cqp_bin=cqp_bin,
+        registry_dir=registry_dir,
+    )
+
+    click.echo("-" * 60)
+    shown = 0
+    for line, sent_idx in zip(raw_output.strip().splitlines(), matching):
+        parsed = parse_cqp_line(line)
+        if not parsed:
+            continue
+
+        record = index_records[sent_idx]
+        chunk  = flat_labels[record.offset : record.offset + record.count]
+
+        # Annotate tokens whose label is in `want`.
+        parts: list[str] = []
+        for i, token in enumerate(parsed.tokens):
+            if i < len(chunk) and int(chunk[i]) in want:
+                lbl = id2label[int(chunk[i])]
+                parts.append(f"[{token.word}/{lbl}]")
+            else:
+                parts.append(token.word)
+
+        click.echo(f"[{sent_idx}] " + " ".join(parts))
+        shown += 1
+
+    click.echo("-" * 60)
+    click.echo(f"({shown} sentences shown)")
+
 
 if __name__ == "__main__":
     corpus()
