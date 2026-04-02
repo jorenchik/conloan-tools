@@ -1,11 +1,10 @@
 import click
-
-from .eval import evaluate 
-from .train import train
+from .train import train, kfold, eval_cmd
 
 @click.group()
 def classifier():
     """Conloan classifier utilities."""
 
-classifier.add_command(evaluate)
 classifier.add_command(train)
+classifier.add_command(kfold)
+classifier.add_command(eval_cmd)

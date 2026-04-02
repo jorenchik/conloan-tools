@@ -101,6 +101,35 @@ def _word_char_spans(text: str) -> list[tuple[str, int, int]]:
         for m in _WORD_PATTERN.finditer(text)
     ]
 
+
+def build_and_save_splits(
+    raw_data: Dataset,
+    splits_dir: Path,
+    seed: int = 42,
+) -> DatasetDict:
+    from datasets import Dataset, DatasetDict
+
+    columns = {f.name: [] for f in fields(LoanwordEntry)}
+    for e in raw_data:
+        for f in fields(LoanwordEntry):
+            columns[f.name].append(e[f.name])
+
+    full = Dataset.from_dict(columns)
+
+    # 80/20 train/test — no dev split
+    split = full.train_test_split(test_size=0.2, seed=seed)
+    splits = DatasetDict({"train": split["train"], "test": split["test"]})
+
+    splits_dir.mkdir(parents=True, exist_ok=True)
+    splits.save_to_disk(str(splits_dir))
+    print(
+        f"Splits saved to {splits_dir}  "
+        f"(train={len(splits['train'])}, "
+        f"test={len(splits['test'])})"
+    )
+    return splits
+
+
 def _build_word_labels(
     word_spans: list[tuple[str, int, int]],
     loan_spans: list[tuple[int, int]],
@@ -127,6 +156,9 @@ def tokenize_and_align_labels(
 ) -> BatchEncoding:
     all_words: list[list[str]] = []
     all_word_labels: list[list[str]] = []
+
+    if not tokenizer.is_fast:
+        raise ValueError("tokenize_and_align_labels requires a fast tokenizer.")
 
     for annotated in examples["source_annotated_loanwords"]:
         plain, loan_spans = _parse_loanword_spans(annotated)
