@@ -103,30 +103,31 @@ def _word_char_spans(text: str) -> list[tuple[str, int, int]]:
 
 
 def build_and_save_splits(
-    raw_data: Dataset,
+    raw_data: "Dataset",
     splits_dir: Path,
     seed: int = 42,
-) -> DatasetDict:
-    from datasets import Dataset, DatasetDict
+    dev: bool = False,
+) -> "DatasetDict":
+    from datasets import DatasetDict
 
-    columns = {f.name: [] for f in fields(LoanwordEntry)}
-    for e in raw_data:
-        for f in fields(LoanwordEntry):
-            columns[f.name].append(e[f.name])
+    split = raw_data.train_test_split(test_size=0.2, seed=seed)
 
-    full = Dataset.from_dict(columns)
-
-    # 80/20 train/test — no dev split
-    split = full.train_test_split(test_size=0.2, seed=seed)
-    splits = DatasetDict({"train": split["train"], "test": split["test"]})
+    if dev:
+        dev_test = split["test"].train_test_split(test_size=0.5, seed=seed)
+        splits = DatasetDict({
+            "train": split["train"],
+            "dev": dev_test["train"],
+            "test": dev_test["test"],
+        })
+    else:
+        splits = DatasetDict({
+            "train": split["train"],
+            "test": split["test"],
+        })
 
     splits_dir.mkdir(parents=True, exist_ok=True)
     splits.save_to_disk(str(splits_dir))
-    print(
-        f"Splits saved to {splits_dir}  "
-        f"(train={len(splits['train'])}, "
-        f"test={len(splits['test'])})"
-    )
+    print(f"Splits saved to {splits_dir} " + ", ".join(f"{k}={len(v)}" for k, v in splits.items()))
     return splits
 
 
@@ -139,7 +140,7 @@ def _build_word_labels(
     for loan_start, loan_end in loan_spans:
         first = True
         for i, (_word, ws, we) in enumerate(word_spans):
-            if ws >= loan_start and we <= loan_end:
+            if ws < loan_end and we > loan_start:  # overlap
                 labels[i] = "B-LOAN" if first else "I-LOAN"
                 first = False
     return labels
@@ -147,13 +148,14 @@ def _build_word_labels(
 # ---- Public interface ----
 
 def tokenize_and_align_labels(
-    examples: LazyBatch,
-    tokenizer: PreTrainedTokenizerFast,
+    examples: "LazyBatch",
+    tokenizer: "PreTrainedTokenizerFast",
     label_to_id: dict[str, int] = LABEL_TO_ID,
     max_length: int = 128,
     padding: str = "max_length",
     truncation: bool = True,
-) -> BatchEncoding:
+    word_level: bool = True,
+) -> "BatchEncoding":
     all_words: list[list[str]] = []
     all_word_labels: list[list[str]] = []
 
@@ -188,11 +190,13 @@ def tokenize_and_align_labels(
             if word_idx is None:
                 label_ids.append(-100)
             elif word_idx == prev_word_idx:
-                label_ids.append(-100)
-            else:
+                # token-level: propagate label; word-level: mask with -100
                 label_ids.append(
-                    label_to_id[word_labels[word_idx]]
+                    -100 if word_level
+                    else label_to_id[word_labels[word_idx]]
                 )
+            else:
+                label_ids.append(label_to_id[word_labels[word_idx]])
             prev_word_idx = word_idx
 
         labels.append(label_ids)
@@ -218,43 +222,3 @@ def load_conloan(file_paths: list[str]) -> Dataset:
     from datasets import Dataset
     # return Dataset.from_dict(columns)
     return Dataset.from_list([asdict(e) for e in entries])
-
-
-def build_and_save_splits(
-    raw_data: Dataset,
-    splits_dir: Path,
-    seed: int = 42,
-) -> DatasetDict:
-
-    from datasets import Dataset, DatasetDict
-    full = raw_data
-
-    columns = {f.name: [] for f in fields(LoanwordEntry)}
-    for e in raw_data:
-        for f in fields(LoanwordEntry):
-            columns[f.name].append(e[f.name])
-
-    full = Dataset.from_dict(columns)
-
-    train_rest = full.train_test_split(test_size=0.2, seed=seed)
-    dev_test = train_rest["test"].train_test_split(
-        test_size=0.5, seed=seed
-    )
-
-    splits = DatasetDict(
-        {
-            "train": train_rest["train"],
-            "dev": dev_test["train"],
-            "test": dev_test["test"],
-        }
-    )
-
-    splits_dir.mkdir(parents=True, exist_ok=True)
-    splits.save_to_disk(str(splits_dir))
-    print(
-        f"Splits saved to {splits_dir}  "
-        f"(train={len(splits['train'])}, "
-        f"dev={len(splits['dev'])}, "
-        f"test={len(splits['test'])})"
-    )
-    return splits

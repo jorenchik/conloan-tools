@@ -34,7 +34,9 @@ DEFAULT_WEIGHT_DECAY = 0.01
 DRY_RUN_EPOCHS = 1
 DRY_RUN_MAX_SAMPLES = 64
 
-KFOLD_LABELS = ("B-LOAN", "I-LOAN", "O")
+#KFOLD_LABELS = ("B-LOAN", "I-LOAN", "O")
+#KFOLD_LABELS = ("B-LOAN", "O")
+KFOLD_LABELS = ("LOAN",)
 KFOLD_METRICS = ("precision", "recall", "f1-score", "support")
 _METRIC_HEADER = {
     "precision": "prec",
@@ -49,7 +51,7 @@ _METRIC_HEADER = {
 
 
 def _splits_are_valid(splits_dir: Path) -> bool:
-    required = {"train", "test", "dataset_info.json"}
+    required = {"train", "test", "dataset_dict.json"}
     return splits_dir.exists() and required.issubset(
         {p.name for p in splits_dir.iterdir()}
     )
@@ -60,6 +62,7 @@ def _load_or_build_splits(
     splits_dir: Path,
     seed: int,
     rebuild: bool,
+    dev: bool = False,
 ) -> "DatasetDict":
     from datasets import DatasetDict
 
@@ -69,7 +72,7 @@ def _load_or_build_splits(
 
     reason = "--rebuild-splits set" if rebuild else f"no valid splits at {splits_dir}"
     click.echo(f"Building splits ({reason})")
-    return build_and_save_splits(load_conloan(inputs), splits_dir, seed=seed)
+    return build_and_save_splits(load_conloan(inputs), splits_dir, seed=seed, dev=dev)
 
 
 # ---------------------------------------------------------------------------
@@ -90,20 +93,23 @@ def _make_compute_metrics(
         true_seqs: list[list[str]] = []
         pred_seqs: list[list[str]] = []
         for pred_seq, label_seq in zip(predictions, labels):
-            true_seqs.append([id_to_label[l] for l in label_seq if l != -100])
-            pred_seqs.append(
-                [
-                    id_to_label[p]
-                    for p, l in zip(pred_seq, label_seq)
-                    if l != -100
-                ]
-            )
+            true_seq: list[str] = []
+            pred_seq_out: list[str] = []
+            for pred_tok, label_tok in zip(pred_seq, label_seq):
+                if label_tok == -100:
+                    continue
+                true_seq.append(id_to_label[label_tok])
+                pred_seq_out.append(id_to_label[pred_tok])
+            true_seqs.append(true_seq)
+            pred_seqs.append(pred_seq_out)
 
         report = classification_report(
             true_seqs, pred_seqs, output_dict=True, zero_division=0
         )
         return {
-            "f1_macro": f1_score(true_seqs, pred_seqs, average="macro"),
+            "f1_macro": f1_score(
+                true_seqs, pred_seqs, average="macro", zero_division=0
+            ),
             **{
                 f"{label}_{metric}": report[label][metric]
                 for label in KFOLD_LABELS
@@ -154,6 +160,12 @@ def _print_table(
                     else f"{val:>{col_metric}.4f}"
                 )
             click.echo(row)
+
+        macro = result.get("eval_f1_macro", float("nan"))
+        click.echo(
+            f"{'':{ fold_col_width}}{'macro f1':<{col_label}}"
+            f"{'':>{col_metric}}{'':>{col_metric}}{macro:>{col_metric}.4f}{'':>{col_metric}}"
+        )
         click.echo(sep)
 
 
@@ -280,9 +292,10 @@ def _tokenize_splits(
     splits: "DatasetDict",
     tokenizer: "AutoTokenizer",
     label_to_id: dict[str, int],
+    word_level: bool = True,
 ) -> "DatasetDict":
     return splits.map(
-        lambda x: tokenize_and_align_labels(x, tokenizer, label_to_id),
+        lambda x: tokenize_and_align_labels(x, tokenizer, label_to_id, word_level=word_level),
         batched=True,
     )
 
@@ -358,6 +371,7 @@ def splits_options(f: "Callable") -> "Callable":
             help="Directory to save/load train/test splits.",
         ),
         click.option("--rebuild-splits", is_flag=True, help="Force rebuild splits."),
+        click.option("--dev-split", is_flag=True, help="Include a dev split (smaller test)."),
     ]
     for d in reversed(decorators):
         f = d(f)
@@ -369,6 +383,10 @@ def hyperparams(f: "Callable") -> "Callable":
         click.option(
             "--epochs", type=int, default=None,
             help=f"Training epochs. [default: {DEFAULT_EPOCHS}]",
+        ),
+        click.option(
+            "--token-level", is_flag=True,
+            help="Evaluate on all subword tokens; default is word-level (first token only).",
         ),
         click.option("--learning-rate", type=float, default=DEFAULT_LR, show_default=True),
         click.option("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, show_default=True),
@@ -399,6 +417,47 @@ def _resolve_dry_run(
     return model, epochs, max_samples
 
 
+def _evaluate_model(
+    model_path: str | Path,
+    tokenized_splits: "DatasetDict",
+    label_to_id: dict[str, int],
+    tokenizer: "AutoTokenizer",
+    batch_size: int,
+    target_splits: list[str],
+    use_cpu: bool,
+) -> dict[str, dict]:
+    from transformers import (
+        AutoModelForTokenClassification,
+        DataCollatorForTokenClassification,
+        TrainingArguments,
+    )
+    from transformers.trainer import Trainer
+
+    model_path = Path(model_path)
+    clf_model = AutoModelForTokenClassification.from_pretrained(str(model_path))
+
+    args = TrainingArguments(
+        output_dir=str(model_path),
+        per_device_eval_batch_size=batch_size,
+        use_cpu=use_cpu,
+    )
+    trainer = Trainer(
+        model=clf_model,
+        args=args,
+        data_collator=DataCollatorForTokenClassification(tokenizer),
+        compute_metrics=_make_compute_metrics(LoanLabel.id_to_label()),
+    )
+
+    results: dict[str, dict] = {}
+    for s in target_splits:
+        click.echo(f"Evaluating on {s} split...")
+        metrics = trainer.evaluate(eval_dataset=tokenized_splits[s])
+        _print_single_eval_table(metrics, title=s)
+        results[s] = metrics
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -416,9 +475,11 @@ def train(
     run_name: str | None,
     seed: int,
     rebuild_splits: bool,
+    dev_split: bool,
     max_samples: int | None,
     dry_run: bool,
     epochs: int | None,
+    token_level: bool,
     learning_rate: float,
     batch_size: int,
     weight_decay: float,
@@ -441,9 +502,9 @@ def train(
     label_to_id = LoanLabel.label_to_id()
     tokenizer = _load_tokenizer(model)
 
-    splits = _load_or_build_splits(list(inputs), Path(splits_dir), seed, rebuild_splits)
+    splits = _load_or_build_splits(list(inputs), Path(splits_dir), seed, rebuild_splits, dev=dev_split)
     splits = _cap_splits(splits, max_samples)
-    tokenized = _tokenize_splits(splits, tokenizer, label_to_id)
+    tokenized = _tokenize_splits(splits, tokenizer, label_to_id, word_level=not token_level)
 
     args = _make_training_args(
         output_dir=str(output_path),
@@ -465,14 +526,33 @@ def train(
 
     trainer.train()
 
-    click.echo("Evaluating on test split...")
-    test_metrics = trainer.evaluate()
-    _print_single_eval_table(test_metrics, title="test")
-    (output_path / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2))
+    # trainer.save_model(str(output_path))
+    # tokenizer.save_pretrained(str(output_path))
+    # click.echo(f"Model saved to {output_path}")
 
     trainer.save_model(str(output_path))
     tokenizer.save_pretrained(str(output_path))
     click.echo(f"Model saved to {output_path}")
+
+    # Load from disk and evaluate — verifies the saved artifact
+    click.echo("Evaluating on test split...")
+    results = _evaluate_model(
+        model_path=output_path,
+        tokenized_splits=tokenized,
+        label_to_id=label_to_id,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        target_splits=["test"],
+        use_cpu=not torch.cuda.is_available(),
+    )
+    (output_path / "test_metrics.json").write_text(
+        json.dumps(results["test"], indent=2)
+    )
+
+    # click.echo("Evaluating on test split...")
+    # test_metrics = trainer.evaluate()
+    # _print_single_eval_table(test_metrics, title="test")
+    # (output_path / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2))
 
 
 @click.command("kfold")
@@ -488,6 +568,7 @@ def kfold(
     max_samples: int | None,
     dry_run: bool,
     epochs: int | None,
+    token_level: bool,
     learning_rate: float,
     batch_size: int,
     weight_decay: float,
@@ -516,7 +597,9 @@ def kfold(
     raw_data = load_conloan(list(inputs))
     full_dataset = _cap_dataset(raw_data.shuffle(seed=seed), max_samples)
     tokenized_full = full_dataset.map(
-        lambda x: tokenize_and_align_labels(x, tokenizer, label_to_id),
+        lambda x: tokenize_and_align_labels(
+            x, tokenizer, label_to_id, word_level=not token_level
+        ),
         batched=True,
     )
 
@@ -585,31 +668,29 @@ def kfold(
     "--model-dir",
     required=True,
     type=click.Path(exists=True, file_okay=False),
-    help="Directory of a saved model (output of train).",
 )
 @click.option(
     "--inputs", "-i",
-    required=True, multiple=True,
+    multiple=True,
     type=click.Path(exists=True, dir_okay=False),
-    help="JSON dataset files (repeatable).",
+    help="JSON dataset files. Required if splits don't exist yet.",
 )
 @click.option(
     "--splits-dir",
     required=True,
     type=click.Path(file_okay=False),
-    help="Directory to save/load train/test splits.",
 )
 @click.option("--seed", type=int, default=42, show_default=True)
-@click.option("--rebuild-splits", is_flag=True, help="Force rebuild splits.")
+@click.option("--rebuild-splits", is_flag=True)
 @click.option("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, show_default=True)
 @click.option(
     "--split",
     type=click.Choice(["train", "test", "both"]),
     default="test",
     show_default=True,
-    help="Which split(s) to evaluate.",
 )
-@click.option("--quiet", is_flag=True, help="Suppress HuggingFace logs.")
+@click.option("--token-level", is_flag=True)
+@click.option("--quiet", is_flag=True)
 def eval_cmd(
     model_dir: str,
     inputs: tuple[str, ...],
@@ -618,52 +699,245 @@ def eval_cmd(
     rebuild_splits: bool,
     batch_size: int,
     split: str,
+    token_level: bool,
     quiet: bool,
 ) -> None:
     """Load a saved model and evaluate on train/test splits."""
     import torch
-    from transformers import AutoModelForTokenClassification, DataCollatorForTokenClassification
+
+    if quiet:
+        _silence_hf()
+
+    splits_path = Path(splits_dir)
+
+    if rebuild_splits or not _splits_are_valid(splits_path):
+        if not inputs:
+            raise click.UsageError(
+                "No valid splits found at --splits-dir. "
+                "Provide --inputs to build them."
+            )
+
+    label_to_id = LoanLabel.label_to_id()
+    tokenizer = _load_tokenizer(model_dir)
+
+    splits = _load_or_build_splits(
+        list(inputs), splits_path, seed, rebuild_splits, dev=False
+    )
+    tokenized = _tokenize_splits(
+        splits, tokenizer, label_to_id, word_level=not token_level
+    )
+
+    use_cpu = not torch.cuda.is_available()
+    target_splits = ["train", "test"] if split == "both" else [split]
+
+    results = _evaluate_model(
+        model_path=model_dir,
+        tokenized_splits=tokenized,
+        label_to_id=label_to_id,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        target_splits=target_splits,
+        use_cpu=use_cpu,
+    )
+
+    out_path = Path(model_dir) / "eval_results.json"
+    out_path.write_text(json.dumps(results, indent=2))
+    click.echo(f"\nResults saved to {out_path}")
+
+
+@click.command("inspect-tokens")
+@click.option(
+    "--inputs", "-i",
+    required=True, multiple=True,
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option("--model", default=DEFAULT_MODEL, show_default=True)
+@click.option("--token-level", is_flag=True)
+@click.option("--max-samples", type=int, default=None)
+@click.option("--seed", type=int, default=42, show_default=True)
+def inspect_tokens(
+    inputs: tuple[str, ...],
+    model: str,
+    token_level: bool,
+    max_samples: int | None,
+    seed: int,
+) -> None:
+    """Print tokenized sentences with aligned labels to stdout."""
+    from datasets import DatasetDict
+
+    label_to_id = LoanLabel.label_to_id()
+    id_to_label = LoanLabel.id_to_label()
+    tokenizer = _load_tokenizer(model)
+
+    dataset = load_conloan(list(inputs))
+    dataset = _cap_dataset(dataset.shuffle(seed=seed), max_samples)
+
+    tokenized = _tokenize_splits(
+        DatasetDict({"data": dataset}),
+        tokenizer,
+        label_to_id,
+        word_level=not token_level,
+    )["data"]
+
+    col_w = 30
+    sep = "-" * (col_w + 16)
+
+    for i, (raw_row, tok_row) in enumerate(zip(dataset, tokenized)):
+        tokens = tokenizer.convert_ids_to_tokens(tok_row["input_ids"])
+        labels = tok_row["labels"]
+        click.echo(f"\n[{i}] {raw_row['source_annotated_loanwords']}")
+        click.echo(sep)
+        click.echo(f"  {'token':<{col_w}} label")
+        click.echo(sep)
+        pad = tokenizer.pad_token
+        pad_start = next(
+            (j for j, t in enumerate(tokens) if t == pad),
+            len(tokens),
+        )
+        n_pad = len(tokens) - pad_start
+        for tok, label_id in zip(tokens[:pad_start], labels[:pad_start]):
+            label_str = "~~" if label_id == -100 else id_to_label[label_id]
+            click.echo(f"  {tok:<{col_w}} {label_str}")
+        if n_pad:
+            click.echo(f"  {'...':<{col_w}} ({n_pad} padding tokens)")
+        click.echo(sep)
+
+
+@click.command("inspect-predictions")
+@click.option(
+    "--inputs", "-i",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSON dataset files. Required if splits don't exist yet.",
+)
+@click.option(
+    "--splits-dir",
+    default=None,
+    type=click.Path(file_okay=False),
+    help="Directory to save/load train/test splits.",
+)
+@click.option(
+    "--split",
+    type=click.Choice(["train", "test", "both"]),
+    default="test",
+    show_default=True,
+)
+@click.option("--rebuild-splits", is_flag=True)
+@click.option(
+    "--model-dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False),
+)
+@click.option("--token-level", is_flag=True)
+@click.option("--max-samples", type=int, default=None)
+@click.option("--seed", type=int, default=42, show_default=True)
+@click.option("--quiet", is_flag=True)
+def inspect_predictions(
+    inputs: tuple[str, ...],
+    splits_dir: str | None,
+    split: str,
+    rebuild_splits: bool,
+    model_dir: str,
+    token_level: bool,
+    max_samples: int | None,
+    seed: int,
+    quiet: bool,
+) -> None:
+    """Run a saved model on samples and print token-level predictions vs labels."""
+    import numpy as np
+    import torch
+    from datasets import DatasetDict
+    from transformers import (
+        AutoModelForTokenClassification,
+        DataCollatorForTokenClassification,
+        TrainingArguments,
+    )
     from transformers.trainer import Trainer
 
     if quiet:
         _silence_hf()
 
-    model_path = Path(model_dir)
-
     label_to_id = LoanLabel.label_to_id()
-    tokenizer = _load_tokenizer(str(model_path))
+    id_to_label = LoanLabel.id_to_label()
+    tokenizer = _load_tokenizer(model_dir)
 
-    splits = _load_or_build_splits(list(inputs), Path(splits_dir), seed, rebuild_splits)
-    tokenized = _tokenize_splits(splits, tokenizer, label_to_id)
+    # --- resolve dataset source ---
+    if splits_dir is not None:
+        splits_path = Path(splits_dir)
+        if rebuild_splits or not _splits_are_valid(splits_path):
+            if not inputs:
+                raise click.UsageError(
+                    "No valid splits found at --splits-dir. "
+                    "Provide --inputs to build them."
+                )
+        source = _load_or_build_splits(
+            list(inputs), splits_path, seed, rebuild_splits, dev=False
+        )
+        target_splits = ["train", "test"] if split == "both" else [split]
+        dataset = source[target_splits[0]] if len(target_splits) == 1 else source
+        if len(target_splits) > 1:
+            from datasets import concatenate_datasets
+            dataset = concatenate_datasets([source[s] for s in target_splits])
+    else:
+        if not inputs:
+            raise click.UsageError("Provide either --inputs or --splits-dir.")
+        dataset = load_conloan(list(inputs))
+
+    dataset = _cap_dataset(dataset.shuffle(seed=seed), max_samples)
+
+    tokenized = _tokenize_splits(
+        DatasetDict({"data": dataset}),
+        tokenizer,
+        label_to_id,
+        word_level=not token_level,
+    )["data"]
 
     use_cpu = not torch.cuda.is_available()
-    clf_model = AutoModelForTokenClassification.from_pretrained(str(model_path))
-
-    from transformers import TrainingArguments
-
-    args = TrainingArguments(
-        output_dir=str(model_path),
-        per_device_eval_batch_size=batch_size,
-        use_cpu=use_cpu,
-    )
+    clf_model = AutoModelForTokenClassification.from_pretrained(model_dir)
     trainer = Trainer(
         model=clf_model,
-        args=args,
+        args=TrainingArguments(
+            output_dir=model_dir,
+            per_device_eval_batch_size=16,
+            use_cpu=use_cpu,
+        ),
         data_collator=DataCollatorForTokenClassification(tokenizer),
-        compute_metrics=_make_compute_metrics(LoanLabel.id_to_label()),
     )
 
-    results: dict[str, dict] = {}
-    target_splits = ["train", "test"] if split == "both" else [split]
+    raw_preds, _, _ = trainer.predict(tokenized)
+    pred_ids = np.argmax(raw_preds, axis=-1)  # (N, seq_len)
 
-    for s in target_splits:
-        click.echo(f"Evaluating on {s} split...")
-        metrics = trainer.evaluate(eval_dataset=tokenized[s])
-        _print_single_eval_table(metrics, title=s)
-        results[s] = metrics
+    col_w = 30
+    sep = "-" * (col_w + 32)
 
-    out_path = model_path / "eval_results.json"
-    out_path.write_text(json.dumps(results, indent=2))
-    click.echo(f"\nResults saved to {out_path}")
+    for i, (raw_row, tok_row, sample_preds) in enumerate(
+        zip(dataset, tokenized, pred_ids)
+    ):
+        tokens = tokenizer.convert_ids_to_tokens(tok_row["input_ids"])
+        labels = tok_row["labels"]
 
+        pad = tokenizer.pad_token
+        pad_start = next(
+            (j for j, t in enumerate(tokens) if t == pad),
+            len(tokens),
+        )
+        n_pad = len(tokens) - pad_start
 
+        click.echo(f"\n[{i}] {raw_row['source_annotated_loanwords']}")
+        click.echo(sep)
+        click.echo(f"  {'token':<{col_w}} {'gold':<12} pred")
+        click.echo(sep)
+
+        for tok, label_id, pred_id in zip(
+            tokens[:pad_start],
+            labels[:pad_start],
+            sample_preds[:pad_start],
+        ):
+            gold_str = "~~" if label_id == -100 else id_to_label[label_id]
+            pred_str = "~~" if label_id == -100 else id_to_label[pred_id]
+            mismatch = " !" if gold_str != pred_str and gold_str != "~~" else ""
+            click.echo(f"  {tok:<{col_w}} {gold_str:<12} {pred_str}{mismatch}")
+
+        if n_pad:
+            click.echo(f"  {'...':<{col_w}} ({n_pad} padding tokens)")
+        click.echo(sep)
