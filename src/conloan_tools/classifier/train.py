@@ -218,6 +218,7 @@ def _make_training_args(
     batch_size: int,
     epochs: int,
     weight_decay: float,
+    warmup_ratio: float = 0.1,
     use_cpu: bool = False,
     fp16: bool = False,
     bf16: bool = False,
@@ -232,6 +233,7 @@ def _make_training_args(
         per_device_eval_batch_size=batch_size,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        warmup_ratio=warmup_ratio,
         optim="adamw_torch",
         eval_strategy="no",
         save_strategy="no",
@@ -397,6 +399,7 @@ def hyperparams(f: "Callable") -> "Callable":
         click.option("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY, show_default=True),
         click.option("--fp16", is_flag=True, help="Enable fp16 mixed precision (GPU only)."),
         click.option("--bf16", is_flag=True, help="Enable bf16 mixed precision (GPU only, Ampere+)."),
+        click.option("--warmup-ratio", type=float, default=0.1, show_default=True),
     ]
     for d in reversed(decorators):
         f = d(f)
@@ -492,6 +495,7 @@ def train(
     quiet: bool,
     fp16: bool,
     bf16: bool,
+    warmup_ratio: bool,
 ) -> None:
     """Train on the train split, evaluate on the test split."""
     import torch
@@ -584,6 +588,7 @@ def kfold(
     quiet: bool,
     fp16: bool,
     bf16: bool,
+    warmup_ratio: bool,
 ) -> None:
     """K-fold CV on the full dataset. No model artifact is saved."""
     import numpy as np
