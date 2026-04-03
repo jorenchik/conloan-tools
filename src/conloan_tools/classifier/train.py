@@ -220,6 +220,7 @@ def _make_training_args(
     weight_decay: float,
     train_dataset_size: int,
     warmup_ratio: float = 0.1,
+    save: str = "none",
     use_cpu: bool = False,
     fp16: bool = False,
     bf16: bool = False,
@@ -241,11 +242,11 @@ def _make_training_args(
         warmup_steps=warmup_steps,
         optim="adamw_torch",
         eval_strategy="no",
-        save_strategy="no",
         logging_steps=10,
         use_cpu=use_cpu,
         fp16=fp16 and not use_cpu,
         bf16=bf16 and not use_cpu,
+        **_save_kwargs(save),
     )
 
 
@@ -405,11 +406,32 @@ def hyperparams(f: "Callable") -> "Callable":
         click.option("--fp16", is_flag=True, help="Enable fp16 mixed precision (GPU only)."),
         click.option("--bf16", is_flag=True, help="Enable bf16 mixed precision (GPU only, Ampere+)."),
         click.option("--warmup-ratio", type=float, default=0.1, show_default=True),
+        click.option(
+            "--save",
+            type=click.Choice(["none", "best", "all"]),
+            default="none",
+            show_default=True,
+            help="Checkpoint saving: none, best epoch (requires --dev-split), all epochs.",
+        ),
     ]
     for d in reversed(decorators):
         f = d(f)
     return f
 
+
+def _save_kwargs(save: str) -> dict:
+    if save == "none":
+        return {"save_strategy": "no", "save_total_limit": None}
+    if save == "all":
+        return {"save_strategy": "epoch", "save_total_limit": None}
+    if save == "best":
+        return {
+            "save_strategy": "epoch",
+            "save_total_limit": 1,
+            "load_best_model_at_end": True,
+            "metric_for_best_model": "eval_f1_macro",
+        }
+    raise ValueError(f"Unknown save mode: {save}")
 
 def _resolve_dry_run(
     dry_run: bool,
@@ -501,9 +523,13 @@ def train(
     fp16: bool,
     bf16: bool,
     warmup_ratio: bool,
+    save: str,
 ) -> None:
     """Train on the train split, evaluate on the test split."""
     import torch
+
+    if save == "best" and not dev_split:
+        raise click.UsageError("--save best requires --dev-split.")
 
     if quiet:
         _silence_hf()
@@ -533,6 +559,7 @@ def train(
         use_cpu=not torch.cuda.is_available(),
         train_dataset_size=len(tokenized["train"]),
         warmup_ratio=warmup_ratio,
+        save=save,
     )
     trainer = _build_trainer(
         model_name=model,
@@ -596,10 +623,14 @@ def kfold(
     fp16: bool,
     bf16: bool,
     warmup_ratio: bool,
+    save: str,
 ) -> None:
     """K-fold CV on the full dataset. No model artifact is saved."""
     import numpy as np
     import torch
+
+    if save == "best" and not dev_split:
+        raise click.UsageError("--save best requires --dev-split.")
 
     if quiet:
         _silence_hf()
@@ -644,6 +675,7 @@ def kfold(
             use_cpu=use_cpu,
             train_dataset_size=len(train_idx),
             warmup_ratio=warmup_ratio,
+            save=save,
         )
         trainer = _build_trainer(
             model_name=model,
