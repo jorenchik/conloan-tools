@@ -218,12 +218,17 @@ def _make_training_args(
     batch_size: int,
     epochs: int,
     weight_decay: float,
+    train_dataset_size: int,
     warmup_ratio: float = 0.1,
     use_cpu: bool = False,
     fp16: bool = False,
     bf16: bool = False,
 ) -> "TrainingArguments":
+    import math
     from transformers import TrainingArguments
+
+    total_steps = math.ceil(train_dataset_size / batch_size) * epochs
+    warmup_steps = math.ceil(total_steps * warmup_ratio)
 
     return TrainingArguments(
         output_dir=output_dir,
@@ -233,7 +238,7 @@ def _make_training_args(
         per_device_eval_batch_size=batch_size,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
-        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps,
         optim="adamw_torch",
         eval_strategy="no",
         save_strategy="no",
@@ -526,6 +531,8 @@ def train(
         epochs=epochs,
         weight_decay=weight_decay,
         use_cpu=not torch.cuda.is_available(),
+        train_dataset_size=len(tokenized["train"]),
+        warmup_ratio=warmup_ratio,
     )
     trainer = _build_trainer(
         model_name=model,
@@ -635,6 +642,8 @@ def kfold(
             epochs=epochs,
             weight_decay=weight_decay,
             use_cpu=use_cpu,
+            train_dataset_size=len(train_idx),
+            warmup_ratio=warmup_ratio,
         )
         trainer = _build_trainer(
             model_name=model,
