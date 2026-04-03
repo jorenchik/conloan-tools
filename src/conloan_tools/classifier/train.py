@@ -219,6 +219,8 @@ def _make_training_args(
     epochs: int,
     weight_decay: float,
     use_cpu: bool = False,
+    fp16: bool = False,
+    bf16: bool = False,
 ) -> "TrainingArguments":
     from transformers import TrainingArguments
 
@@ -235,6 +237,8 @@ def _make_training_args(
         save_strategy="no",
         logging_steps=10,
         use_cpu=use_cpu,
+        fp16=fp16 and not use_cpu,
+        bf16=bf16 and not use_cpu,
     )
 
 
@@ -391,6 +395,8 @@ def hyperparams(f: "Callable") -> "Callable":
         click.option("--learning-rate", type=float, default=DEFAULT_LR, show_default=True),
         click.option("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, show_default=True),
         click.option("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY, show_default=True),
+        click.option("--fp16", is_flag=True, help="Enable fp16 mixed precision (GPU only)."),
+        click.option("--bf16", is_flag=True, help="Enable bf16 mixed precision (GPU only, Ampere+)."),
     ]
     for d in reversed(decorators):
         f = d(f)
@@ -484,6 +490,8 @@ def train(
     batch_size: int,
     weight_decay: float,
     quiet: bool,
+    fp16: bool,
+    bf16: bool,
 ) -> None:
     """Train on the train split, evaluate on the test split."""
     import torch
@@ -574,6 +582,8 @@ def kfold(
     weight_decay: float,
     k_folds: int,
     quiet: bool,
+    fp16: bool,
+    bf16: bool,
 ) -> None:
     """K-fold CV on the full dataset. No model artifact is saved."""
     import numpy as np
