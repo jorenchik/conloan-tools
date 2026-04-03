@@ -362,12 +362,16 @@ def build_ner_index(
                 ]
             else:
                 results = infer_ner_pretokenized(model, batch)
+                # get_logits skips entries with no word_logits; results may be
+                # shorter than batch. Re-derive words from get_logits to stay aligned.
+                logit_entries = get_logits(model, batch)
                 arrays = [
                     np.array([
                         lid if is_clean_word(w, allow_ner=True) else 0
                         for w, lid in zip(words, r.label_ids)
                     ], dtype=np.uint8)
                     for (words, _), r in zip(batch, results)
+                    for (words, _), r in zip(logit_entries, results)
                 ]
 
             for arr in arrays:

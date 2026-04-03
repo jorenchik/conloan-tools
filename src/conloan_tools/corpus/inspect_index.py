@@ -34,6 +34,10 @@ def _is_logits(f: h5py.File) -> bool:
     return f["scores"]["data"].ndim == 2
 
 
+def _is_ner(attrs: dict) -> bool:
+    return attrs.get("type") == "ner"
+
+
 def _id2label(attrs: dict) -> dict[int, str] | None:
     raw = attrs.get("id2label")
     if raw is None:
@@ -100,6 +104,45 @@ def _fmt_scores_2d(
     if len(arr) > head_tokens:
         lines.append(f"  ... (+{len(arr) - head_tokens} more tokens)")
     return lines
+
+
+def _fmt_scores_labels(
+    arr: np.ndarray,
+    id2label: dict[int, str] | None,
+    head_tokens: int,
+) -> list[str]:
+    """Return one line per token for NER labels mode (uint8 IDs)."""
+    lines = []
+    for i, lid in enumerate(arr[:head_tokens]):
+        label = id2label[int(lid)] if id2label else str(int(lid))
+        lines.append(f"  token[{i:>4}]  label={label}")
+    if len(arr) > head_tokens:
+        lines.append(f"  ... (+{len(arr) - head_tokens} more tokens)")
+    return lines
+
+
+def _print_sentence_scores(
+    arr: np.ndarray,
+    attrs: dict,
+    f: h5py.File,
+    head_tokens: int,
+    head_labels: int,
+) -> None:
+    """Dispatch score display based on index type."""
+    id2label = _id2label(attrs)
+    if _is_logits(f):
+        click.echo("scores (logits):")
+        for line in _fmt_scores_2d(arr, id2label, head_tokens, head_labels):
+            click.echo(line)
+    elif _is_ner(attrs):
+        click.echo("scores (NER labels):")
+        for line in _fmt_scores_labels(arr, id2label, head_tokens):
+            click.echo(line)
+    else:
+        click.echo(
+            "scores : "
+            + _fmt_scores_1d(arr, head_tokens, str(arr.dtype))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +236,6 @@ def cmd_sent(
             row      = lookup_spos
             cpos_val = int(cpos_ds[row])
         else:
-            # nearest: last sentence whose cpos <= lookup_cpos
             row, cpos_val = _find_sentence_by_cpos(cpos_ds, lookup_cpos)
 
         count = int(count_ds[row])
@@ -208,17 +250,7 @@ def cmd_sent(
         click.echo(f"count  : {count} tokens")
 
         arr = _get_sentence_scores(f, row)
-
-        if _is_logits(f):
-            id2label = _id2label(attrs)
-            click.echo("scores (logits):")
-            for line in _fmt_scores_2d(arr, id2label, head_tokens, head_labels):
-                click.echo(line)
-        else:
-            click.echo(
-                "scores : "
-                + _fmt_scores_1d(arr, head_tokens, str(arr.dtype))
-            )
+        _print_sentence_scores(arr, attrs, f, head_tokens, head_labels)
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +346,6 @@ def cmd_sample(
         n_sents = f["index"]["cpos"].shape[0]
         rng     = np.random.default_rng(seed)
         rows    = sorted(rng.choice(n_sents, size=min(n, n_sents), replace=False))
-        id2label = _id2label(attrs)
-        logits   = _is_logits(f)
 
         for row in rows:
             cpos_val = int(f["index"]["cpos"][row])
@@ -328,13 +358,7 @@ def cmd_sample(
             arr = _get_sentence_scores(f, row)
 
             click.echo(f"\n--- spos={spos_val}  cpos={cpos_val}  count={count} ---")
-            if logits:
-                for line in _fmt_scores_2d(arr, id2label, head_tokens, head_labels):
-                    click.echo(line)
-            else:
-                click.echo(
-                    "  " + _fmt_scores_1d(arr, head_tokens, str(arr.dtype))
-                )
+            _print_sentence_scores(arr, attrs, f, head_tokens, head_labels)
 
 
 # ---------------------------------------------------------------------------
@@ -353,20 +377,21 @@ def cmd_hist(path: str, bins: int, max_sentences: int) -> None:
     """
     Print ASCII histogram of score values.
 
-    Surprisal / NER labels: histogram of all token scores.
-    NER logits: histogram of per-token argmax label indices.
+    Surprisal        : histogram of raw float scores.
+    NER labels       : frequency count per label ID.
+    NER logits       : frequency count of per-token argmax label.
     """
     with _open_h5(path) as f:
-        attrs    = _attrs(f)
+        attrs     = _attrs(f)
         scores_ds = f["scores"]["data"]
-        n_tokens = scores_ds.shape[0]
-        logits   = _is_logits(f)
-        id2label = _id2label(attrs)
+        n_tokens  = scores_ds.shape[0]
+        logits    = _is_logits(f)
+        ner       = _is_ner(attrs)
+        id2label  = _id2label(attrs)
 
         cap = max_sentences
         if cap and cap > 0:
             count_ds = f["index"]["count"][:]
-            # pick first `cap` sentences
             n_cap    = min(cap, len(count_ds))
             n_tok    = int(count_ds[:n_cap].sum())
             data_raw = scores_ds[:n_tok]
@@ -378,26 +403,30 @@ def cmd_hist(path: str, bins: int, max_sentences: int) -> None:
 
         if logits:
             data = np.argmax(data_raw, axis=1).astype(np.int32)
-            click.echo("Mode: argmax label index over logits (--bins ignored)\n")
-            counts = np.bincount(
-                data, minlength=len(id2label) if id2label else int(data.max()) + 1
-            )
-            edges = np.arange(len(counts) + 1, dtype=np.float32)
+            click.echo("Mode: argmax label index over logits\n")
+        elif ner:
+            data = data_raw[:].astype(np.int32)
+            click.echo("Mode: NER label IDs\n")
         else:
             data = data_raw[:].astype(np.float32)
             click.echo(f"Mode: raw scores  mean={data.mean():.4f}  std={data.std():.4f}\n")
+
+        if logits or ner:
+            n_classes = len(id2label) if id2label else int(data.max()) + 1
+            counts    = np.bincount(data, minlength=n_classes)
+            edges     = np.arange(n_classes + 1, dtype=np.float32)
+        else:
             counts, edges = np.histogram(data, bins=bins)
 
-        counts, edges = np.histogram(data, bins=bins)
         max_count = counts.max()
-        bar_width  = 50
+        bar_width = 50
 
         for i, c in enumerate(counts):
-            bar   = "█" * int(c / max_count * bar_width)
-            lo, hi = edges[i], edges[i + 1]
-            if logits and id2label:
-                label = id2label.get(int(lo), str(int(lo)))
+            bar = "█" * int(c / max_count * bar_width)
+            if (logits or ner) and id2label:
+                label = id2label.get(i, str(i))
                 tag   = f"{label:<14}"
             else:
+                lo, hi = edges[i], edges[i + 1]
                 tag = f"{lo:>8.4f} – {hi:<8.4f}"
             click.echo(f"  {tag}  {bar:<{bar_width}}  {c:>8,}")
