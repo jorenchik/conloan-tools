@@ -168,19 +168,25 @@ def _load_index_records(h5_path: Path) -> list[IndexRecord]:
 def _load_ner_labels(h5_path: Path) -> tuple[np.ndarray, list[IndexRecord], dict[int, str]]:
     """
     Load NER label index from HDF5.
-    Returns (flat_label_array uint8, index_records, id2label).
-    Raises ValueError for logits-mode files.
     """
     import h5py
 
     with h5py.File(h5_path, "r") as f:
         ner_output = f.attrs.get("ner_output", "labels")
-        if ner_output != "labels":
+        raw = f["scores"]["data"][:]
+        if ner_output == "logits":
+            if raw.ndim != 2:
+                raise click.UsageError(
+                    f"{h5_path.name}: expected 2-D logits array, "
+                    f"got shape {raw.shape}."
+                )
+            labels = np.argmax(raw, axis=-1).astype(np.uint8)
+        elif ner_output == "labels":
+            labels = raw.astype(np.uint8)
+        else:
             raise click.UsageError(
-                f"{h5_path.name} was built with ner_output='{ner_output}'. "
-                "Re-build the index with --ner-output labels."
+                f"{h5_path.name}: unknown ner_output='{ner_output}'."
             )
-        labels = f["scores"]["data"][:]
         cpos   = f["index"]["cpos"][:]
         count  = f["index"]["count"][:]
         raw_id2label = json.loads(f.attrs["id2label"])
@@ -907,7 +913,7 @@ def query_ner_entities(
     for sent_idx, record in enumerate(
         tqdm(records, desc="Scanning NER labels", unit="sent")
     ):
-        chunk = flat_labees[record.offset : record.offset + record.count]
+        chunk = flat_labels[record.offset : record.offset + record.count]
         if np.any(np.isin(chunk, list(want))):
             matching.append(sent_idx)
         if max_results > 0 and len(matching) >= max_results:

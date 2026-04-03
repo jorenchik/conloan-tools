@@ -241,7 +241,7 @@ def build_surprisal_index(
             limit_mb=limit_mb,
         ):
             scores = [
-                lm.compute_score(tok, reduction) if is_clean_word(tok) else 0.0
+                lm.compute_score(tok, reduction) if is_clean_word(tok, allow_ner=False) else 0.0
                 for tok in tokens
             ]
             arr = np.array(scores, dtype=np.float16)
@@ -295,17 +295,20 @@ def build_ner_index(
     num_labels = len(id2label)
 
     import torch
-    model_torch_dtype = next(model.model.parameters()).dtype
-    scores_dtype = None
+
+    # bfloat16 has no HDF5 equivalent — promote to float32 on write.
+    _TORCH_TO_NP: dict[torch.dtype, type] = {
+        torch.float32: np.float32,
+        torch.float16: np.float16,
+        torch.bfloat16: np.float32,   # promoted
+    }
     if ner_output == "logits":
-        if model_torch_dtype == torch.float16:
-            scores_dtype = np.float16 
-        elif model_torch_dtype == torch.float16:
-            scores_dtype = np.float32
-        else:
-            raise Exception(f"Unexpected model dtype {model_torch_dtype}")
+        torch_dtype = model.torch_dtype or next(model.model.parameters()).dtype
+        scores_dtype = _TORCH_TO_NP.get(torch_dtype)
+        if scores_dtype is None:
+            raise ValueError(f"Unsupported model dtype {torch_dtype}")
     else:
-        scores_dtype = np.uint8 
+        scores_dtype = np.uint8
 
     num_labels_arg = num_labels if ner_output == "logits" else None
 
@@ -316,6 +319,11 @@ def build_ner_index(
         "input":      str(input_path),
         "date":       datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "dtype":      str(scores_dtype) if ner_output == "logits" else "uint8",
+        "torch_dtype": str(model.torch_dtype) if model.torch_dtype else "unknown",
+        "bf16_promoted": (
+            ner_output == "logits"
+            and model.torch_dtype == torch.bfloat16
+        ),
         "num_labels": num_labels,
         "id2label":   id2label,
         "store_spos": store_spos,
@@ -345,14 +353,21 @@ def build_ner_index(
 
             if ner_output == "logits":
                 results = get_logits(model, batch)
-                # get_logits returns (words, tensor) per entry
                 arrays = [
-                    t.cpu().numpy().astype(np.float32) for _, t in results
+                    np.array([
+                        row if is_clean_word(w, allow_ner=True) else np.zeros_like(row)
+                        for w, row in zip(words, t.to(torch.float32).cpu().numpy().astype(scores_dtype))
+                    ], dtype=scores_dtype)
+                    for words, t in results
                 ]
             else:
                 results = infer_ner_pretokenized(model, batch)
                 arrays = [
-                    np.array(r.label_ids, dtype=np.uint8) for r in results
+                    np.array([
+                        lid if is_clean_word(w, allow_ner=True) else 0
+                        for w, lid in zip(words, r.label_ids)
+                    ], dtype=np.uint8)
+                    for (words, _), r in zip(batch, results)
                 ]
 
             for arr in arrays:
@@ -400,7 +415,7 @@ def build_index():
 @click.option("--output-dir",      required=True, help="Output directory")
 @click.option("--name",            required=True, help="Base name for output file")
 @click.option("--n",               default=3, show_default=True)
-@click.option("--reduction",       type=click.Choice(["max", "mean"]), default="max", show_default=True)
+@click.option("--reduction",       type=click.Choice(["max", "mean"]), default="mean", show_default=True)
 @click.option("--no-spos",         is_flag=True, default=False, help="Omit spos dataset")
 @click.option("--limit-lines",     type=int)
 @click.option("--limit-sentences", type=int)
@@ -439,16 +454,24 @@ def build_surprisal_index_command(
 @click.option("--limit-lines",     type=int)
 @click.option("--limit-sentences", type=int)
 @click.option("--limit-mb",        type=float)
+@click.option(
+    "--dtype",
+    type=click.Choice(["auto", "fp32", "fp16", "bf16"]),
+    default="auto",
+    show_default=True,
+    help="Model weight dtype. bf16 logits are stored as fp32.",
+)
 def build_ner_index_command(
     model_name, input_path, output_dir, name, lang,
-    batch_size, device, ner_output, no_spos,
+    batch_size, device, ner_output, dtype, no_spos,
     limit_lines, limit_sentences, limit_mb,
 ) -> None:
-    """Score every token in a .vert corpus with NER. Streams to HDF5."""
     from conloan_tools.ner.ner import build_ner_model
 
     click.echo(f"Device {device}")
-    _model = build_ner_model(model_name=model_name, device=device)
+    _model = build_ner_model(model_name=model_name, device=device, dtype=dtype)
+    if ner_output == "logits" and dtype == "bf16":
+        click.echo("[!] bf16 model: logits will be stored as fp32 (HDF5 limitation)", err=True)
     h5_path = build_ner_index(
         model=_model,
         input_path=input_path,

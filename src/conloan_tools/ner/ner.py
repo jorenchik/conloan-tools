@@ -20,6 +20,7 @@ class NERModel:
     model: AutoModelForTokenClassification
     id2label: dict[int, str]
     device: str
+    torch_dtype: torch.dtype = None
 
 
 @dataclass
@@ -215,6 +216,7 @@ def infer_ner_batch(
 def build_ner_model(
     model_name: str = "Babelscape/wikineural-multilingual-ner",
     device: str | None = None,
+    dtype: str = "auto", # "auto" | "fp32" | "fp16" | "bf16"
 ) -> NERModel:
     import torch
     from transformers import AutoModelForTokenClassification, AutoTokenizer
@@ -222,17 +224,30 @@ def build_ner_model(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    _DTYPE_MAP = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }
+    if dtype == "auto":
+        torch_dtype = torch.float16 if device == "cuda" else torch.float32
+    elif dtype in _DTYPE_MAP:
+        torch_dtype = _DTYPE_MAP[dtype]
+    else:
+        raise ValueError(f"dtype must be auto/fp32/fp16/bf16, got {dtype!r}")
+
     tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(model_name)
     model: AutoModelForTokenClassification = (
         AutoModelForTokenClassification.from_pretrained(
             model_name, 
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32
+            torch_dtype=torch_dtype,
         ).to(device)
     )
 
     return NERModel(
         tokenizer=tokenizer,
         model=model,
+        torch_dtype=torch_dtype,
         id2label={k: _normalize_label(v) for k, v in model.config.id2label.items()},
         device=device,
     )
@@ -345,6 +360,13 @@ def _resolve_label_float(
     default=False,
     help="Suppress per-result output; print only benchmark stats.",
 )
+@click.option(
+    "--dtype",
+    type=click.Choice(["auto", "fp32", "fp16", "bf16"]),
+    default="auto",
+    show_default=True,
+    help="Model weight dtype.",
+)
 def benchmark(
     input_texts: str,
     model_name: str,
@@ -372,7 +394,7 @@ def benchmark(
     _tokenizer: stanza.Pipeline = _stanza_tokenizer(
         lang=lang, use_gpu=(device == "cuda")
     )
-    _model: NERModel = build_ner_model(model_name=model_name, device=device)
+    _model: NERModel = build_ner_model(model_name=model_name, device=device, dtype=dtype)
 
     biases: dict[str, float] | None = (
         {label: val for label, val in label_biases} if label_biases else None
