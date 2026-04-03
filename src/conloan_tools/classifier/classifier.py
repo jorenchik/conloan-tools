@@ -1,5 +1,5 @@
 import click
-from .train import train, kfold, eval_cmd, inspect_tokens, inspect_predictions
+from .train import train, kfold, eval_cmd, inspect_tokens, inspect_predictions, inspect_lengths
 
 @click.group()
 def classifier():
@@ -10,3 +10,4 @@ classifier.add_command(kfold)
 classifier.add_command(eval_cmd)
 classifier.add_command(inspect_tokens)
 classifier.add_command(inspect_predictions)
+classifier.add_command(inspect_lengths)

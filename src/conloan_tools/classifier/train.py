@@ -956,3 +956,48 @@ def inspect_predictions(
         if n_pad:
             click.echo(f"  {'...':<{col_w}} ({n_pad} padding tokens)")
         click.echo(sep)
+
+
+@click.command("inspect-lengths")
+@click.option(
+    "--inputs", "-i",
+    required=True, multiple=True,
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option("--model", default=DEFAULT_MODEL, show_default=True)
+@click.option("--max-length", type=int, default=128, show_default=True)
+def inspect_lengths(
+    inputs: tuple[str, ...],
+    model: str,
+    max_length: int,
+) -> None:
+    """Print token length distribution and truncation rate."""
+    import numpy as np
+    from datasets import DatasetDict
+
+    label_to_id = LoanLabel.label_to_id()
+    tokenizer = _load_tokenizer(model)
+    dataset = load_conloan(list(inputs))
+
+    tokenized = DatasetDict({"data": dataset}).map(
+        lambda x: tokenize_and_align_labels(
+            x, tokenizer, label_to_id,
+            truncation=False,
+            padding="do_not_pad",
+        ),
+        batched=True,
+    )["data"]
+
+    lengths = np.array([len(row["input_ids"]) for row in tokenized])
+    truncated = int((lengths > max_length).sum())
+
+    percentiles = [50, 75, 90, 95, 99, 100]
+    click.echo(f"\nToken length distribution (n={len(lengths)}, max_length={max_length}):")
+    click.echo(f"  {'min':<8} {int(lengths.min())}")
+    click.echo(f"  {'mean':<8} {lengths.mean():.1f}")
+    for p in percentiles:
+        click.echo(f"  {'p' + str(p):<8} {int(np.percentile(lengths, p))}")
+    click.echo(
+        f"\n  Truncated: {truncated}/{len(lengths)} "
+        f"({100 * truncated / len(lengths):.1f}%)"
+    )
