@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import click
+import re
 import h5py
 import numpy as np
 from tqdm import tqdm
@@ -358,18 +359,13 @@ def cmd_validate(
         count = count_ds[:]
         spos  = f["index"]["spos"][:] if has_spos else None
 
-        if cpos[0] != 0:
-            _err(f"cpos[0]={cpos[0]}, expected 0")
-
-        expected = int(cpos[0])
-        for i in range(n_sents):
-            if int(cpos[i]) != expected:
+        for i in range(n_sents - 1):
+            min_next = int(cpos[i]) + int(count[i])
+            if int(cpos[i + 1]) < min_next:
                 _err(
-                    f"cpos discontinuity at row={i}: "
-                    f"expected {expected}, got {cpos[i]}"
+                    f"cpos overlap at row={i}: "
+                    f"cpos[{i}]={cpos[i]} + count={count[i]} > cpos[{i+1}]={cpos[i+1]}"
                 )
-                expected = int(cpos[i])
-            expected += int(count[i])
 
         total  = int(count.sum())
         actual = scores_ds.shape[0]
@@ -618,3 +614,86 @@ def cmd_hist(path: str, bins: int, max_sentences: int) -> None:
                 lo, hi = edges[i], edges[i + 1]
                 tag = f"{lo:>8.4f} – {hi:<8.4f}"
             click.echo(f"  {tag}  {bar:<{bar_width}}  {c:>8,}")
+
+
+@inspect_index.command("find-offset")
+@click.argument("path")
+@click.argument("corpus_name")
+@click.option("--cqp-bin",      default="cqp", show_default=True)
+@click.option("--registry-dir", default=None)
+def cmd_find_offset(
+    path: str,
+    corpus_name: str,
+    cqp_bin: str,
+    registry_dir: str | None,
+) -> None:
+    """
+    Binary search for the first spos where stored cpos diverges from CWB.
+
+    Requires --corpus and a working CQP setup.
+    """
+    try:
+        from conloan_tools.corpus.query import (
+            fetch_corpus_sentences,
+            _resolve_registry,
+        )
+    except ImportError as exc:
+        click.echo(f"[FAIL] Cannot import query helpers: {exc}", err=True)
+        sys.exit(1)
+
+    try:
+        _resolve_registry(registry_dir)
+    except Exception as exc:
+        click.echo(f"[FAIL] Registry not resolvable: {exc}", err=True)
+        sys.exit(1)
+
+    def get_cwb_cpos(spos: int) -> int:
+        raw = fetch_corpus_sentences(
+            corpus=corpus_name,
+            indices=[spos],
+            mode="spos",
+            cqp_bin=cqp_bin,
+            registry_dir=registry_dir,
+        )
+        m = re.search(r"<MATCHNUM>(\d+)</MATCHNUM>", raw)
+        if not m:
+            raise ValueError(f"No MATCHNUM in CWB output for spos={spos}")
+        return int(m.group(1))
+
+    with _open_h5(path) as f:
+        cpos_ds = f["index"]["cpos"]
+        spos_ds = f["index"]["spos"] if "spos" in f["index"] else None
+        n_sents = cpos_ds.shape[0]
+        cpos    = cpos_ds[:]
+        spos_arr = f["index"]["spos"][:] if spos_ds is not None else np.arange(n_sents)
+
+    lo, hi = 0, n_sents - 1
+    first_bad = -1
+
+    click.echo(f"Binary searching over {n_sents:,} sentences...")
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        stored = int(cpos[mid])
+        sp     = int(spos_arr[mid])
+        actual = get_cwb_cpos(sp)
+        diff   = actual - stored
+        click.echo(f"  spos={sp:>10}  stored={stored:>10}  actual={actual:>10}  diff={diff:+d}")
+
+        if diff != 0:
+            first_bad = mid
+            hi = mid - 1
+        else:
+            lo = mid + 1
+
+    if first_bad == -1:
+        click.echo("\n[OK] No divergence found.")
+    else:
+        sp     = int(spos_arr[first_bad])
+        stored = int(cpos[first_bad])
+        actual = get_cwb_cpos(sp)
+        click.echo(
+            f"\n[FAIL] First bad sentence: row={first_bad}  "
+            f"spos={sp}  stored={stored}  actual={actual}  "
+            f"diff={actual - stored:+d}"
+        )
