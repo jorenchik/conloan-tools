@@ -299,6 +299,8 @@ def build_ner_index(
     limit_sentences: int | None = None,
     limit_mb: float | None = None,
 ) -> Path:
+    import torch
+
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     h5_path = out / f"{name}.h5"
@@ -309,39 +311,33 @@ def build_ner_index(
     id2label: dict[int, str] = {int(k): v for k, v in model.id2label.items()}
     num_labels = len(id2label)
 
-    import torch
-
-    # bfloat16 has no HDF5 equivalent — promote to float32 on write.
     _TORCH_TO_NP: dict[torch.dtype, type] = {
         torch.float32: np.float32,
         torch.float16: np.float16,
-        torch.bfloat16: np.float32,   # promoted
+        torch.bfloat16: np.float32,  # promoted — no HDF5 bfloat16
     }
     if ner_output == "logits":
         torch_dtype = model.torch_dtype or next(model.model.parameters()).dtype
         scores_dtype = _TORCH_TO_NP.get(torch_dtype)
         if scores_dtype is None:
             raise ValueError(f"Unsupported model dtype {torch_dtype}")
+        num_labels_arg = num_labels
     else:
         scores_dtype = np.uint8
-
-    num_labels_arg = num_labels if ner_output == "logits" else None
+        num_labels_arg = None
 
     meta = {
-        "type":       "ner",
-        "ner_output": ner_output,
-        "model":      getattr(model.model.config, "_name_or_path", "unknown"),
-        "input":      str(input_path),
-        "date":       datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "dtype":      str(scores_dtype) if ner_output == "logits" else "uint8",
-        "torch_dtype": str(model.torch_dtype) if model.torch_dtype else "unknown",
-        "bf16_promoted": (
-            ner_output == "logits"
-            and model.torch_dtype == torch.bfloat16
-        ),
-        "num_labels": num_labels,
-        "id2label":   id2label,
-        "store_spos": store_spos,
+        "type":          "ner",
+        "ner_output":    ner_output,
+        "model":         getattr(model.model.config, "_name_or_path", "unknown"),
+        "input":         str(input_path),
+        "date":          datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "dtype":         str(scores_dtype) if ner_output == "logits" else "uint8",
+        "torch_dtype":   str(model.torch_dtype) if model.torch_dtype else "unknown",
+        "bf16_promoted": ner_output == "logits" and model.torch_dtype == torch.bfloat16,
+        "num_labels":    num_labels,
+        "id2label":      id2label,
+        "store_spos":    store_spos,
     }
 
     f = _create_hdf5(h5_path, scores_dtype, meta, store_spos, num_labels_arg)
@@ -352,58 +348,78 @@ def build_ner_index(
     scores_buf: list[np.ndarray] = []
     spos = 0
 
-    sentence_iterator = iter_vert_sentences(
-        input_path,
-        limit_lines=limit_lines,
-        limit_sentences=limit_sentences,
-        limit_mb=limit_mb,
-    )
+    # Each batch entry: (sent_id, tokens, cpos)
+    batch: list[tuple[str, list[str], int]] = []
 
-    try:
-        batch: list[tuple[str, list[str], int]] = []
+    def flush_batch() -> None:
+        nonlocal spos
 
-        def flush_batch() -> None:
-            nonlocal spos
+        # get_logits is the single source of truth for both modes:
+        # it filters out sentences with no usable word_logits, so
+        # it determines which entries are actually written to the index.
+        logit_entries: list[tuple[list[str], torch.Tensor]] = get_logits(model, batch)
 
-            if ner_output == "logits":
-                results = get_logits(model, batch)
-                arrays = [
-                    np.array([
+        # Build a cpos lookup keyed by word list identity so we can recover
+        # the original cpos for each surviving entry.
+        # get_logits preserves order and skips entries — align by position
+        # against the original batch using the returned word lists.
+        surviving: list[tuple[str, list[str], int]] = []
+        batch_iter = iter(batch)
+        for words, _ in logit_entries:
+            for sent_id, batch_words, cpos in batch_iter:
+                if batch_words is words:
+                    surviving.append((sent_id, batch_words, cpos))
+                    break
+
+        if ner_output == "logits":
+            arrays: list[np.ndarray] = [
+                np.array(
+                    [
                         row if is_clean_word(w, allow_ner=True) else np.zeros_like(row)
-                        for w, row in zip(words, t.to(torch.float32).cpu().numpy().astype(scores_dtype))
-                    ], dtype=scores_dtype)
-                    for words, t in results
-                ]
-            else:
-                results = infer_ner_pretokenized(model, batch)
-                # get_logits skips entries with no word_logits; results may be
-                # shorter than batch. Re-derive words from get_logits to stay aligned.
-                logit_entries = get_logits(model, batch)
-                arrays = [
-                    np.array([
+                        for w, row in zip(
+                            words,
+                            t.to(torch.float32).cpu().numpy().astype(scores_dtype),
+                        )
+                    ],
+                    dtype=scores_dtype,
+                )
+                for (words, t), (_, _, _) in zip(logit_entries, surviving)
+            ]
+        else:
+            # infer_ner_pretokenized only on the surviving subset so indexing
+            # stays consistent with logit_entries.
+            results = infer_ner_pretokenized(model, surviving)
+            arrays = [
+                np.array(
+                    [
                         lid if is_clean_word(w, allow_ner=True) else 0
                         for w, lid in zip(words, r.label_ids)
-                    ], dtype=np.uint8)
-                    for (words, _), r in zip(batch, results)
-                    for (words, _), r in zip(logit_entries, results)
-                ]
-
-            for (sent_id, words, sent_cpos), arr in zip(batch, arrays):
-                cpos_buf.append(sent_cpos)  # use yielded cpos, not accumulated
-                count_buf.append(arr.shape[0])
-                if spos_buf is not None:
-                    spos_buf.append(spos)
-                scores_buf.append(arr)
-                spos += 1
-
-            if len(cpos_buf) >= flush_every:
-                _hdf5_flush(
-                    f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos
+                    ],
+                    dtype=np.uint8,
                 )
+                for (words, _), r in zip(logit_entries, results)
+            ]
 
-            batch.clear()
+        for (_, _, sent_cpos), arr in zip(surviving, arrays):
+            cpos_buf.append(sent_cpos)
+            count_buf.append(arr.shape[0])
+            if spos_buf is not None:
+                spos_buf.append(spos)
+            scores_buf.append(arr)
+            spos += 1  # increments only for non-skipped entries
 
-        for sent_id, tokens, cpos in sentence_iterator:
+        if len(cpos_buf) >= flush_every:
+            _hdf5_flush(f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos)
+
+        batch.clear()
+
+    try:
+        for sent_id, tokens, cpos in iter_vert_sentences(
+            input_path,
+            limit_lines=limit_lines,
+            limit_sentences=limit_sentences,
+            limit_mb=limit_mb,
+        ):
             batch.append((sent_id, tokens, cpos))
             if len(batch) >= batch_size:
                 flush_batch()
