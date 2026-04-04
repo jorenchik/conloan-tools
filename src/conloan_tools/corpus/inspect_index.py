@@ -67,6 +67,15 @@ def _find_sentence_by_cpos(
     return result, int(cpos_ds[result])
 
 
+def _validate_cpos_lookup(cpos_val: int, count: int, target: int) -> None:
+    if not (cpos_val <= target < cpos_val + count):
+        click.echo(
+            f"Warning: cpos {target} is beyond the last token of the "
+            f"containing sentence (cpos={cpos_val}, count={count}).",
+            err=True,
+        )
+
+
 def _get_sentence_scores(
     f: h5py.File, row: int
 ) -> np.ndarray:
@@ -229,11 +238,23 @@ def cmd_sent(
         if lookup_spos is not None:
             if lookup_spos < 0 or lookup_spos >= n_sents:
                 click.echo(
-                    f"Error: spos {lookup_spos} out of range [0, {n_sents - 1}].",
+                    f"Error: spos {lookup_spos} out of range "
+                    f"[0, {n_sents - 1}].",
                     err=True,
                 )
                 sys.exit(1)
-            row      = lookup_spos
+            if "spos" in f["index"]:
+                spos_arr = f["index"]["spos"][:]
+                matches  = np.where(spos_arr == lookup_spos)[0]
+                if len(matches) == 0:
+                    click.echo(
+                        f"Error: spos {lookup_spos} not found in index.",
+                        err=True,
+                    )
+                    sys.exit(1)
+                row = int(matches[0])
+            else:
+                row = lookup_spos
             cpos_val = int(cpos_ds[row])
         else:
             row, cpos_val = _find_sentence_by_cpos(cpos_ds, lookup_cpos)
@@ -244,6 +265,8 @@ def cmd_sent(
             if "spos" in f["index"]
             else row
         )
+        if lookup_cpos is not None:
+            _validate_cpos_lookup(cpos_val, count, lookup_cpos)
 
         click.echo(f"spos   : {spos_val}")
         click.echo(f"cpos   : {cpos_val}")
@@ -289,6 +312,9 @@ def cmd_validate(path: str) -> None:
         cpos  = cpos_ds[:]
         count = count_ds[:]
 
+        if cpos[0] != 0:
+            _err(f"cpos[0]={cpos[0]}, expected 0")
+
         # 1. cpos continuity
         expected = cpos[0]
         for i in range(n_sents):
@@ -316,6 +342,8 @@ def cmd_validate(path: str) -> None:
                     f"spos not strictly +1 at row {b}: "
                     f"{spos[b]} -> {spos[b + 1]}"
                 )
+            if len(bad) > 10:
+                _err(f"... and {len(bad) - 10} more spos errors (total {len(bad)})")
         else:
             click.echo("  spos: not stored (skipped)")
 
@@ -405,10 +433,10 @@ def cmd_hist(path: str, bins: int, max_sentences: int) -> None:
             data = np.argmax(data_raw, axis=1).astype(np.int32)
             click.echo("Mode: argmax label index over logits\n")
         elif ner:
-            data = data_raw[:].astype(np.int32)
+            data = data_raw.astype(np.int32)
             click.echo("Mode: NER label IDs\n")
         else:
-            data = data_raw[:].astype(np.float32)
+            data = data_raw.astype(np.float32)
             click.echo(f"Mode: raw scores  mean={data.mean():.4f}  std={data.std():.4f}\n")
 
         if logits or ner:
