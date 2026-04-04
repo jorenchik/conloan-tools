@@ -363,6 +363,7 @@ def build_ner_index(
         batch: list[tuple[str, list[str], int]] = []
 
         def flush_batch() -> None:
+            nonlocal spos
 
             if ner_output == "logits":
                 results = get_logits(model, batch)
