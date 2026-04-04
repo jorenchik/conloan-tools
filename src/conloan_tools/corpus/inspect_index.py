@@ -5,6 +5,7 @@ from pathlib import Path
 import click
 import h5py
 import numpy as np
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
@@ -283,13 +284,53 @@ def cmd_sent(
 
 @inspect_index.command("validate")
 @click.argument("path")
-def cmd_validate(path: str) -> None:
+@click.option("--corpus",        default=None, help="Corpus name for CQP cross-check.")
+@click.option("--cqp-bin",       default="cqp", show_default=True)
+@click.option("--registry-dir",  default=None)
+@click.option(
+    "--sample",
+    type=int,
+    default=None,
+    help="Randomly sample N sentences for CQP cross-check (default: all).",
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=256,
+    show_default=True,
+    help="Sentences per CQP fetch batch.",
+)
+@click.option(
+    "--max-errors",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Abort CQP cross-check after this many token-count mismatches (0 = unlimited).",
+)
+@click.option("--seed", default=42, show_default=True)
+def cmd_validate(
+    path: str,
+    corpus: str | None,
+    cqp_bin: str,
+    registry_dir: str | None,
+    sample: int | None,
+    batch_size: int,
+    max_errors: int,
+    seed: int,
+) -> None:
     """
-    Check internal consistency of an index file.
+    Check internal consistency of an index file, and optionally
+    cross-check token counts against live CQP output.
 
-      - cpos[i+1] == cpos[i] + count[i] for all i
-      - spos is strictly monotone (if present)
+    Structural checks:
+      - cpos[i+1] == cpos[i] + count[i]  for all i
+      - spos is strictly +1              (if present)
       - scores/data.shape[0] == sum(count)
+
+    CQP cross-check (requires --corpus):
+      - For every sampled sentence, fetch the sentence from CQP by spos,
+        parse it with the same tokeniser used at index time, and compare
+        the token count stored in the index against the live parse.
     """
     errors = 0
 
@@ -298,59 +339,197 @@ def cmd_validate(path: str) -> None:
         click.echo(f"  [FAIL] {msg}")
         errors += 1
 
+    # ------------------------------------------------------------------ #
+    # Phase 1 – structural checks (no CQP needed)                         #
+    # ------------------------------------------------------------------ #
     with _open_h5(path) as f:
-        cpos_ds  = f["index"]["cpos"]
-        count_ds = f["index"]["count"]
+        cpos_ds   = f["index"]["cpos"]
+        count_ds  = f["index"]["count"]
         scores_ds = f["scores"]["data"]
-        n_sents  = cpos_ds.shape[0]
+        n_sents   = cpos_ds.shape[0]
+        has_spos  = "spos" in f["index"]
 
         click.echo(f"Sentences : {n_sents:,}")
         click.echo(f"Tokens    : {scores_ds.shape[0]:,}")
-        click.echo("Checking...")
+        click.echo(f"spos      : {'stored' if has_spos else 'NOT stored'}")
+        click.echo("Checking structure...")
 
-        # Load index arrays in one shot — they're small even for large corpora
         cpos  = cpos_ds[:]
         count = count_ds[:]
+        spos  = f["index"]["spos"][:] if has_spos else None
 
         if cpos[0] != 0:
             _err(f"cpos[0]={cpos[0]}, expected 0")
 
-        # 1. cpos continuity
-        expected = cpos[0]
+        expected = int(cpos[0])
         for i in range(n_sents):
-            if cpos[i] != expected:
+            if int(cpos[i]) != expected:
                 _err(
-                    f"cpos discontinuity at spos={i}: "
+                    f"cpos discontinuity at row={i}: "
                     f"expected {expected}, got {cpos[i]}"
                 )
-                # re-sync so we don't cascade errors
-                expected = cpos[i]
-            expected += count[i]
+                expected = int(cpos[i])
+            expected += int(count[i])
 
-        # 2. total token count
-        total = int(count.sum())
+        total  = int(count.sum())
         actual = scores_ds.shape[0]
         if total != actual:
             _err(f"sum(count)={total:,} != scores/data.shape[0]={actual:,}")
 
-        # 3. spos monotonicity
-        if "spos" in f["index"]:
-            spos = f["index"]["spos"][:]
-            bad  = np.where(np.diff(spos.astype(np.int64)) != 1)[0]
-            for b in bad[:10]:  # cap noise
+        if spos is not None:
+            bad = np.where(np.diff(spos.astype(np.int64)) != 1)[0]
+            for b in bad[:10]:
                 _err(
-                    f"spos not strictly +1 at row {b}: "
+                    f"spos not strictly +1 at row={b}: "
                     f"{spos[b]} -> {spos[b + 1]}"
                 )
             if len(bad) > 10:
                 _err(f"... and {len(bad) - 10} more spos errors (total {len(bad)})")
         else:
-            click.echo("  spos: not stored (skipped)")
+            click.echo("  spos: not stored — skipping monotonicity check")
 
     if errors == 0:
+        click.echo("  [OK] structural checks passed.")
+    else:
+        click.echo(f"\n  {errors} structural error(s) found.")
+
+    # ------------------------------------------------------------------ #
+    # Phase 2 – CQP cross-check                                           #
+    # ------------------------------------------------------------------ #
+    if corpus is None:
+        return
+
+    if not has_spos:
+        click.echo(
+            "\n  [WARN] spos dataset absent — CQP cross-check uses row index "
+            "as spos, which may be wrong if sentences were filtered during "
+            "index build.",
+            err=True,
+        )
+
+    try:
+        from conloan_tools.corpus.query import (
+            fetch_corpus_sentences,
+            parse_cqp_line,
+            _resolve_registry,
+        )
+    except ImportError as exc:
+        click.echo(f"  [WARN] Cannot import query helpers: {exc}", err=True)
+        return
+
+    try:
+        _resolve_registry(registry_dir)
+    except Exception as exc:
+        click.echo(f"  [WARN] Registry not resolvable: {exc}", err=True)
+        return
+
+    # Which rows to check
+    all_rows = np.arange(n_sents, dtype=np.int64)
+    if sample is not None and sample < n_sents:
+        rng  = np.random.default_rng(seed)
+        rows = np.sort(rng.choice(all_rows, size=sample, replace=False))
+        click.echo(f"\nCQP cross-check: sampling {sample:,} / {n_sents:,} sentences")
+    else:
+        rows = all_rows
+        click.echo(f"\nCQP cross-check: all {n_sents:,} sentences")
+
+    cqp_errors  = 0
+    cqp_checked = 0
+
+    with _open_h5(path) as f:
+        spos_ds  = f["index"]["spos"] if has_spos else None
+        count_ds = f["index"]["count"]
+
+        # Iterate in batches
+        for batch_start in tqdm(
+            range(0, len(rows), batch_size),
+            desc="Cross-checking",
+            unit="batch",
+        ):
+            batch_rows = rows[batch_start : batch_start + batch_size]
+
+            # spos values to pass to CQP (or fall back to row index)
+            if spos_ds is not None:
+                batch_spos = [int(spos_ds[r]) for r in batch_rows]
+            else:
+                batch_spos = [int(r) for r in batch_rows]
+
+            expected_counts = [int(count_ds[r]) for r in batch_rows]
+
+            try:
+                raw = fetch_corpus_sentences(
+                    corpus=corpus,
+                    indices=batch_spos,
+                    mode="spos",
+                    cqp_bin=cqp_bin,
+                    registry_dir=registry_dir,
+                )
+            except Exception as exc:
+                click.echo(f"  [WARN] CQP fetch failed for batch: {exc}", err=True)
+                continue
+
+            lines = [l for l in raw.splitlines() if l.strip()]
+
+            if len(lines) != len(batch_rows):
+                click.echo(
+                    f"  [WARN] CQP returned {len(lines)} lines for a batch of "
+                    f"{len(batch_rows)} — alignment uncertain, skipping batch.",
+                    err=True,
+                )
+                continue
+
+            for row, sp, exp_count, line in zip(
+                batch_rows, batch_spos, expected_counts, lines
+            ):
+                cqp_checked += 1
+                parsed = parse_cqp_line(line)
+
+                if parsed is None:
+                    click.echo(
+                        f"  [FAIL] CQP cross-check: "
+                        f"row={row}  spos={sp}  "
+                        f"parse_cqp_line returned None  line={line!r}",
+                        err=True,
+                    )
+                    cqp_errors += 1
+                    if max_errors and cqp_errors >= max_errors:
+                        click.echo(
+                            f"  [ABORT] max-errors={max_errors} reached, "
+                            f"stopping cross-check.",
+                            err=True,
+                        )
+                        break
+                    continue
+
+                got_count = len(parsed.tokens)
+                if got_count != exp_count:
+                    cqp_cpos = int(cpos[row])
+                    click.echo(
+                        f"  [FAIL] token count mismatch  "
+                        f"row={row}  spos={sp}  cpos={cqp_cpos}  "
+                        f"index={exp_count}  cqp={got_count}  "
+                        f"diff={got_count - exp_count:+d}"
+                    )
+                    cqp_errors += 1
+                    if max_errors and cqp_errors >= max_errors:
+                        click.echo(
+                            f"  [ABORT] max-errors={max_errors} reached, "
+                            f"stopping cross-check.",
+                            err=True,
+                        )
+                        break
+            else:
+                # inner loop completed without break — continue outer loop
+                continue
+            break  # inner loop was broken (max_errors hit)
+
+    click.echo(
+        f"\nCQP cross-check: {cqp_checked:,} sentences checked, "
+        f"{cqp_errors} mismatch(es)."
+    )
+    if errors == 0 and cqp_errors == 0:
         click.echo("  [OK] all checks passed.")
     else:
-        click.echo(f"\n  {errors} error(s) found.")
         sys.exit(1)
 
 
