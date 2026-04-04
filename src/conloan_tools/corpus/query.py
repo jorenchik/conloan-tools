@@ -319,7 +319,6 @@ def build_masks(
         rec = src.ner_records[sent_idx]
         sent_labels = src.ner_labels[rec.offset : rec.offset + rec.count]
 
-        breakpoint()
         def _is_ne(label_id: int) -> bool:
             label = src.ner_id2label.get(label_id, "O")
             if label == "O":
@@ -671,16 +670,15 @@ def find_code_switch_sequences(
     min_consecutive: int,
     corpus: str,
     cfg: ScoringConfig,
-    max_results: int = DEFAULT_RESULTS,
     cqp_bin: str = DEFAULT_CQP_BIN,
     registry_dir: Optional[str] = None,
     limit_sentences: int | None = None,
     mask_src: Optional[MaskSources] = None,
 ) -> list[CodeSwitchRun]:
+    """Score all qualifying runs; caller is responsible for capping display."""
     if mask_src is None:
         mask_src = MaskSources()
 
-    # NER alignment check — only when NER index is provided.
     if mask_src.ner_records is not None:
         _assert_index_alignment(index_records, mask_src.ner_records)
 
@@ -689,7 +687,7 @@ def find_code_switch_sequences(
         index_records=index_records,
         threshold=threshold,
         min_consecutive=min_consecutive,
-        max_results=max_results,
+        max_results=0,  # no cap — score everything
         limit_sentences=limit_sentences,
     )
     if not candidates:
@@ -718,15 +716,12 @@ def find_code_switch_sequences(
 
         n = len(parsed.tokens)
         valid_indices = [i for i in token_indices if i < n]
-        valid_scores  = [s for i, s in zip(token_indices, token_scores) if i < n]
+        valid_scores = [s for i, s in zip(token_indices, token_scores) if i < n]
 
         if len(valid_indices) < min_consecutive:
             continue
 
-        # Override cs_mask with the detected run — the surprisal HDF5 is the
-        # source of truth for which tokens triggered detection.
         cs_mask = [1 if i in set(valid_indices) else 0 for i in range(n)]
-
         lw_mask, _, ne_mask = build_masks(parsed, sent_idx, mask_src)
 
         metrics = score_sentence(
@@ -806,19 +801,43 @@ def query_group():
 
 @query_group.command("code-switch")
 @click.argument("corpus_name")
-@click.argument("surprisal_h5", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument(
+    "surprisal_h5",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
 @click.option("--threshold", type=float, required=True)
 @click.option("--min-consecutive", type=int, default=2, show_default=True)
-@click.option("--max-results", type=int, default=DEFAULT_RESULTS, show_default=True)
+@click.option(
+    "--max-results",
+    type=int,
+    default=DEFAULT_RESULTS,
+    show_default=True,
+    help="Number of top results to display. 0 = show all.",
+)
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
-@click.option("--limit-sentences", type=int, default=None)
+@click.option(
+    "--limit-sentences",
+    type=int,
+    default=None,
+    help="Scan only the first N sentences. Omit to scan all.",
+)
 @scoring_config_option
 @mask_source_options
 def query_code_switch(
-    corpus_name, surprisal_h5, threshold, min_consecutive, max_results,
-    cqp_bin, registry_dir, limit_sentences, scoring_config,
-    ner_h5, loanword_file, ner_ignore_misc, surprisal_threshold
+    corpus_name,
+    surprisal_h5,
+    threshold,
+    min_consecutive,
+    max_results,
+    cqp_bin,
+    registry_dir,
+    limit_sentences,
+    scoring_config,
+    ner_h5,
+    loanword_file,
+    ner_ignore_misc,
+    surprisal_threshold,
 ):
     """Find code-switch sequences using a surprisal HDF5 index."""
     cfg = load_scoring_config(scoring_config)
@@ -840,16 +859,17 @@ def query_code_switch(
         min_consecutive=min_consecutive,
         corpus=corpus_name,
         cfg=cfg,
-        max_results=max_results,
         cqp_bin=cqp_bin,
         registry_dir=registry_dir,
         limit_sentences=limit_sentences,
         mask_src=mask_src,
     )
 
-    click.echo(f"[*] Found {len(results)} candidate sequences")
-    if results:
-        _render_code_switch_results(results, threshold)
+    click.echo(f"[*] Found and scored {len(results)} candidate sequences")
+
+    shown = results if max_results == 0 else results[:max_results]
+    if shown:
+        _render_code_switch_results(shown, threshold)
 
 
 @query_group.command("lemmas")
@@ -927,23 +947,45 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
 
 @query_group.command("ner-entities")
 @click.argument("corpus_name")
-@click.argument("ner_h5", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument(
+    "ner_h5",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
 @click.option("--label", "labels", multiple=True)
-@click.option("--max-results", type=int, default=DEFAULT_RESULTS, show_default=True)
+@click.option(
+    "--max-results",
+    type=int,
+    default=DEFAULT_RESULTS,
+    show_default=True,
+    help="Number of top results to display. 0 = show all.",
+)
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
-@click.option("--limit-sentences", type=int, default=None)
+@click.option(
+    "--limit-sentences",
+    type=int,
+    default=None,
+    help="Scan only the first N sentences. Omit to scan all.",
+)
 @scoring_config_option
 @mask_source_options
 def query_ner_entities(
-    corpus_name, ner_h5, labels, max_results, cqp_bin, registry_dir,
-    limit_sentences, scoring_config,
-    surprisal_h5, surprisal_threshold, loanword_file, ner_ignore_misc
+    corpus_name,
+    ner_h5,
+    labels,
+    max_results,
+    cqp_bin,
+    registry_dir,
+    limit_sentences,
+    scoring_config,
+    surprisal_h5,
+    surprisal_threshold,
+    loanword_file,
+    ner_ignore_misc,
 ):
     """Find and score sentences containing named entities."""
     cfg = load_scoring_config(scoring_config)
 
-    # NER is a positional arg; load the rest via load_mask_sources.
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
@@ -951,10 +993,10 @@ def query_ner_entities(
         ner_ignore_misc=ner_ignore_misc,
     )
 
-    click.echo("[*] Loading NER index...")
+    click.echo("[*] Loading NER index...", err=True)
     ner_labels, ner_records, id2label = _load_ner_labels(ner_h5)
-    mask_src.ner_labels   = ner_labels
-    mask_src.ner_records  = ner_records
+    mask_src.ner_labels = ner_labels
+    mask_src.ner_records = ner_records
     mask_src.ner_id2label = id2label
 
     if surprisal_h5 is not None:
@@ -973,9 +1015,11 @@ def query_ner_entities(
         want = set(id2label.keys()) - o_ids
 
     click.echo(
-        f"[*] Scanning for labels: {sorted(id2label[k] for k in want)}"
+        f"[*] Scanning for labels: {sorted(id2label[k] for k in want)}",
+        err=True,
     )
 
+    # --- Phase 1: scan (respects limit_sentences) ---
     matching: list[int] = []
     records = ner_records[:limit_sentences] if limit_sentences else ner_records
     for sent_idx, record in enumerate(
@@ -984,13 +1028,13 @@ def query_ner_entities(
         chunk = ner_labels[record.offset : record.offset + record.count]
         if np.any(np.isin(chunk, list(want))):
             matching.append(sent_idx)
-        if max_results > 0 and len(matching) >= max_results:
-            break
 
-    click.echo(f"[*] Found {len(matching)} candidate sentence(s)")
+    click.echo(f"[*] Found {len(matching)} candidate sentence(s)", err=True)
     if not matching:
         return
 
+    # --- Phase 2: fetch all matching ---
+    click.echo("[*] Fetching sentences from corpus...", err=True)
     raw_output = fetch_corpus_sentences(
         corpus=corpus_name,
         indices=matching,
@@ -998,16 +1042,22 @@ def query_ner_entities(
         cqp_bin=cqp_bin,
         registry_dir=registry_dir,
     )
+    lines = raw_output.strip().splitlines()
+    click.echo(f"[*] Fetched {len(lines)} sentence(s)", err=True)
 
-    click.echo("-" * 60)
-    shown = 0
-    for line, sent_idx in zip(raw_output.strip().splitlines(), matching):
+    # --- Phase 3: score all ---
+    scored_results: list[tuple[ScoredResult, str, int]] = []
+    for line, sent_idx in tqdm(
+        zip(lines, matching),
+        total=len(matching),
+        desc="Scoring",
+        unit="sent",
+    ):
         parsed = parse_cqp_line(line)
         if not parsed:
             continue
 
         lw_mask, cs_mask, ne_mask = build_masks(parsed, sent_idx, mask_src)
-
         scored = score_sentence(
             parsed,
             loanword_mask=lw_mask,
@@ -1017,26 +1067,44 @@ def query_ner_entities(
         )
 
         record = ner_records[sent_idx]
-        chunk  = ner_labels[record.offset : record.offset + record.count]
-        parts  = [
+        chunk = ner_labels[record.offset : record.offset + record.count]
+        parts = [
             f"[{t.word}/{id2label[int(chunk[i])]}]"
             if i < len(chunk) and int(chunk[i]) in want
             else t.word
             for i, t in enumerate(parsed.tokens)
         ]
+        scored_results.append((scored, " ".join(parts), sent_idx))
 
-        status = f" [FILTERED: {scored.filter_reason}]" if scored.filtered else ""
+    scored_results.sort(key=lambda x: x[0].score_total, reverse=True)
+    click.echo(
+        f"[*] Scored {len(scored_results)} sentence(s)", err=True
+    )
+
+    # --- Phase 4: render top-k (0 = all) ---
+    shown = (
+        scored_results
+        if max_results == 0
+        else scored_results[:max_results]
+    )
+
+    click.echo("-" * 60)
+    for scored, parts_str, sent_idx in shown:
+        status = (
+            f" [FILTERED: {scored.filter_reason}]" if scored.filtered else ""
+        )
         click.echo(
             f"Score: {scored.score_total:.4f}  "
             f"(len={scored.score_length:.2f}  lw={scored.score_loanword:.2f}  "
-            f"cs={scored.score_code_switch:.2f}  clean={scored.score_cleanliness:.2f}  "
-            f"ne={scored.score_named_entity:.2f})  | ID: {scored.cqp_id}{status}"
+            f"cs={scored.score_code_switch:.2f}  "
+            f"clean={scored.score_cleanliness:.2f}  "
+            f"ne={scored.score_named_entity:.2f})  "
+            f"| ID: {scored.cqp_id}{status}"
         )
-        click.echo(f"[{sent_idx}] " + " ".join(parts))
+        click.echo(f"[{sent_idx}] " + parts_str)
         click.echo("-" * 60)
-        shown += 1
 
-    click.echo(f"({shown} sentences shown)")
+    click.echo(f"({len(shown)} of {len(scored_results)} sentences shown)")
 
 
 if __name__ == "__main__":
