@@ -104,6 +104,8 @@ def iter_vert_sentences(
 
             # ---- token line (always advances cpos) ------------------------
             else:
+                if not stripped:
+                    continue  # blank line — no cpos in CWB regardless of -L
                 parts = stripped.split("\t", 1)
                 tokens.append(parts[0])  # append even if empty; cpos must advance
 
