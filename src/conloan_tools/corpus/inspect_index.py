@@ -410,7 +410,7 @@ def cmd_validate(
     try:
         from conloan_tools.corpus.query import (
             fetch_corpus_sentences,
-            parse_cqp_line,
+            parse_cwb_output,
             _resolve_registry,
         )
     except ImportError as exc:
@@ -468,38 +468,19 @@ def cmd_validate(
                 click.echo(f"  [WARN] CQP fetch failed for batch: {exc}", err=True)
                 continue
 
-            lines = [l for l in raw.splitlines() if l.strip()]
-
-            if len(lines) != len(batch_rows):
+            blocks = list(parse_cwb_output(raw))
+            if len(blocks) != len(batch_rows):
                 click.echo(
-                    f"  [WARN] CQP returned {len(lines)} lines for a batch of "
+                    f"  [WARN] CQP returned {len(blocks)} blocks for a batch of "
                     f"{len(batch_rows)} — alignment uncertain, skipping batch.",
                     err=True,
                 )
                 continue
 
-            for row, sp, exp_count, line in zip(
-                batch_rows, batch_spos, expected_counts, lines
+            for row, sp, exp_count, parsed in zip(
+                batch_rows, batch_spos, expected_counts, blocks
             ):
                 cqp_checked += 1
-                parsed = parse_cqp_line(line)
-
-                if parsed is None:
-                    click.echo(
-                        f"  [FAIL] CQP cross-check: "
-                        f"row={row}  spos={sp}  "
-                        f"parse_cqp_line returned None  line={line!r}",
-                        err=True,
-                    )
-                    cqp_errors += 1
-                    if max_errors and cqp_errors >= max_errors:
-                        click.echo(
-                            f"  [ABORT] max-errors={max_errors} reached, "
-                            f"stopping cross-check.",
-                            err=True,
-                        )
-                        break
-                    continue
 
                 got_count = len(parsed.tokens)
                 if got_count != exp_count:

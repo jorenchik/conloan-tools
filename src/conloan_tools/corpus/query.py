@@ -3,7 +3,7 @@ import os
 import tempfile
 import click
 import json
-from typing import List, Optional, Tuple, Literal
+from typing import List, Optional, Tuple, Literal, Iterator
 import re
 from pathlib import Path
 import numpy as np
@@ -84,7 +84,7 @@ def _run_cqp_command(
     session_setup = [
         f"{corpus};",
         "set Context s;",
-        "set PrintMode ascii;",
+        "set PrintMode sgml;",
         "show -pos -lemma;",
         "show +pos +lemma;",
         "set PrintOptions noheader;",
@@ -409,50 +409,60 @@ def is_clean_word(w: str, allow_ner: bool = True) -> bool:
     return True
 
 
-def parse_cqp_line(line: str) -> Optional[CQPResult]:
-    try:
-        id_part, content_part = line.split(":", 1)
-        cqp_id = int(id_part.strip())
-    except ValueError:
-        return None
+_LINE_RE  = re.compile(r"<LINE>(.*?)</LINE>", re.DOTALL)
+_MNUM_RE  = re.compile(r"<MATCHNUM>(\d+)</MATCHNUM>")
+_TOK_ITER = re.compile(r"<MATCH>|</MATCH>|<TOKEN>(.*?)</TOKEN>")
 
-    raw_tokens = content_part.strip().split()
-    parsed_tokens: List[Token] = []
+
+def _parse_sgml_line(ordinal: int, line_content: str) -> Optional[CQPResult]:
+    m = _MNUM_RE.search(line_content)
+    cqp_id = int(m.group(1)) if m else ordinal
+
+    content_m = re.search(r"<CONTENT>(.*?)</CONTENT>", line_content, re.DOTALL)
+    content = content_m.group(1) if content_m else line_content
+
+    parsed_tokens: list[Token] = []
     match_index = -1
+    in_match = False
     current_index = 0
 
-    for rt in raw_tokens:
-        if rt in ("<g", "<s>", "</s>") or rt.startswith("</"):
-            continue
-        is_match_start = rt.startswith("<")
-        if is_match_start:
-            rt = rt[1:]
+    for tok_m in _TOK_ITER.finditer(content):
+        tag = tok_m.group(0)
+        if tag == "<MATCH>":
+            in_match = True
             if match_index == -1:
                 match_index = current_index
-        if rt.endswith(">"):
-            rt = rt[:-1]
-        if not rt:
             continue
-        parts = rt.rsplit("/", 2)
+        if tag == "</MATCH>":
+            in_match = False
+            continue
+        raw_tok = tok_m.group(1)
+        if not raw_tok:
+            continue
+        parts = raw_tok.rsplit("/", 2)
         if len(parts) == 3:
-            w, p, lemma = parts
+            w, pos, lemma = parts
         elif len(parts) == 2:
-            w, p = parts
+            w, pos = parts
             lemma = w
         else:
-            w = rt
-            p = "UNK"
-            lemma = w
-        if w in ("/>", "<g/>", "<g", "") or w.startswith("</"):
+            w, pos, lemma = raw_tok, "UNK", raw_tok
+        if not w:
             continue
-        parsed_tokens.append(Token(word=w, pos=p, lemma=lemma))
+        parsed_tokens.append(Token(word=w, pos=pos, lemma=lemma))
         current_index += 1
 
-    return CQPResult(
-        cqp_id=cqp_id,
-        tokens=parsed_tokens,
-        match_index=match_index,
-    )
+    if not parsed_tokens:
+        return None
+    return CQPResult(cqp_id=cqp_id, tokens=parsed_tokens, match_index=match_index)
+
+
+def parse_cwb_output(raw: str) -> Iterator[CQPResult]:
+    """Yield one CQPResult per <LINE> in SGML output."""
+    for ordinal, m in enumerate(_LINE_RE.finditer(raw)):
+        parsed = _parse_sgml_line(ordinal, m.group(1))
+        if parsed:
+            yield parsed
 
 
 def _build_spos_commands(indices: List[int]) -> List[str]:
@@ -589,12 +599,7 @@ def query_by_lemmas(
     seen_texts: dict[tuple, ScoredResult] = {}
     scored: List[ScoredResult] = []
 
-    for line in tqdm(raw_output[0].splitlines(), disable=not verbose):
-        if not line.strip():
-            continue
-        parsed = parse_cqp_line(line)
-        if not parsed:
-            continue
+    for parsed in tqdm(list(parse_cwb_output(raw_output[0])), disable=not verbose):
 
         lw_mask, cs_mask, ne_mask = build_masks(
             parsed, parsed.cqp_id, mask_src, lw_lemma_set=lemma_set
@@ -703,10 +708,8 @@ def find_code_switch_sequences(
     )
 
     sentence_map: dict[int, CQPResult] = {}
-    for line, sent_idx in zip(raw_output.strip().splitlines(), unique_sent_indices):
-        parsed = parse_cqp_line(line)
-        if parsed:
-            sentence_map[sent_idx] = parsed
+    for parsed, sent_idx in zip(parse_cwb_output(raw_output), unique_sent_indices):
+        sentence_map[sent_idx] = parsed
 
     results: list[CodeSwitchRun] = []
     for sent_idx, token_indices, token_scores in candidates:
@@ -937,12 +940,10 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
 
     raw_output = fetch_corpus_sentences(corpus_name, indices=[i for i in range(start,stop+1)], mode="spos", cqp_bin=cqp_bin, registry_dir=registry_dir)
     
-    for line in raw_output.splitlines():
-        parsed = parse_cqp_line(line)
-        if parsed:
-            # Simple text reconstruction for display
-            text = " ".join([t.word for t in parsed.tokens])
-            click.echo(f"[{parsed.cqp_id}] {text}")
+    for parsed in parse_cwb_output(raw_output):
+        # Simple text reconstruction for display
+        text = " ".join([t.word for t in parsed.tokens])
+        click.echo(f"[{parsed.cqp_id}] {text}")
 
 
 @query_group.command("ner-entities")
@@ -1047,16 +1048,12 @@ def query_ner_entities(
 
     # --- Phase 3: score all ---
     scored_results: list[tuple[ScoredResult, str, int]] = []
-    for line, sent_idx in tqdm(
-        zip(lines, matching),
+    for parsed, sent_idx in tqdm(
+        zip(parse_cwb_output(raw_output), matching),
         total=len(matching),
         desc="Scoring",
         unit="sent",
     ):
-        parsed = parse_cqp_line(line)
-        if not parsed:
-            continue
-
         lw_mask, cs_mask, ne_mask = build_masks(parsed, sent_idx, mask_src)
         scored = score_sentence(
             parsed,

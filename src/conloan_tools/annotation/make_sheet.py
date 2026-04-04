@@ -7,7 +7,6 @@ from collections import defaultdict
 from tqdm import tqdm
 
 from conloan_tools.corpus.query import (
-    parse_cqp_line,
     DEFAULT_CQP_BIN,
     query_by_lemmas,
 )
