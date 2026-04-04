@@ -98,6 +98,8 @@ def iter_vert_sentences(
             else:
                 if not stripped:
                     continue
+                if current_id is not None and not tokens:
+                    sentence_start_cpos = cpos_counter  # first token of sentence
                 cpos_counter += 1  # always advance, even outside <s>
                 if current_id is not None:
                     parts = stripped.split("\t", 1)
