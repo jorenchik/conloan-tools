@@ -92,7 +92,7 @@ def iter_vert_sentences(
                     if limit_sentences is not None and sentences_count >= limit_sentences:
                         return
 
-            elif stripped.startswith("<"):
+            elif stripped.startswith("<") and "\t" not in stripped:
                 pass
 
             else:
