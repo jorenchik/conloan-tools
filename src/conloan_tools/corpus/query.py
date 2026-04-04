@@ -596,13 +596,22 @@ def query_by_lemmas(
     if mask_src is None:
         mask_src = MaskSources()
 
+    if mask_src.surprisal_records and mask_src.ner_records:
+        _assert_index_alignment(mask_src.surprisal_records, mask_src.ner_records)
+
     seen_texts: dict[tuple, ScoredResult] = {}
     scored: List[ScoredResult] = []
 
     for parsed in tqdm(list(parse_cwb_output(raw_output[0])), disable=not verbose):
+        sent_idx = parsed.cqp_id
+
+        if mask_src.surprisal_records and sent_idx >= len(mask_src.surprisal_records):
+            continue
+        if mask_src.ner_records and sent_idx >= len(mask_src.ner_records):
+            continue
 
         lw_mask, cs_mask, ne_mask = build_masks(
-            parsed, parsed.cqp_id, mask_src, lw_lemma_set=lemma_set
+            parsed, sent_idx, mask_src, lw_lemma_set=lemma_set
         )
 
         result = score_sentence(
@@ -826,7 +835,26 @@ def query_group():
     help="Scan only the first N sentences. Omit to scan all.",
 )
 @scoring_config_option
-@mask_source_options
+@click.option(
+    "--ner-h5",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="NER HDF5 index; builds NE mask. Falls back to heuristic if omitted.",
+)
+@click.option(
+    "--loanwords",
+    "loanword_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="One lemma per line; builds loanword mask.",
+)
+@click.option(
+    "--ignore-misc",
+    "ner_ignore_misc",
+    is_flag=True,
+    default=False,
+    help="Treat MISC NER labels as O (exclude from named-entity mask).",
+)
 def query_code_switch(
     corpus_name,
     surprisal_h5,
@@ -840,7 +868,6 @@ def query_code_switch(
     ner_h5,
     loanword_file,
     ner_ignore_misc,
-    surprisal_threshold,
 ):
     """Find code-switch sequences using a surprisal HDF5 index."""
     cfg = load_scoring_config(scoring_config)
@@ -869,7 +896,6 @@ def query_code_switch(
     )
 
     click.echo(f"[*] Found and scored {len(results)} candidate sequences")
-
     shown = results if max_results == 0 else results[:max_results]
     if shown:
         _render_code_switch_results(shown, threshold)
@@ -886,12 +912,12 @@ def query_code_switch(
 @mask_source_options
 def query_lemmas_command(
     corpus_name, lemmas, limit, cqp_bin, registry_dir, scoring_config, top,
-    surprisal_h5, surprisal_threshold, ner_h5, loanword_file, ner_ignore_misc
+    surprisal_h5, surprisal_threshold, ner_h5, loanword_file, ner_ignore_misc,
 ):
     """Query corpus by lemma(s) and score results."""
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
-        surprisal_threshold=surprisal_threshold,
+        surprisal_threshold=surprisal_threshold,  # was missing
         ner_h5=ner_h5,
         loanword_file=loanword_file,
         ner_ignore_misc=ner_ignore_misc,
@@ -969,7 +995,33 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
     help="Scan only the first N sentences. Omit to scan all.",
 )
 @scoring_config_option
-@mask_source_options
+@click.option(
+    "--surprisal-h5",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Surprisal HDF5 index; builds code-switch mask. Omit for all-zero.",
+)
+@click.option(
+    "--surprisal-threshold",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Per-token surprisal threshold for code-switch mask.",
+)
+@click.option(
+    "--loanwords",
+    "loanword_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="One lemma per line; builds loanword mask.",
+)
+@click.option(
+    "--ignore-misc",
+    "ner_ignore_misc",
+    is_flag=True,
+    default=False,
+    help="Treat MISC NER labels as O (exclude from named-entity mask).",
+)
 def query_ner_entities(
     corpus_name,
     ner_h5,
@@ -1000,7 +1052,7 @@ def query_ner_entities(
     mask_src.ner_records = ner_records
     mask_src.ner_id2label = id2label
 
-    if surprisal_h5 is not None:
+    if surprisal_h5 is not None and mask_src.surprisal_records is not None:
         _assert_index_alignment(mask_src.surprisal_records, ner_records)
 
     o_ids = {k for k, v in id2label.items() if v == "O"}
@@ -1020,9 +1072,8 @@ def query_ner_entities(
         err=True,
     )
 
-    # --- Phase 1: scan (respects limit_sentences) ---
-    matching: list[int] = []
     records = ner_records[:limit_sentences] if limit_sentences else ner_records
+    matching: list[int] = []
     for sent_idx, record in enumerate(
         tqdm(records, desc="Scanning NER labels", unit="sent")
     ):
@@ -1034,7 +1085,6 @@ def query_ner_entities(
     if not matching:
         return
 
-    # --- Phase 2: fetch all matching ---
     click.echo("[*] Fetching sentences from corpus...", err=True)
     raw_output = fetch_corpus_sentences(
         corpus=corpus_name,
@@ -1043,10 +1093,7 @@ def query_ner_entities(
         cqp_bin=cqp_bin,
         registry_dir=registry_dir,
     )
-    lines = raw_output.strip().splitlines()
-    click.echo(f"[*] Fetched {len(lines)} sentence(s)", err=True)
 
-    # --- Phase 3: score all ---
     scored_results: list[tuple[ScoredResult, str, int]] = []
     for parsed, sent_idx in tqdm(
         zip(parse_cwb_output(raw_output), matching),
@@ -1074,15 +1121,10 @@ def query_ner_entities(
         scored_results.append((scored, " ".join(parts), sent_idx))
 
     scored_results.sort(key=lambda x: x[0].score_total, reverse=True)
-    click.echo(
-        f"[*] Scored {len(scored_results)} sentence(s)", err=True
-    )
+    click.echo(f"[*] Scored {len(scored_results)} sentence(s)", err=True)
 
-    # --- Phase 4: render top-k (0 = all) ---
     shown = (
-        scored_results
-        if max_results == 0
-        else scored_results[:max_results]
+        scored_results if max_results == 0 else scored_results[:max_results]
     )
 
     click.echo("-" * 60)
