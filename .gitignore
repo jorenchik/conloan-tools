@@ -217,3 +217,4 @@ __marimo__/
 
 # Local data, heavy indexes/results
 _data/ 
+_results/
