@@ -35,6 +35,8 @@ def iter_vert_sentences(
     auto_id = 0
     current_id: str | None = None
     tokens: list[str] = []
+    sentence_start_cpos = 0
+    cpos_counter = 0  # global, advances for every token line
 
     processed_count = 0
     sentences_count = 0
@@ -64,50 +66,42 @@ def iter_vert_sentences(
 
             stripped = line_bytes.decode("utf-8").rstrip("\n")
 
-            # ---- sentence open tag ----------------------------------------
             if stripped.startswith("<s") and (
                 len(stripped) == 2 or stripped[2] in (" ", ">")
             ):
                 if current_id is not None:
-                    # malformed: nested <s> — yield what we have so cpos stays intact
-                    yield current_id, tokens
+                    yield current_id, tokens, sentence_start_cpos
                     sentences_count += 1
-                    if (
-                        limit_sentences is not None
-                        and sentences_count >= limit_sentences
-                    ):
+                    if limit_sentences is not None and sentences_count >= limit_sentences:
                         return
 
                 m = SENT_ID_RE.search(stripped)
                 current_id = m.group(1) if m else str(auto_id)
                 auto_id += 1
                 tokens = []
+                sentence_start_cpos = cpos_counter  # record here
 
-            # ---- sentence close tag ---------------------------------------
             elif stripped.startswith("</s") and (
                 len(stripped) == 3 or stripped[3] in (" ", ">")
             ):
                 if current_id is not None:
-                    yield current_id, tokens
+                    yield current_id, tokens, sentence_start_cpos
                     sentences_count += 1
                     current_id = None
                     tokens = []
-                    if (
-                        limit_sentences is not None
-                        and sentences_count >= limit_sentences
-                    ):
+                    if limit_sentences is not None and sentences_count >= limit_sentences:
                         return
 
-            # ---- structural tag (not a token) -----------------------------
             elif stripped.startswith("<"):
-                pass  # <text>, <doc>, </text>, </span>, etc. — no cpos
+                pass
 
-            # ---- token line (always advances cpos) ------------------------
             else:
                 if not stripped:
-                    continue  # blank line — no cpos in CWB regardless of -L
-                parts = stripped.split("\t", 1)
-                tokens.append(parts[0])  # append even if empty; cpos must advance
+                    continue
+                cpos_counter += 1  # always advance, even outside <s>
+                if current_id is not None:
+                    parts = stripped.split("\t", 1)
+                    tokens.append(parts[0])
 
 
 # ---------------------------------------------------------------------------
@@ -251,11 +245,10 @@ def build_surprisal_index(
     count_buf:  list[int]        = []
     spos_buf:   list[int] | None = [] if store_spos else None
     scores_buf: list[np.ndarray] = []
-    cpos = 0
     spos = 0
 
     try:
-        for _, tokens in iter_vert_sentences(
+        for _, tokens, cpos in iter_vert_sentences(
             input_path,
             limit_lines=limit_lines,
             limit_sentences=limit_sentences,
@@ -273,7 +266,6 @@ def build_surprisal_index(
                 spos_buf.append(spos)
             scores_buf.append(arr)
 
-            cpos += len(arr)
             spos += 1
 
             if len(cpos_buf) >= flush_every:
@@ -356,7 +348,6 @@ def build_ner_index(
     count_buf:  list[int]        = []
     spos_buf:   list[int] | None = [] if store_spos else None
     scores_buf: list[np.ndarray] = []
-    cpos = 0
     spos = 0
 
     sentence_iterator = iter_vert_sentences(
@@ -367,10 +358,9 @@ def build_ner_index(
     )
 
     try:
-        batch: list[tuple[str, list[str]]] = []
+        batch: list[tuple[str, list[str], int]] = []
 
         def flush_batch() -> None:
-            nonlocal cpos, spos
 
             if ner_output == "logits":
                 results = get_logits(model, batch)
@@ -395,13 +385,12 @@ def build_ner_index(
                     for (words, _), r in zip(logit_entries, results)
                 ]
 
-            for arr in arrays:
-                cpos_buf.append(cpos)
+            for (sent_id, words, sent_cpos), arr in zip(batch, arrays):
+                cpos_buf.append(sent_cpos)  # use yielded cpos, not accumulated
                 count_buf.append(arr.shape[0])
                 if spos_buf is not None:
                     spos_buf.append(spos)
                 scores_buf.append(arr)
-                cpos += arr.shape[0]
                 spos += 1
 
             if len(cpos_buf) >= flush_every:
@@ -411,8 +400,8 @@ def build_ner_index(
 
             batch.clear()
 
-        for sent_id, tokens in sentence_iterator:
-            batch.append((sent_id, tokens))
+        for sent_id, tokens, cpos in sentence_iterator:
+            batch.append((sent_id, tokens, cpos))
             if len(batch) >= batch_size:
                 flush_batch()
 
