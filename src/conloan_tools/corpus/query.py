@@ -59,6 +59,20 @@ class MaskSources:
     ner_ignore_misc: bool = False
 
 
+def _assert_index_alignment(
+    a: list[IndexRecord], b: list[IndexRecord]
+) -> None:
+    if len(a) != len(b):
+        raise click.UsageError(
+            f"Index alignment mismatch: {len(a)} vs {len(b)} sentences."
+        )
+
+
+def _build_cpos_index(records: list[IndexRecord]) -> dict[int, int]:
+    """Map token-level corpus position → sentence ordinal."""
+    return {rec.offset: i for i, rec in enumerate(records)}
+
+
 def _resolve_registry(
     registry_dir: Optional[str],
 ) -> tuple[str, str]:
@@ -92,6 +106,7 @@ def _run_cqp_command(
     
     # Create a batch script with all commands
     script_lines = session_setup + commands
+    # click.echo(f"[DEBUG] CQP script:\n{chr(10).join(script_lines)}", err=True)
     
     with tempfile.NamedTemporaryFile(
         mode="w", delete=False, suffix=".cqp"
@@ -108,6 +123,8 @@ def _run_cqp_command(
             cwd=registry_dir,
         )
         stdout, stderr = process.communicate()
+        if stderr.strip():
+            click.echo(f"[CQP stderr]: {stderr.strip()}", err=True)
         if process.returncode != 0:
             raise click.ClickException(f"CQP Error: {stderr}")
         return stdout
@@ -522,26 +539,6 @@ def fetch_corpus_sentences(
     return _run_cqp_command(corpus, commands, cqp_bin, reg_dir, registry)
 
 
-def _build_spos_commands(indices: List[int]) -> List[str]:
-    """Select sentences by s-attribute index (spos)."""
-    commands = ["Results = <s> [];"]
-    for idx in indices:
-        commands.append(f"cat Results {idx} {idx};")
-    return commands
-
-
-def _build_cpos_commands(indices: List[int]) -> List[str]:
-    """Select sentences by corpus position (cpos), expanded to sentence context."""
-    # Build disjunction: [_.pos = 0 | _.pos = 42 | ...]
-    disjunction = " | ".join(f"_.pos = {idx}" for idx in indices)
-    commands = [
-        "set Context s;",
-        f"Results = [{disjunction}];",
-        "cat Results;",
-    ]
-    return commands
-
-
 def query_cqp_batch(
     corpus: str,
     queries: List[Tuple[str, Optional[int]]],
@@ -569,7 +566,7 @@ def query_cqp_batch(
 
 def build_or_query(lemmas: List[str]) -> str:
     """Build a CQP OR query from a list of lemmas."""
-    escaped = [re.escape(l) for l in lemmas]
+    escaped = [re.sub(r'([\[\](){}.*+?^$|\\])', r'\\\1', l) for l in lemmas]
     return f'[lemma="{"|".join(escaped)}"]'
 
 
@@ -599,21 +596,25 @@ def query_by_lemmas(
     if mask_src.surprisal_records and mask_src.ner_records:
         _assert_index_alignment(mask_src.surprisal_records, mask_src.ner_records)
 
+    ref_records = mask_src.surprisal_records or mask_src.ner_records
+    cpos_index = _build_cpos_index(ref_records) if ref_records else None
+
     seen_texts: dict[tuple, ScoredResult] = {}
     scored: List[ScoredResult] = []
 
     for parsed in tqdm(list(parse_cwb_output(raw_output[0])), disable=not verbose):
         sent_idx = parsed.cqp_id
-
-        if mask_src.surprisal_records and sent_idx >= len(mask_src.surprisal_records):
-            continue
-        if mask_src.ner_records and sent_idx >= len(mask_src.ner_records):
-            continue
+        breakpoint()
+        if cpos_index is not None:
+            sent_idx = cpos_index.get(parsed.cqp_id - 1)
+            if sent_idx is None:
+                continue
+        else:
+            sent_idx = parsed.cqp_id
 
         lw_mask, cs_mask, ne_mask = build_masks(
             parsed, sent_idx, mask_src, lw_lemma_set=lemma_set
         )
-
         result = score_sentence(
             parsed,
             loanword_mask=lw_mask,
