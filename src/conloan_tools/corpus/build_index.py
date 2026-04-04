@@ -51,42 +51,61 @@ def iter_vert_sentences(
         for line_bytes in f_bin:
             if limit_lines is not None and processed_count >= limit_lines:
                 break
+            if byte_limit is not None and bytes_processed >= byte_limit:
+                break
 
             line_len = len(line_bytes)
             bytes_processed += line_len
             pbar.update(line_len)
-
-            if byte_limit is not None and bytes_processed >= byte_limit:
-                break
-
             processed_count += 1
+
             if processed_count % 1000 == 0:
                 pbar.set_postfix(lines=processed_count, sents=sentences_count)
 
             stripped = line_bytes.decode("utf-8").rstrip("\n")
 
+            # ---- sentence open tag ----------------------------------------
             if stripped.startswith("<s") and (
                 len(stripped) == 2 or stripped[2] in (" ", ">")
             ):
-                current_id = str(auto_id)
+                if current_id is not None:
+                    # malformed: nested <s> — yield what we have so cpos stays intact
+                    yield current_id, tokens
+                    sentences_count += 1
+                    if (
+                        limit_sentences is not None
+                        and sentences_count >= limit_sentences
+                    ):
+                        return
+
+                m = SENT_ID_RE.search(stripped)
+                current_id = m.group(1) if m else str(auto_id)
                 auto_id += 1
                 tokens = []
 
-            elif stripped.startswith("</s"):
-                yield current_id, tokens
-                sentences_count += 1
-                current_id = None
-                tokens = []
-                if (
-                    limit_sentences is not None
-                    and sentences_count >= limit_sentences
-                ):
-                    return
+            # ---- sentence close tag ---------------------------------------
+            elif stripped.startswith("</s") and (
+                len(stripped) == 3 or stripped[3] in (" ", ">")
+            ):
+                if current_id is not None:
+                    yield current_id, tokens
+                    sentences_count += 1
+                    current_id = None
+                    tokens = []
+                    if (
+                        limit_sentences is not None
+                        and sentences_count >= limit_sentences
+                    ):
+                        return
 
-            elif current_id is not None and not stripped.startswith("<"):
+            # ---- structural tag (not a token) -----------------------------
+            elif stripped.startswith("<"):
+                pass  # <text>, <doc>, </text>, </span>, etc. — no cpos
+
+            # ---- token line (always advances cpos) ------------------------
+            else:
                 parts = stripped.split("\t", 1)
-                if parts[0]:
-                    tokens.append(parts[0])
+                tokens.append(parts[0])  # append even if empty; cpos must advance
 
 
 # ---------------------------------------------------------------------------
