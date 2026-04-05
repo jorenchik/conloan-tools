@@ -11,7 +11,7 @@ import numpy as np
 from conloan_tools.corpus import corpus
 from conloan_tools.corpus.query import is_clean_word
 from conloan_tools.wb.wb import WittenBellCharLM
-from conloan_tools.ner.ner import NERModel, infer_ner_pretokenized, get_logits
+from conloan_tools.ner.ner import NERModel, get_logits
 from tqdm import tqdm
 
 IDX_FLUSH_EVERY = 10_000
@@ -68,11 +68,18 @@ def _iter_ner_scores(
 
     def _process_batch() -> list[tuple[int, np.ndarray]]:
         logit_entries = get_logits(model, batch)
-        # use id() rather than fragile list-equality or iterator alignment
-        id_to_result: dict[int, np.ndarray] = {}
+        id_to_tensor: dict[int, torch.Tensor] = {
+            id(words): t for words, t in logit_entries
+        }
 
-        if ner_output == "logits":
-            for words, t in logit_entries:
+        results: list[tuple[int, np.ndarray]] = []
+        for _, words, cpos in batch:
+            t = id_to_tensor.get(id(words))
+            if t is None:
+                results.append((cpos, _null_arr(len(words))))
+                continue
+
+            if ner_output == "logits":
                 rows = (
                     t.cpu().numpy().astype(scores_dtype)
                     if scores_dtype == np.float16
@@ -85,28 +92,19 @@ def _iter_ner_scores(
                     ],
                     dtype=scores_dtype,
                 )
-                id_to_result[id(words)] = arr
-        else:
-            # infer_ner_pretokenized needs (sent_id, words, cpos) triples
-            surviving = [
-                (None, words, cpos) for _, words, cpos in batch
-                if id(words) in {id(w) for w, _ in logit_entries}
-            ]
-            results = infer_ner_pretokenized(model, surviving)
-            for (words, _), result in zip(logit_entries, results):
+            else:
+                label_ids = t.argmax(dim=-1).cpu().numpy()
                 arr = np.array(
                     [
-                        lid if is_clean_word(w, allow_ner=True) else 0
-                        for w, lid in zip(words, result.label_ids)
+                        int(lid) if is_clean_word(w, allow_ner=True) else 0
+                        for w, lid in zip(words, label_ids)
                     ],
                     dtype=np.uint8,
                 )
-                id_to_result[id(words)] = arr
 
-        return [
-            (cpos, id_to_result.get(id(words), _null_arr(len(words))))
-            for _, words, cpos in batch
-        ]
+            results.append((cpos, arr))
+
+        return results
 
 
     for sent_id, tokens, cpos in iter_vert_sentences(

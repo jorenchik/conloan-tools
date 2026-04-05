@@ -56,9 +56,12 @@ def get_id2label(model: NERModel) -> dict[int, str]:
 
 def get_logits(
     model: NERModel,
-    batch: list[tuple[str, list[str]]],
+    batch: list[tuple[str, list[str], ...]],
 ) -> list[tuple[list[str], torch.Tensor]]:
-    """Run model and return word-aligned logits. Shape per entry: (W, num_labels)."""
+    """Run model and return word-aligned logits. Shape per entry: (W, num_labels).
+    W always equals len(words); truncated words get zero logit rows.
+    Sentences with zero subword tokens are dropped from the output.
+    """
     import torch
 
     batched_words = [b[1] for b in batch]
@@ -74,20 +77,28 @@ def get_logits(
     with torch.no_grad():
         logits: torch.Tensor = model.model(**encoded).logits
 
+    num_labels = logits.shape[-1]
+
     entries: list[tuple[list[str], torch.Tensor]] = []
     for idx, words in enumerate(batched_words):
-        word_logits: list[torch.Tensor] = []
+        seen: set[int] = set()
+        word_to_subidx: dict[int, int] = {}
         prev_word_idx: int | None = None
 
         for sub_idx, word_idx in enumerate(encoded.word_ids(batch_index=idx)):
             if word_idx is None or word_idx == prev_word_idx:
                 continue
-            word_logits.append(logits[idx, sub_idx])
+            word_to_subidx[word_idx] = sub_idx
             prev_word_idx = word_idx
 
-        if not word_logits:
+        if not word_to_subidx:
             continue
-        entries.append((words, torch.stack(word_logits)))
+
+        # Build full-length tensor; words dropped by truncation stay zero.
+        out = torch.zeros(len(words), num_labels, dtype=logits.dtype, device=logits.device)
+        for word_idx, sub_idx in word_to_subidx.items():
+            out[word_idx] = logits[idx, sub_idx]
+        entries.append((words, out))
 
     return entries
 
