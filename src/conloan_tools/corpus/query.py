@@ -570,6 +570,7 @@ def query_cqp_batch(
     queries: List[Tuple[str, Optional[int]]],
     cqp_bin: Optional[str] = None,
     registry_dir: Optional[str] = None,
+    seed: int = 42,
 ) -> List[str]:
     """
     Executes multiple CQP queries in a single session.
@@ -582,6 +583,7 @@ def query_cqp_batch(
     for query, limit in queries:
         commands = [f"Results = {query};"]
         if limit and limit > 0:
+            commands.append(f"randomize {seed};")
             commands.append(f"reduce Results to {limit};")
         commands.append("cat Results;")
         output = _run_cqp_command(corpus, commands, cqp_bin, reg_dir, registry)
