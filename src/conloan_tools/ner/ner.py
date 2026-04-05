@@ -389,6 +389,7 @@ def benchmark(
     perf_only: bool,
     label_biases: tuple[tuple[str, float], ...],
     min_confidences: tuple[tuple[str | None, float], ...],
+    dtype: str,
 ) -> None:
     """Run a NER benchmark over provided texts."""
     if device is None:
