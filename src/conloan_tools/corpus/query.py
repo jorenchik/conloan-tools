@@ -1,5 +1,4 @@
 import subprocess
-import bisect
 import os
 import tempfile
 import click
@@ -50,10 +49,12 @@ class MaskSources:
     # Surprisal
     surprisal_scores: Optional[np.ndarray] = None
     surprisal_records: Optional[list[IndexRecord]] = None
+    surprisal_cpos: Optional[np.ndarray] = None
     surprisal_threshold: float = 0.0
     # NER
     ner_labels: Optional[np.ndarray] = None
     ner_records: Optional[list[IndexRecord]] = None
+    ner_cpos: Optional[np.ndarray] = None
     ner_id2label: Optional[dict[int, str]] = None
     # Loanwords
     lw_lemmas: Optional[set[str]] = None
@@ -82,15 +83,14 @@ def _build_cpos_index(
 
 def _lookup_sent_idx(
     cpos: int,
-    offsets: list[int],
+    cpos_array: np.ndarray,          # keep as ndarray
     records: list[IndexRecord],
 ) -> int | None:
-    """Return sentence ordinal whose interval contains `cpos`, or None."""
-    i = bisect.bisect_right(offsets, cpos) - 1
+    i = int(np.searchsorted(cpos_array, cpos, side="right")) - 1
     if i < 0:
         return None
     rec = records[i]
-    if rec.offset <= cpos < rec.offset + rec.count:
+    if cpos_array[i] <= cpos < cpos_array[i] + rec.count:
         return i
     return None
 
@@ -245,6 +245,7 @@ def _load_ner_labels(h5_path: Path) -> tuple[np.ndarray, list[IndexRecord], dict
             raise click.UsageError(
                 f"{h5_path.name}: unknown ner_output='{ner_output}'."
             )
+        cpos = f["index"]["cpos"][:]
         count  = f["index"]["count"][:]
         raw_id2label = json.loads(f.attrs["id2label"])
 
@@ -254,7 +255,7 @@ def _load_ner_labels(h5_path: Path) -> tuple[np.ndarray, list[IndexRecord], dict
         IndexRecord(offset=int(o), count=int(n))
         for o, n in zip(offsets, count)
     ]
-    return labels, records, id2label
+    return labels, records, id2label, cpos
 
 
 def _render_code_switch_results(
@@ -312,11 +313,11 @@ def load_mask_sources(
     if surprisal_h5 is not None:
         click.echo(f"[*] Loading surprisal index: {surprisal_h5.name}", err=True)
         src.surprisal_scores = _load_scores(surprisal_h5)
-        src.surprisal_records = _load_index_records(surprisal_h5)
+        src.surprisal_records, src.surprisal_cpos = _load_index_records(surprisal_h5)
 
     if ner_h5 is not None:
         click.echo(f"[*] Loading NER index: {ner_h5.name}", err=True)
-        src.ner_labels, src.ner_records, src.ner_id2label = _load_ner_labels(ner_h5)
+        src.ner_labels, src.ner_records, src.ner_id2label, src.ner_cpos = _load_ner_labels(ner_h5)
 
     if surprisal_h5 is not None and ner_h5 is not None:
         _assert_index_alignment(src.surprisal_records, src.ner_records)
@@ -621,19 +622,17 @@ def query_by_lemmas(
     if mask_src.surprisal_records and mask_src.ner_records:
         _assert_index_alignment(mask_src.surprisal_records, mask_src.ner_records)
 
-    ref_records, ref_cpos = load_index_records_with_cpos(ref_h5)
-    cpos_offsets = list(ref_cpos)
-    # ref_records = mask_src.surprisal_records or mask_src.ner_records
-    # cpos_index = _build_cpos_index(ref_records) if ref_records else None
+    ref_records = mask_src.surprisal_records or mask_src.ner_records
+    ref_cpos_arr = src.surprisal_cpos if mask_src.surprisal_records else mask_src.ner_cpos
 
     seen_texts: dict[tuple, ScoredResult] = {}
     scored: List[ScoredResult] = []
 
     for parsed in tqdm(list(parse_cwb_output(raw_output[0])), disable=not verbose):
-        sent_idx = parsed.cqp_id
+        # sent_idx = parsed.cqp_id
         breakpoint()
-        if cpos_offsets is not None:
-            sent_idx = _lookup_sent_idx(parsed.cqp_id, cpos_offsets, ref_records)
+        if ref_cpos_arr is not None:
+            sent_idx = _lookup_sent_idx(parsed.cqp_id, ref_cpos_arr, ref_records)
             if sent_idx is None:
                 continue
         else:
@@ -908,7 +907,7 @@ def query_code_switch(
 
     click.echo("[*] Loading surprisal index...")
     scores = _load_scores(surprisal_h5)
-    index_records = _load_index_records(surprisal_h5)
+    index_records, _ = _load_index_records(surprisal_h5)
 
     results = find_code_switch_sequences(
         scores=scores,
@@ -1075,10 +1074,11 @@ def query_ner_entities(
     )
 
     click.echo("[*] Loading NER index...", err=True)
-    ner_labels, ner_records, id2label = _load_ner_labels(ner_h5)
+    ner_labels, ner_records, id2label, ner_cpos = _load_ner_labels(ner_h5)
     mask_src.ner_labels = ner_labels
     mask_src.ner_records = ner_records
     mask_src.ner_id2label = id2label
+    mask_src.ner_cpos = ner_cpos
 
     if surprisal_h5 is not None and mask_src.surprisal_records is not None:
         _assert_index_alignment(mask_src.surprisal_records, ner_records)
