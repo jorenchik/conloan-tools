@@ -207,17 +207,20 @@ def _load_scores(h5_path: Path) -> np.ndarray:
         return f["scores"]["data"][:].astype(np.float32)
 
 
-def _load_index_records(h5_path: Path) -> list[IndexRecord]:
-    """Load sentence index records from HDF5 /index/cpos + /index/count."""
+def _load_index_records(h5_path: Path) -> tuple[list[IndexRecord], np.ndarray]:
+    """Returns (records, cpos_array). Records use flat offsets for score slicing;
+    cpos_array retains raw corpus positions for sentence lookup."""
     import h5py
 
     with h5py.File(h5_path, "r") as f:
+        cpos  = f["index"]["cpos"][:]
         count = f["index"]["count"][:]
     offsets = np.concatenate([[0], np.cumsum(count[:-1])])
-    return [
+    records = [
         IndexRecord(offset=int(o), count=int(n))
         for o, n in zip(offsets, count)
     ]
+    return records, cpos
 
 
 def _load_ner_labels(h5_path: Path) -> tuple[np.ndarray, list[IndexRecord], dict[int, str]]:
@@ -618,11 +621,8 @@ def query_by_lemmas(
     if mask_src.surprisal_records and mask_src.ner_records:
         _assert_index_alignment(mask_src.surprisal_records, mask_src.ner_records)
 
-    ref_records = mask_src.surprisal_records or mask_src.ner_records
-    if ref_records:
-        cpos_offsets, _ = _build_cpos_index(ref_records)
-    else:
-        cpos_offsets = None
+    ref_records, ref_cpos = load_index_records_with_cpos(ref_h5)
+    cpos_offsets = list(ref_cpos)
     # ref_records = mask_src.surprisal_records or mask_src.ner_records
     # cpos_index = _build_cpos_index(ref_records) if ref_records else None
 
