@@ -65,7 +65,7 @@ Encode `<my_corpus>.vert` as `<MYCORPUS>`:
 
 ```
 mkdir $CORPUS_DATA/<MYCORPUS>
-cwb-encode -d "$CORPUS_DATA/<MYCORPUS>" -f <my_corpus>.vert -R "$CORPUS_REGISTRY" \
+cwb-encode -d "$CORPUS_DATA/<MYCORPUS>" -f <my_corpus>.vert -R "$CORPUS_REGISTRY/<mycorpus>" \
   -c utf8 -x \
   -P pos -P lemma \
   -S doc:0+id+reference+section \
