@@ -1,4 +1,5 @@
 import subprocess
+import bisect
 import os
 import tempfile
 import click
@@ -68,9 +69,30 @@ def _assert_index_alignment(
         )
 
 
-def _build_cpos_index(records: list[IndexRecord]) -> dict[int, int]:
-    """Map token-level corpus position → sentence ordinal."""
-    return {rec.offset: i for i, rec in enumerate(records)}
+def _build_cpos_index(
+    records: list[IndexRecord],
+) -> tuple[list[int], list[int]]:
+    """
+    Returns (offsets, sent_indices) sorted by offset, suitable for
+    bisect lookup. Finds the sentence containing any cpos in O(log n).
+    """
+    offsets = [r.offset for r in records]
+    return offsets, list(range(len(records)))
+
+
+def _lookup_sent_idx(
+    cpos: int,
+    offsets: list[int],
+    records: list[IndexRecord],
+) -> int | None:
+    """Return sentence ordinal whose interval contains `cpos`, or None."""
+    i = bisect.bisect_right(offsets, cpos) - 1
+    if i < 0:
+        return None
+    rec = records[i]
+    if rec.offset <= cpos < rec.offset + rec.count:
+        return i
+    return None
 
 
 def _resolve_registry(
@@ -587,7 +609,7 @@ def query_by_lemmas(
         cqp_bin,
         registry_dir,
     )
-    cfg = load_scoring_config(scoring_config)
+    cfg = load_scoring_config(scoring_config, profile="lemmas")
     lemma_set = {l.lower() for l in lemmas}
 
     if mask_src is None:
@@ -597,7 +619,12 @@ def query_by_lemmas(
         _assert_index_alignment(mask_src.surprisal_records, mask_src.ner_records)
 
     ref_records = mask_src.surprisal_records or mask_src.ner_records
-    cpos_index = _build_cpos_index(ref_records) if ref_records else None
+    if ref_records:
+        cpos_offsets, _ = _build_cpos_index(ref_records)
+    else:
+        cpos_offsets = None
+    # ref_records = mask_src.surprisal_records or mask_src.ner_records
+    # cpos_index = _build_cpos_index(ref_records) if ref_records else None
 
     seen_texts: dict[tuple, ScoredResult] = {}
     scored: List[ScoredResult] = []
@@ -605,8 +632,8 @@ def query_by_lemmas(
     for parsed in tqdm(list(parse_cwb_output(raw_output[0])), disable=not verbose):
         sent_idx = parsed.cqp_id
         breakpoint()
-        if cpos_index is not None:
-            sent_idx = cpos_index.get(parsed.cqp_id - 1)
+        if cpos_offsets is not None:
+            sent_idx = _lookup_sent_idx(parsed.cqp_id, cpos_offsets, ref_records)
             if sent_idx is None:
                 continue
         else:
@@ -871,7 +898,7 @@ def query_code_switch(
     ner_ignore_misc,
 ):
     """Find code-switch sequences using a surprisal HDF5 index."""
-    cfg = load_scoring_config(scoring_config)
+    cfg = load_scoring_config(scoring_config, profile="code-switch")
 
     mask_src = load_mask_sources(
         ner_h5=ner_h5,
@@ -1038,7 +1065,7 @@ def query_ner_entities(
     ner_ignore_misc,
 ):
     """Find and score sentences containing named entities."""
-    cfg = load_scoring_config(scoring_config)
+    cfg = load_scoring_config(scoring_config, profile="ner")
 
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
