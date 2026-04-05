@@ -362,7 +362,6 @@ def build_surprisal_index(
         _build_index_from_iter(
             _iter_surprisal_scores(
                 lm, input_path, reduction,
-                num_labels if ner_output == "logits" else None,
                 limit_lines, limit_sentences, limit_mb,
             ),
             f, store_spos, flush_every,
