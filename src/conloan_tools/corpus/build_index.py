@@ -22,9 +22,133 @@ _CHUNK_TOKENS = 8_192
 _CHUNK_SENTS  = 1_024
 
 
-# ---------------------------------------------------------------------------
-# .vert reader
-# ---------------------------------------------------------------------------
+def _iter_surprisal_scores(
+    lm: WittenBellCharLM,
+    input_path: str,
+    reduction: str,
+    limit_lines: int | None,
+    limit_sentences: int | None,
+    limit_mb: float | None,
+):
+    for _, tokens, cpos in iter_vert_sentences(
+        input_path,
+        limit_lines=limit_lines,
+        limit_sentences=limit_sentences,
+        limit_mb=limit_mb,
+    ):
+        scores = [
+            lm.compute_score(tok, reduction)
+            if is_clean_word(tok, allow_ner=False)
+            else 0.0
+            for tok in tokens
+        ]
+        yield cpos, np.array(scores, dtype=np.float16)
+
+
+def _iter_ner_scores(
+    model: "NERModel",
+    input_path: str,
+    ner_output: str,
+    batch_size: int,
+    scores_dtype: type,
+    num_labels: int | None,
+    limit_lines: int | None,
+    limit_sentences: int | None,
+    limit_mb: float | None,
+):
+    import torch
+
+    def _null_arr(n_tokens: int) -> np.ndarray:
+        if ner_output == "logits":
+            return np.zeros((n_tokens, num_labels), dtype=scores_dtype)
+        else:
+            return np.zeros((n_tokens,), dtype=np.uint8)
+
+    batch: list[tuple[str, list[str], int]] = []
+
+    def _process_batch() -> list[tuple[int, np.ndarray]]:
+        logit_entries = get_logits(model, batch)
+        # use id() rather than fragile list-equality or iterator alignment
+        id_to_result: dict[int, np.ndarray] = {}
+
+        if ner_output == "logits":
+            for words, t in logit_entries:
+                rows = (
+                    t.cpu().numpy().astype(scores_dtype)
+                    if scores_dtype == np.float16
+                    else t.to(torch.float32).cpu().numpy()
+                )
+                arr = np.array(
+                    [
+                        row if is_clean_word(w, allow_ner=True) else np.zeros_like(row)
+                        for w, row in zip(words, rows)
+                    ],
+                    dtype=scores_dtype,
+                )
+                id_to_result[id(words)] = arr
+        else:
+            # infer_ner_pretokenized needs (sent_id, words, cpos) triples
+            surviving = [
+                (None, words, cpos) for _, words, cpos in batch
+                if id(words) in {id(w) for w, _ in logit_entries}
+            ]
+            results = infer_ner_pretokenized(model, surviving)
+            for (words, _), result in zip(logit_entries, results):
+                arr = np.array(
+                    [
+                        lid if is_clean_word(w, allow_ner=True) else 0
+                        for w, lid in zip(words, result.label_ids)
+                    ],
+                    dtype=np.uint8,
+                )
+                id_to_result[id(words)] = arr
+
+        return [
+            (cpos, id_to_result.get(id(words), _null_arr(len(words))))
+            for _, words, cpos in batch
+        ]
+
+
+    for sent_id, tokens, cpos in iter_vert_sentences(
+        input_path,
+        limit_lines=limit_lines,
+        limit_sentences=limit_sentences,
+        limit_mb=limit_mb,
+    ):
+        batch.append((sent_id, tokens, cpos))
+        if len(batch) >= batch_size:
+            yield from _process_batch()
+            batch.clear()
+
+    if batch:
+        yield from _process_batch()
+
+
+def _build_index_from_iter(
+    score_iter,
+    f: h5py.File,
+    store_spos: bool,
+    flush_every: int,
+) -> None:
+    cpos_buf:   list[int]        = []
+    count_buf:  list[int]        = []
+    spos_buf:   list[int] | None = [] if store_spos else None
+    scores_buf: list[np.ndarray] = []
+    spos = 0
+
+    for cpos, arr in score_iter:
+        cpos_buf.append(cpos)
+        count_buf.append(arr.shape[0])
+        if spos_buf is not None:
+            spos_buf.append(spos)
+        scores_buf.append(arr)
+        spos += 1
+
+        if len(cpos_buf) >= flush_every:
+            _hdf5_flush(f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos)
+
+    _hdf5_flush(f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos)
+
 
 def iter_vert_sentences(
     path: str,
@@ -105,10 +229,6 @@ def iter_vert_sentences(
                     parts = stripped.split("\t", 1)
                     tokens.append(parts[0])
 
-
-# ---------------------------------------------------------------------------
-# Shared HDF5 helpers
-# ---------------------------------------------------------------------------
 
 # HDF5 layout (both surprisal and NER):
 #
@@ -210,10 +330,6 @@ def _hdf5_flush(
     scores_buf.clear()
 
 
-# ---------------------------------------------------------------------------
-# Surprisal index
-# ---------------------------------------------------------------------------
-
 def build_surprisal_index(
     lm: WittenBellCharLM,
     input_path: str,
@@ -234,64 +350,35 @@ def build_surprisal_index(
         "type":       "surprisal",
         "input":      str(input_path),
         "reduction":  reduction,
-        "n":           lm.n,
-        "model":      f"WittenBellCharLM",
+        "n":          lm.n,
+        "model":      "WittenBellCharLM",
         "date":       datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "dtype":      "float16",
         "store_spos": store_spos,
     }
 
     f = _create_hdf5(h5_path, np.float16, meta, store_spos, num_labels=None)
-
-    cpos_buf:   list[int]        = []
-    count_buf:  list[int]        = []
-    spos_buf:   list[int] | None = [] if store_spos else None
-    scores_buf: list[np.ndarray] = []
-    spos = 0
-
     try:
-        for _, tokens, cpos in iter_vert_sentences(
-            input_path,
-            limit_lines=limit_lines,
-            limit_sentences=limit_sentences,
-            limit_mb=limit_mb,
-        ):
-            scores = [
-                lm.compute_score(tok, reduction) if is_clean_word(tok, allow_ner=False) else 0.0
-                for tok in tokens
-            ]
-            arr = np.array(scores, dtype=np.float16)
-
-            cpos_buf.append(cpos)
-            count_buf.append(len(arr))
-            if spos_buf is not None:
-                spos_buf.append(spos)
-            scores_buf.append(arr)
-
-            spos += 1
-
-            if len(cpos_buf) >= flush_every:
-                _hdf5_flush(
-                    f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos
-                )
-
-        _hdf5_flush(f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos)
+        _build_index_from_iter(
+            _iter_surprisal_scores(
+                lm, input_path, reduction,
+                num_labels if ner_output == "logits" else None,
+                limit_lines, limit_sentences, limit_mb,
+            ),
+            f, store_spos, flush_every,
+        )
     finally:
         f.close()
 
     return h5_path
 
 
-# ---------------------------------------------------------------------------
-# NER index
-# ---------------------------------------------------------------------------
-
 def build_ner_index(
-    model: NERModel,
+    model: "NERModel",
     input_path: str,
     output_dir: str,
     name: str,
-    ner_output: str = "logits",      # "logits" | "labels"
+    ner_output: str = "logits",
     batch_size: int = 32,
     store_spos: bool = True,
     flush_every: int = IDX_FLUSH_EVERY,
@@ -301,12 +388,12 @@ def build_ner_index(
 ) -> Path:
     import torch
 
+    if ner_output not in ("logits", "labels"):
+        raise ValueError(f"ner_output must be 'logits' or 'labels', got {ner_output!r}")
+
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     h5_path = out / f"{name}.h5"
-
-    if ner_output not in ("logits", "labels"):
-        raise ValueError(f"ner_output must be 'logits' or 'labels', got {ner_output!r}")
 
     id2label: dict[int, str] = {int(k): v for k, v in model.id2label.items()}
     num_labels = len(id2label)
@@ -314,7 +401,7 @@ def build_ner_index(
     _TORCH_TO_NP: dict[torch.dtype, type] = {
         torch.float32: np.float32,
         torch.float16: np.float16,
-        torch.bfloat16: np.float32,  # promoted — no HDF5 bfloat16
+        torch.bfloat16: np.float32,
     }
     if ner_output == "logits":
         torch_dtype = model.torch_dtype or next(model.model.parameters()).dtype
@@ -341,102 +428,20 @@ def build_ner_index(
     }
 
     f = _create_hdf5(h5_path, scores_dtype, meta, store_spos, num_labels_arg)
-
-    cpos_buf:   list[int]        = []
-    count_buf:  list[int]        = []
-    spos_buf:   list[int] | None = [] if store_spos else None
-    scores_buf: list[np.ndarray] = []
-    spos = 0
-
-    # Each batch entry: (sent_id, tokens, cpos)
-    batch: list[tuple[str, list[str], int]] = []
-
-    def flush_batch() -> None:
-        nonlocal spos
-
-        # get_logits is the single source of truth for both modes:
-        # it filters out sentences with no usable word_logits, so
-        # it determines which entries are actually written to the index.
-        logit_entries: list[tuple[list[str], torch.Tensor]] = get_logits(model, batch)
-
-        # Build a cpos lookup keyed by word list identity so we can recover
-        # the original cpos for each surviving entry.
-        # get_logits preserves order and skips entries — align by position
-        # against the original batch using the returned word lists.
-        surviving: list[tuple[str, list[str], int]] = []
-        batch_iter = iter(batch)
-        for words, _ in logit_entries:
-            for sent_id, batch_words, cpos in batch_iter:
-                if batch_words is words:
-                    surviving.append((sent_id, batch_words, cpos))
-                    break
-
-        if ner_output == "logits":
-            arrays: list[np.ndarray] = [
-                np.array(
-                    [
-                        row if is_clean_word(w, allow_ner=True) else np.zeros_like(row)
-                        for w, row in zip(
-                            words,
-                            t.to(torch.float32).cpu().numpy().astype(scores_dtype),
-                        )
-                    ],
-                    dtype=scores_dtype,
-                )
-                for (words, t), (_, _, _) in zip(logit_entries, surviving)
-            ]
-        else:
-            # infer_ner_pretokenized only on the surviving subset so indexing
-            # stays consistent with logit_entries.
-            results = infer_ner_pretokenized(model, surviving)
-            arrays = [
-                np.array(
-                    [
-                        lid if is_clean_word(w, allow_ner=True) else 0
-                        for w, lid in zip(words, r.label_ids)
-                    ],
-                    dtype=np.uint8,
-                )
-                for (words, _), r in zip(logit_entries, results)
-            ]
-
-        for (_, _, sent_cpos), arr in zip(surviving, arrays):
-            cpos_buf.append(sent_cpos)
-            count_buf.append(arr.shape[0])
-            if spos_buf is not None:
-                spos_buf.append(spos)
-            scores_buf.append(arr)
-            spos += 1  # increments only for non-skipped entries
-
-        if len(cpos_buf) >= flush_every:
-            _hdf5_flush(f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos)
-
-        batch.clear()
-
     try:
-        for sent_id, tokens, cpos in iter_vert_sentences(
-            input_path,
-            limit_lines=limit_lines,
-            limit_sentences=limit_sentences,
-            limit_mb=limit_mb,
-        ):
-            batch.append((sent_id, tokens, cpos))
-            if len(batch) >= batch_size:
-                flush_batch()
-
-        if batch:
-            flush_batch()
-
-        _hdf5_flush(f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos)
+        _build_index_from_iter(
+            _iter_ner_scores(
+                model, input_path, ner_output, batch_size, scores_dtype,
+                num_labels if ner_output == "logits" else None,
+                limit_lines, limit_sentences, limit_mb,
+            ),
+            f, store_spos, flush_every,
+        )
     finally:
         f.close()
 
     return h5_path
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 @click.group("build-index")
 def build_index():
