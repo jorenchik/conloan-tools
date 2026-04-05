@@ -78,10 +78,8 @@ def _validate_cpos_lookup(cpos_val: int, count: int, target: int) -> None:
         )
 
 
-def _get_sentence_scores(
-    f: h5py.File, row: int
-) -> np.ndarray:
-    offset = int(f["index"]["cpos"][row])
+def _get_sentence_scores(f: h5py.File, row: int) -> np.ndarray:
+    offset = int(f["index"]["count"][:row].sum())
     count  = int(f["index"]["count"][row])
     return f["scores"]["data"][offset : offset + count]
 

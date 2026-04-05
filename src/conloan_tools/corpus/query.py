@@ -212,11 +212,11 @@ def _load_index_records(h5_path: Path) -> list[IndexRecord]:
     import h5py
 
     with h5py.File(h5_path, "r") as f:
-        cpos  = f["index"]["cpos"][:]
         count = f["index"]["count"][:]
+    offsets = np.concatenate([[0], np.cumsum(count[:-1])])
     return [
-        IndexRecord(offset=int(c), count=int(n))
-        for c, n in zip(cpos, count)
+        IndexRecord(offset=int(o), count=int(n))
+        for o, n in zip(offsets, count)
     ]
 
 
@@ -242,14 +242,14 @@ def _load_ner_labels(h5_path: Path) -> tuple[np.ndarray, list[IndexRecord], dict
             raise click.UsageError(
                 f"{h5_path.name}: unknown ner_output='{ner_output}'."
             )
-        cpos   = f["index"]["cpos"][:]
         count  = f["index"]["count"][:]
         raw_id2label = json.loads(f.attrs["id2label"])
 
     id2label = {int(k): v for k, v in raw_id2label.items()}
+    offsets = np.concatenate([[0], np.cumsum(count[:-1])])
     records  = [
-        IndexRecord(offset=int(c), count=int(n))
-        for c, n in zip(cpos, count)
+        IndexRecord(offset=int(o), count=int(n))
+        for o, n in zip(offsets, count)
     ]
     return labels, records, id2label
 
