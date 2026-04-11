@@ -252,6 +252,31 @@ class MaskSources:
     ner_ignore_misc: bool = False
 
 
+def _ne_exclusion_set(mask_src: MaskSources) -> set[int]:
+    """
+    Return sentence indices that contain any NE label.
+    Respects mask_src.ner_ignore_misc.
+    Returns an empty set if no NER data is loaded.
+    """
+    if (
+        mask_src.ner_labels is None
+        or mask_src.ner_records is None
+        or mask_src.ner_id2label is None
+    ):
+        return set()
+    o_ids = {k for k, v in mask_src.ner_id2label.items() if v == "O"}
+    ne_want = set(mask_src.ner_id2label.keys()) - o_ids
+    if mask_src.ner_ignore_misc:
+        ne_want -= {k for k, v in mask_src.ner_id2label.items() if v == "MISC"}
+    if not ne_want:
+        return set()
+    return set(
+        _ner_matching_sentences(mask_src.ner_labels, mask_src.ner_records, ne_want)
+    )
+
+
+
+
 def _assert_index_alignment(
     a: list[IndexRecord], b: list[IndexRecord]
 ) -> None:
@@ -905,6 +930,13 @@ def query_by_lemmas(
     else:
         sent_indices = np.array([p.cqp_id for p in parsed_list], dtype=np.int32)
 
+    ne_excluded = _ne_exclusion_set(mask_src)
+    if ne_excluded:
+        click.echo(
+            f"[*] NE exclusion: {len(ne_excluded)} sentences will be skipped",
+            err=True,
+        )
+
     seen_texts: dict[tuple, ScoredResult] = {}
     scored: List[ScoredResult] = []
 
@@ -914,7 +946,7 @@ def query_by_lemmas(
         disable=not verbose,
     ):
         sent_idx = int(sent_idx)
-        if sent_idx == -1:
+        if sent_idx == -1 or sent_idx in ne_excluded:
             continue
 
         lw_mask, cs_mask, ne_mask = build_masks(
@@ -1327,6 +1359,15 @@ def query_code_switch(
     index_records, _ = _load_index_records(surprisal_h5)
 
     allowed = _sentence_index_set(len(index_records), sequential, seed, lookup)
+    ne_excl = _ne_exclusion_set(mask_src)
+    if ne_excl:
+        click.echo(
+            f"[*] NE exclusion: removing {len(ne_excl)} sentences", err=True
+        )
+        if allowed is None:
+            allowed = set(range(len(index_records))) - ne_excl
+        else:
+            allowed -= ne_excl
     click.echo(
         f"[*] Scanning in {'sequential' if sequential else f'random (seed={seed})'} order"
         + (f", {lookup} sentences" if lookup else ""),
