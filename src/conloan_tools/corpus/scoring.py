@@ -148,6 +148,20 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
 }
 
 
+def _precompute_densities(
+    tokens: List[Token],
+    loanword_mask: List[int],
+    code_switch_mask: List[int],
+    named_entity_mask: List[int],
+) -> tuple[int, float, float, float, float]:
+    s_len = len(tokens)
+    alpha_ratio = sum(1 for t in tokens if t.word.isalnum()) / s_len
+    lw_density  = sum(loanword_mask)     / s_len
+    cs_density  = sum(code_switch_mask)  / s_len
+    ne_density  = sum(named_entity_mask) / s_len
+    return s_len, alpha_ratio, lw_density, cs_density, ne_density
+
+
 def _validate_profile_defaults(
     profile: QueryProfile,
     known_fields: set[str],
@@ -294,12 +308,13 @@ def _apply_hard_gates(
     code_switch_mask: List[int],
     named_entity_mask: List[int],
     cfg: ScoringConfig,
+    densities: tuple[int, float, float, float, float] | None = None,
 ) -> Optional[str]:
-    """
-    Evaluate all hard-gate conditions in order.
-    Returns a filter reason string on the first failure, None if all pass.
-    """
-    s_len = len(tokens)
+    if densities is None:
+        densities = _precompute_densities(
+            tokens, loanword_mask, code_switch_mask, named_entity_mask
+        )
+    s_len, alpha_ratio, lw_density, cs_density, ne_density = densities
 
     if s_len == 0:
         return "empty"
@@ -308,13 +323,8 @@ def _apply_hard_gates(
     if s_len > cfg.max_tokens:
         return "too_long"
 
-    alpha_ratio = sum(1 for t in tokens if t.word.isalnum()) / s_len
     if alpha_ratio < cfg.min_alpha_ratio:
         return "low_alpha"
-
-    lw_density = sum(loanword_mask) / s_len
-    cs_density = sum(code_switch_mask) / s_len
-    ne_density = sum(named_entity_mask) / s_len
 
     if cfg.filter_require_loanword and lw_density == 0.0:
         return "zero_loanwords"
@@ -346,13 +356,13 @@ def _compute_scores(
     code_switch_mask: List[int],
     named_entity_mask: List[int],
     cfg: ScoringConfig,
+    densities: tuple[int, float, float, float, float] | None = None,
 ) -> tuple[float, float, float, float, float]:
-    s_len = len(tokens)
-    alpha_ratio = sum(1 for t in tokens if t.word.isalnum()) / s_len
-
-    lw_density = sum(loanword_mask) / s_len
-    cs_density = sum(code_switch_mask) / s_len
-    ne_density = sum(named_entity_mask) / s_len
+    if densities is None:
+        densities = _precompute_densities(
+            tokens, loanword_mask, code_switch_mask, named_entity_mask
+        )
+    s_len, alpha_ratio, lw_density, cs_density, ne_density = densities
 
     score_length       = _gaussian(s_len,      cfg.length_mu,       cfg.length_sigma)
     score_alpha        = alpha_ratio
@@ -361,6 +371,15 @@ def _compute_scores(
     score_named_entity = _gaussian(ne_density, cfg.named_entity_mu, cfg.named_entity_sigma)
 
     return score_length, score_alpha, score_loanword, score_code_switch, score_named_entity
+
+
+_weights_cache: dict[int, dict[str, float]] = {}
+
+def _get_weights(cfg: ScoringConfig) -> dict[str, float]:
+    key = id(cfg)
+    if key not in _weights_cache:
+        _weights_cache[key] = _normalised_weights(cfg)
+    return _weights_cache[key]
 
 
 def score_sentence(
@@ -380,19 +399,22 @@ def score_sentence(
     code_switch_mask  = code_switch_mask  or [0] * s_len
     named_entity_mask = named_entity_mask or [0] * s_len
 
+    densities = _precompute_densities(
+        tokens, loanword_mask, code_switch_mask, named_entity_mask
+    )
     reason = _apply_hard_gates(
-        tokens, loanword_mask, code_switch_mask, named_entity_mask, cfg
+        tokens, loanword_mask, code_switch_mask, named_entity_mask, cfg, densities
     )
     if reason:
         return _make_filtered(res, reason)
 
     score_length, score_alpha, score_loanword, score_code_switch, score_named_entity = (
         _compute_scores(
-            tokens, loanword_mask, code_switch_mask, named_entity_mask, cfg
+            tokens, loanword_mask, code_switch_mask, named_entity_mask, cfg, densities
         )
     )
 
-    w = _normalised_weights(cfg)
+    w = _get_weights(cfg)
     score_total = (
           w["length"]       * score_length
         + w["alpha"]        * score_alpha
