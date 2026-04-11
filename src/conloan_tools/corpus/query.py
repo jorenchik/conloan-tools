@@ -102,23 +102,52 @@ def _collapse_spans(
     tokens: list[tuple[str, bool]],
     tag: str,
 ) -> str:
-    """
-    Collapse consecutive tagged tokens into a single span.
-    e.g. [("a", True), ("b", True), ("c", False)] → "<TAG>a b</TAG> c"
-    """
     parts = []
     span: list[str] = []
+    counter = 1
 
     def _flush():
+        nonlocal counter
         if span:
-            parts.append(f"<{tag}>{' '.join(span)}</{tag}>")
+            parts.append(f"<{tag}{counter}>{' '.join(span)}</{tag}{counter}>")
             span.clear()
+            counter += 1
 
     for word, tagged in tokens:
         if tagged:
             span.append(word)
         else:
             _flush()
+            parts.append(word)
+    _flush()
+
+    return " ".join(parts)
+
+
+def _collapse_ne_spans(
+    tokens: list[tuple[str, str | None]],
+) -> str:
+    parts = []
+    span: list[str] = []
+    current_label: str | None = None
+    counter = 1
+
+    def _flush():
+        nonlocal counter
+        if span:
+            parts.append(f"<NE{counter}>{' '.join(span)}</NE{counter}>")
+            span.clear()
+            counter += 1
+
+    for word, label in tokens:
+        if label is not None:
+            if label != current_label:
+                _flush()
+            span.append(word)
+            current_label = label
+        else:
+            _flush()
+            current_label = None
             parts.append(word)
     _flush()
 
@@ -154,34 +183,6 @@ def tag_all_loanwords(parsed_result, lemma_set_lower, primary_lemma):
 
     tagged = [(t.word, i in tag_map) for i, t in enumerate(parsed_result.tokens)]
     return _collapse_spans(tagged, "L")
-
-
-def _collapse_ne_spans(
-    tokens: list[tuple[str, str | None]],  # (word, label_or_None)
-) -> str:
-    """Collapse consecutive same-label NE tokens into a single span."""
-    parts = []
-    span: list[str] = []
-    current_label: str | None = None
-
-    def _flush():
-        if span:
-            parts.append(f"<NE>{' '.join(span)}</NE>")
-            span.clear()
-
-    for word, label in tokens:
-        if label is not None:
-            if label != current_label:
-                _flush()
-            span.append(word)
-            current_label = label
-        else:
-            _flush()
-            current_label = None
-            parts.append(word)
-    _flush()
-
-    return " ".join(parts)
 
 
 def _tag_ner_sentence(
