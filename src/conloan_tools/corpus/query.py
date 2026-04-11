@@ -33,10 +33,34 @@ DEFAULT_RESULTS = 20
 
 # ------ Data types -------
 
-@dataclass
+@dataclass(slots=True)
 class IndexRecord:
     offset: int
     count: int
+
+
+class IndexRecordList:
+    """Mimics list[IndexRecord] but backed by numpy arrays."""
+    def __init__(self, offsets: np.ndarray, counts: np.ndarray):
+        self._offsets = offsets
+        self._counts  = counts
+
+    def __len__(self) -> int:
+        return len(self._offsets)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return IndexRecordList(self._offsets[i], self._counts[i])
+        return IndexRecord(int(self._offsets[i]), int(self._counts[i]))
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield IndexRecord(int(self._offsets[i]), int(self._counts[i]))
+
+
+def _build_records(count: np.ndarray) -> IndexRecordList:
+    offsets = np.concatenate([[0], np.cumsum(count[:-1])])
+    return IndexRecordList(offsets, count)
 
 
 @dataclass
@@ -344,6 +368,7 @@ def _chunked_read(ds, out: np.ndarray, desc: str) -> None:
     """Read an h5py dataset into a pre-allocated array with a progress bar."""
     n = ds.shape[0]
     chunk = ds.chunks[0] if ds.chunks else _CHUNK_TOKENS
+    click.echo(f"[*] {desc}: {n:,} tokens in chunks of {chunk:,}", err=True)
     with tqdm(total=n, unit="tok", desc=desc, leave=False) as pbar:
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
@@ -352,16 +377,12 @@ def _chunked_read(ds, out: np.ndarray, desc: str) -> None:
 
 
 def _load_scores(h5_path: Path) -> np.ndarray:
+    click.echo(f"[*] Opening scores index: {h5_path}", err=True)
     with h5py.File(h5_path, "r") as f:
         ds = f["scores"]["data"]
         out = np.empty(ds.shape[0], dtype=np.float32)
         _chunked_read(ds, out, f"Loading scores {h5_path.name}")
     return out
-
-
-def _build_records(count: np.ndarray) -> list[IndexRecord]:
-    offsets = np.concatenate([[0], np.cumsum(count[:-1])])
-    return [IndexRecord(offset=int(o), count=int(n)) for o, n in zip(offsets, count)]
 
 
 def _load_index_records(
@@ -382,15 +403,25 @@ def _load_ner_labels(
         count        = f["index"]["count"][:]
         raw_id2label = json.loads(f.attrs["id2label"])
         ds           = f["scores"]["data"]
+        click.echo(
+            f"[*] NER index: ner_output={ner_output}  "
+            f"shape={ds.shape}  dtype={ds.dtype}",
+            err=True,
+        )
 
         if ner_output == "logits":
             if ds.ndim != 2:
                 raise click.UsageError(
                     f"{h5_path.name}: expected 2-D logits, got {ds.shape}."
                 )
-            raw = np.empty(ds.shape, dtype=ds.dtype)
-            _chunked_read(ds, raw, f"Loading NER logits {h5_path.name}")
-            labels = np.argmax(raw, axis=-1).astype(np.uint8)
+            n_tokens, n_labels = ds.shape
+            labels = np.empty(n_tokens, dtype=np.uint8)
+            chunk = ds.chunks[0] if ds.chunks else _CHUNK_TOKENS
+            with tqdm(total=n_tokens, unit="tok", desc=f"Loading NER logits {h5_path.name}", leave=False) as pbar:
+                for start in range(0, n_tokens, chunk):
+                    end = min(start + chunk, n_tokens)
+                    labels[start:end] = np.argmax(ds[start:end], axis=-1).astype(np.uint8)
+                    pbar.update(end - start)
         elif ner_output == "labels":
             labels = np.empty(ds.shape[0], dtype=np.uint8)
             _chunked_read(ds, labels, f"Loading NER labels {h5_path.name}")
@@ -399,8 +430,18 @@ def _load_ner_labels(
                 f"{h5_path.name}: unknown ner_output='{ner_output}'."
             )
 
+    click.echo(
+        f"[*] NER index: building records", err=True,
+    )
     id2label = {int(k): v for k, v in raw_id2label.items()}
     records  = _build_records(count)
+
+    click.echo(
+        f"[*] NER labels loaded: {len(records):,} sentences  "
+        f"{labels.nbytes / 1024**2:.1f} MB  "
+        f"labels={sorted(set(id2label.values()))}",
+        err=True,
+    )
     return labels, records, id2label, cpos
 
 
@@ -457,16 +498,17 @@ def load_mask_sources(
     )
 
     if surprisal_h5 is not None:
-        click.echo(f"[*] Loading surprisal index: {surprisal_h5.name}", err=True)
+        click.echo(f"[*] Loading surprisal index: {surprisal_h5}", err=True)
         src.surprisal_scores = _load_scores(surprisal_h5)
         src.surprisal_records, src.surprisal_cpos = _load_index_records(surprisal_h5)
 
     if ner_h5 is not None:
-        click.echo(f"[*] Loading NER index: {ner_h5.name}", err=True)
+        click.echo(f"[*] Loading NER index: {ner_h5}", err=True)
         src.ner_labels, src.ner_records, src.ner_id2label, src.ner_cpos = _load_ner_labels(ner_h5)
 
     if surprisal_h5 is not None and ner_h5 is not None:
         _assert_index_alignment(src.surprisal_records, src.ner_records)
+        click.echo("[*] Index alignment check passed", err=True)
 
     if loanword_file is not None:
         click.echo(f"[*] Loading loanword list: {loanword_file.name}", err=True)
@@ -648,7 +690,7 @@ def _parse_sgml_line(ordinal: int, line_content: str) -> Optional[CQPResult]:
 
 def parse_cwb_output(raw: str) -> Iterator[CQPResult]:
     matches = list(_LINE_RE.finditer(raw))
-    for ordinal, m in tqdm(enumerate(matches), total=len(matches), desc="Parsing CQP output", unit="sent"):
+    for ordinal, m in enumerate(matches):
         parsed = _parse_sgml_line(ordinal, m.group(1))
         if parsed:
             yield parsed
