@@ -98,13 +98,37 @@ def _write_record(record: CandidateRecord, fh) -> None:
     fh.write(json.dumps(dataclasses.asdict(record), ensure_ascii=False) + "\n")
 
 
+def _collapse_spans(
+    tokens: list[tuple[str, bool]],
+    tag: str,
+) -> str:
+    """
+    Collapse consecutive tagged tokens into a single span.
+    e.g. [("a", True), ("b", True), ("c", False)] → "<TAG>a b</TAG> c"
+    """
+    parts = []
+    span: list[str] = []
+
+    def _flush():
+        if span:
+            parts.append(f"<{tag}>{' '.join(span)}</{tag}>")
+            span.clear()
+
+    for word, tagged in tokens:
+        if tagged:
+            span.append(word)
+        else:
+            _flush()
+            parts.append(word)
+    _flush()
+
+    return " ".join(parts)
+
+
 def _tag_code_switch_sentence(run: CodeSwitchRun) -> str:
     index_set = set(run.token_indices)
-    parts = [
-        f"<CS>{t.word}</CS>" if i in index_set else t.word
-        for i, t in enumerate(run.tokens)
-    ]
-    return " ".join(parts)
+    tokens = [(t.word, i in index_set) for i, t in enumerate(run.tokens)]
+    return _collapse_spans(tokens, "CS")
 
 
 def tag_all_loanwords(parsed_result, lemma_set_lower, primary_lemma):
@@ -128,15 +152,36 @@ def tag_all_loanwords(parsed_result, lemma_set_lower, primary_lemma):
     for tag_num, (pos, _, _) in enumerate(loanword_positions, start=1):
         tag_map[pos] = tag_num
 
-    tokens = []
-    for i, t in enumerate(parsed_result.tokens):
-        if i in tag_map:
-            n = tag_map[i]
-            tokens.append(f"<L{n}>{t.word}</L{n}>")
-        else:
-            tokens.append(t.word)
+    tagged = [(t.word, i in tag_map) for i, t in enumerate(parsed_result.tokens)]
+    return _collapse_spans(tagged, "L")
 
-    return " ".join(tokens)
+
+def _collapse_ne_spans(
+    tokens: list[tuple[str, str | None]],  # (word, label_or_None)
+) -> str:
+    """Collapse consecutive same-label NE tokens into a single span."""
+    parts = []
+    span: list[str] = []
+    current_label: str | None = None
+
+    def _flush():
+        if span:
+            parts.append(f"<NE>{' '.join(span)}</NE>")
+            span.clear()
+
+    for word, label in tokens:
+        if label is not None:
+            if label != current_label:
+                _flush()
+            span.append(word)
+            current_label = label
+        else:
+            _flush()
+            current_label = None
+            parts.append(word)
+    _flush()
+
+    return " ".join(parts)
 
 
 def _tag_ner_sentence(
@@ -149,13 +194,16 @@ def _tag_ner_sentence(
 ) -> str:
     record = ner_records[sent_idx]
     chunk = ner_labels[record.offset : record.offset + record.count]
-    parts = [
-        f'<NE label="{id2label[int(chunk[i])]}">{t.word}</NE>'
-        if i < len(chunk) and int(chunk[i]) in want
-        else t.word
+    tokens = [
+        (
+            t.word,
+            id2label[int(chunk[i])]
+            if i < len(chunk) and int(chunk[i]) in want
+            else None,
+        )
         for i, t in enumerate(parsed.tokens)
     ]
-    return " ".join(parts)
+    return _collapse_ne_spans(tokens)
 
 
 def _result_to_record(
