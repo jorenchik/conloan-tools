@@ -341,6 +341,7 @@ def _scan_runs_vectorized(
     counts: np.ndarray,    # int32, one per sentence
     threshold: float,
     min_consecutive: int,
+    allowed: set[int] | None = None,
 ) -> list[tuple[int, list[int], list[float]]]:
     """
     Returns (sent_idx, token_indices, token_scores) for the best run per
@@ -410,6 +411,8 @@ def _scan_runs_vectorized(
 
     # Re-sort by sent_idx for stable downstream behaviour
     output.sort(key=lambda x: x[0])
+    if allowed is not None:
+        output = [o for o in output if o[0] in allowed]
     return output
 
 
@@ -946,6 +949,7 @@ def scan_anomaly_candidates(
     threshold: float,
     min_consecutive: int,
     lookup: int | None = None,
+    allowed=None,
 ) -> list[tuple[int, list[int], list[float]]]:
     """
     Vectorized scan. Returns (sent_idx, token_indices, token_scores)
@@ -962,7 +966,7 @@ def scan_anomaly_candidates(
     flat = scores[:end_idx]
 
     candidates = _scan_runs_vectorized(
-        flat, offsets, counts, threshold, min_consecutive
+        flat, offsets, counts, threshold, min_consecutive, allowed=allowed
     )
 
     # Sort by run length descending (best first)
@@ -975,6 +979,7 @@ def _ner_matching_sentences(
     records: list[IndexRecord],
     want: set[int],
     exclude: set[int] | None = None,
+    allowed: set[int] | None = None,
 ) -> list[int]:
     """
     Vectorized: return sorted sentence indices that contain any label in `want`
@@ -996,6 +1001,8 @@ def _ner_matching_sentences(
         return []
 
     hit_sents = set(np.unique(sent_ids[token_hits]).tolist())
+    if allowed is not None:
+        hit_sents &= allowed
 
     if exclude:
         excl_arr  = np.array(sorted(exclude), dtype=flat.dtype)
@@ -1018,6 +1025,7 @@ def find_code_switch_sequences(
     registry_dir: Optional[str] = None,
     lookup: int | None = None,        # renamed from limit_sentences
     mask_src: Optional[MaskSources] = None,
+    allowed = None,
 ) -> list[CodeSwitchRun]:
     """Score all qualifying runs; caller is responsible for capping display."""
     if mask_src is None:
@@ -1032,6 +1040,7 @@ def find_code_switch_sequences(
         threshold=threshold,
         min_consecutive=min_consecutive,
         lookup=lookup,
+        allowed=allowed,
     )
     if not candidates:
         return []
@@ -1163,6 +1172,25 @@ def _load_candidates(path: str) -> list[CandidateRecord]:
     return records
 
 
+def _sentence_index_set(
+    n_total: int,
+    sequential: bool,
+    seed: int,
+    lookup: int | None,
+) -> set[int] | None:
+    """
+    Returns a set of allowed sentence indices, or None meaning 'all'.
+    Sequential: first `lookup` sentences. Random: `lookup` random indices.
+    """
+    if lookup is None:
+        return None
+    if sequential:
+        return set(range(min(lookup, n_total)))
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(n_total, size=min(lookup, n_total), replace=False)
+    return set(idx.tolist())
+
+
 @query_group.command("pretty-print")
 @click.argument(
     "candidates",
@@ -1262,6 +1290,12 @@ def _render_candidates(records: list[CandidateRecord]) -> None:
     default=None,
     help="Write JSONL to file. Omit to write to stdout.",
 )
+@click.option(
+    "--sequential",
+    is_flag=True,
+    default=False,
+    help="Scan in index order. Default: random by seed."
+)
 def query_code_switch(
     corpus_name,
     surprisal_h5,
@@ -1277,6 +1311,7 @@ def query_code_switch(
     loanword_file,
     ner_ignore_misc,
     output,
+    sequential,
 ):
     """Find code-switch sequences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.CODE_SWITCH)
@@ -1291,6 +1326,12 @@ def query_code_switch(
     scores = _load_scores(surprisal_h5)
     index_records, _ = _load_index_records(surprisal_h5)
 
+    allowed = _sentence_index_set(len(index_records), sequential, seed, lookup)
+    click.echo(
+        f"[*] Scanning in {'sequential' if sequential else f'random (seed={seed})'} order"
+        + (f", {lookup} sentences" if lookup else ""),
+        err=True,
+    )
     found = find_code_switch_sequences(
         scores=scores,
         index_records=index_records,
@@ -1300,8 +1341,9 @@ def query_code_switch(
         cfg=cfg,
         cqp_bin=cqp_bin,
         registry_dir=registry_dir,
-        lookup=lookup,
+        lookup=None,
         mask_src=mask_src,
+        allowed=allowed,
     )
 
     click.echo(f"[*] Found and scored {len(found)} candidate sequences", err=True)
@@ -1499,6 +1541,12 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
     default=None,
     help="Write JSONL to file. Omit to write to stdout.",
 )
+@click.option(
+    "--sequential",
+    is_flag=True,
+    default=False,
+    help="Scan in index order. Default: random by seed."
+)
 def query_ner_entities(
     corpus_name, ner_h5, labels, excl_labels,
     lookup, results, cqp_bin, registry_dir, seed, scoring_config,
@@ -1566,13 +1614,18 @@ def query_ner_entities(
             err=True,
         )
 
-    records = ner_records[:lookup] if lookup else ner_records
+    allowed = _sentence_index_set(len(ner_records), sequential, seed, lookup)
+    click.echo(
+        f"[*] Scanning in {'sequential' if sequential else f'random (seed={seed})'} order"
+        + (f", {lookup} sentences" if lookup else ""),
+        err=True,
+    )
 
     click.echo(
         f"[*] Scanning {len(records)} sentences for matching labels...",
         err=True,
     )
-    matching = _ner_matching_sentences(ner_labels, records, want, exclude)
+    matching = _ner_matching_sentences(ner_labels, ner_records, want, exclude, allowed=allowed)
     click.echo(f"[*] Found {len(matching)} candidate sentence(s)", err=True)
 
     if not matching:

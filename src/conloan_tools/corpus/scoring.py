@@ -124,6 +124,7 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "max_tokens":                      128,
         "min_alpha_ratio":                 0.5,
         "filter_require_code_switch":      True,
+        "filter_forbid_named_entity":      True,
 
         "weight_code_switch":              0.40,
         "weight_length":                   0.20,
