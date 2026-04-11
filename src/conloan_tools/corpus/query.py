@@ -71,7 +71,7 @@ class CandidateRecord:
 
 def _write_record(record: CandidateRecord, fh) -> None:
     import dataclasses
-    fh.write(json.dumps(dataclasses.asdict(record)) + "\n")
+    fh.write(json.dumps(dataclasses.asdict(record), ensure_ascii=False) + "\n")
 
 
 def _tag_code_switch_sentence(run: CodeSwitchRun) -> str:
@@ -1054,12 +1054,70 @@ def query_group():
 @contextmanager
 def _output_context(output: Path | None):
     if output is None:
-        yield None
+        yield sys.stdout
     else:
         with open(output, "w", encoding="utf-8") as fh:
             yield fh
 
 
+def _load_candidates(path: str) -> list[CandidateRecord]:
+    records = []
+    with open(path, encoding="utf-8") as f:
+        for line in tqdm(f, desc="Loading candidates", unit="rec"):
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            records.append(CandidateRecord(**d))
+    return records
+
+
+@query_group.command("pretty-print")
+@click.argument(
+    "candidates",
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option(
+    "--results",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Number of results to show. 0 = all.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["lemmas", "ner", "code_switch", "all"]),
+    default="all",
+    show_default=True,
+    help="Filter by mode.",
+)
+def pretty_print_command(candidates, results, mode):
+    """Pretty-print a JSONL candidates file."""
+    pool = _load_candidates(candidates)
+    if mode != "all":
+        pool = [r for r in pool if r.mode == mode]
+    shown = pool[:results] if results > 0 else pool
+    _render_candidates(shown)
+    click.echo(f"({len(shown)} of {len(pool)} records shown)", err=True)
+
+
+def _render_candidates(records: list[CandidateRecord]) -> None:
+    for rec in records:
+        status = (
+            f" [FILTERED: {rec.filter_reason}]" if rec.filtered else ""
+        )
+        click.echo(
+            f"Score: {rec.score_total:.4f}  "
+            f"(len={rec.score_length:.2f}  lw={rec.score_lw:.2f}  "
+            f"cs={rec.score_cs:.2f}  alpha={rec.score_alpha:.2f}  "
+            f"ne={rec.score_ne:.2f})  "
+            f"| mode={rec.mode}  cqp_id={rec.cqp_id}"
+            f"  spos={rec.spos}{status}"
+        )
+        click.echo(rec.sentence)
+        if rec.tag_map:
+            click.echo(f"  ↳ tags: {rec.tag_map}")
+        click.echo("-" * 60)
 
 
 @query_group.command("code-switch")
@@ -1081,7 +1139,7 @@ def _output_context(output: Path | None):
     type=int,
     default=DEFAULT_RESULTS,
     show_default=True,
-    help="Number of top results to display. 0 = show all.",
+    help="Number of top results to emit. 0 = all.",
 )
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
@@ -1091,7 +1149,7 @@ def _output_context(output: Path | None):
     "--ner-h5",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="NER HDF5 index; builds NE mask. Falls back to heuristic if omitted.",
+    help="NER HDF5 index; builds NE mask.",
 )
 @click.option(
     "--loanwords",
@@ -1105,13 +1163,13 @@ def _output_context(output: Path | None):
     "ner_ignore_misc",
     is_flag=True,
     default=False,
-    help="Treat MISC NER labels as O (exclude from named-entity mask).",
+    help="Treat MISC NER labels as O.",
 )
 @click.option(
     "--output",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
-    help="Write JSONL records instead of pretty-printing.",
+    help="Write JSONL to file. Omit to write to stdout.",
 )
 def query_code_switch(
     corpus_name,
@@ -1129,7 +1187,7 @@ def query_code_switch(
     ner_ignore_misc,
     output,
 ):
-    """Find code-switch sequences using a surprisal HDF5 index."""
+    """Find code-switch sequences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.CODE_SWITCH)
 
     mask_src = load_mask_sources(
@@ -1181,34 +1239,7 @@ def query_code_switch(
                 spos=run.sent_idx,
                 seed=seed,
             )
-            if fh:
-                _write_record(rec, fh)
-            else:
-                index_set = set(run.token_indices)
-                status = (
-                    f"[FILTERED: {run.metrics.filter_reason}]"
-                    if run.metrics.filtered else ""
-                )
-                click.echo(
-                    f"Score: {run.metrics.score_total:.4f}  "
-                    f"(len={run.metrics.score_length:.2f}"
-                    f"  lw={run.metrics.score_loanword:.2f}"
-                    f"  cs={run.metrics.score_code_switch:.2f}"
-                    f"  alpha={run.metrics.score_alpha:.2f}"
-                    f"  ne={run.metrics.score_named_entity:.2f})"
-                    f"  | Pos: {run.sent_idx}  ID: {run.metrics.cqp_id}  {status}"
-                )
-                parts = [
-                    f"[{t.word}]" if i in index_set else t.word
-                    for i, t in enumerate(run.tokens)
-                ]
-                click.echo(" ".join(parts))
-                run_details = "  ".join(
-                    f"{run.tokens[i].word}({s:.2f})"
-                    for i, s in zip(run.token_indices, run.token_scores)
-                )
-                click.echo(f"  ↳ run: {run_details}")
-                click.echo("-" * 60)
+            _write_record(rec, fh)
 
     if output:
         click.echo(f"[✓] Wrote {len(shown)} records to {output}", err=True)
@@ -1229,7 +1260,7 @@ def query_code_switch(
     type=int,
     default=DEFAULT_RESULTS,
     show_default=True,
-    help="Number of top results to display.",
+    help="Number of top results to emit.",
 )
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
@@ -1240,7 +1271,7 @@ def query_code_switch(
     "--output",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
-    help="Write JSONL records instead of pretty-printing.",
+    help="Write JSONL to file. Omit to write to stdout.",
 )
 def query_lemmas_command(
     corpus_name,
@@ -1258,7 +1289,7 @@ def query_lemmas_command(
     ner_ignore_misc,
     output,
 ):
-    """Query corpus by lemma(s) and score results."""
+    """Query corpus by lemma(s) and emit JSONL records."""
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
@@ -1304,18 +1335,7 @@ def query_lemmas_command(
                 spos=None,
                 seed=seed,
             )
-            if fh:
-                _write_record(rec, fh)
-            else:
-                click.echo(
-                    f"Score: {r.score_total:.4f}  "
-                    f"(len={r.score_length:.2f}  lw={r.score_loanword:.2f}  "
-                    f"cs={r.score_code_switch:.2f}  alpha={r.score_alpha:.2f}  "
-                    f"ne={r.score_named_entity:.2f})  | ID: {r.cqp_id}"
-                    f"{' [FILTERED: ' + r.filter_reason + ']' if r.filtered else ''}"
-                )
-                click.echo(" ".join(t.word for t in r.tokens))
-                click.echo("-" * 60)
+            _write_record(rec, fh)
 
     if output:
         click.echo(f"[✓] Wrote {len(shown)} records to {output}", err=True)
@@ -1363,7 +1383,7 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
     type=int,
     default=DEFAULT_RESULTS,
     show_default=True,
-    help="Number of top results to display. 0 = show all.",
+    help="Number of top results to emit. 0 = all.",
 )
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
@@ -1386,7 +1406,7 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
     "--output",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
-    help="Write JSONL records instead of pretty-printing.",
+    help="Write JSONL to file. Omit to write to stdout.",
 )
 def query_ner_entities(
     corpus_name, ner_h5, labels, excl_labels,
@@ -1394,7 +1414,7 @@ def query_ner_entities(
     surprisal_h5, surprisal_threshold, loanword_file, ner_ignore_misc,
     output,
 ):
-    """Find and score sentences containing named entities."""
+    """Find named entity sentences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.NER)
 
     mask_src = load_mask_sources(
@@ -1456,9 +1476,14 @@ def query_ner_entities(
         )
 
     records = ner_records[:lookup] if lookup else ner_records
-    matching = _ner_matching_sentences(ner_labels, records, want, exclude)
 
+    click.echo(
+        f"[*] Scanning {len(records)} sentences for matching labels...",
+        err=True,
+    )
+    matching = _ner_matching_sentences(ner_labels, records, want, exclude)
     click.echo(f"[*] Found {len(matching)} candidate sentence(s)", err=True)
+
     if not matching:
         return
 
@@ -1520,23 +1545,7 @@ def query_ner_entities(
                 spos=sent_idx,
                 seed=seed,
             )
-            if fh:
-                _write_record(rec, fh)
-            else:
-                status = (
-                    f" [FILTERED: {scored.filter_reason}]"
-                    if scored.filtered else ""
-                )
-                click.echo(
-                    f"Score: {scored.score_total:.4f}  "
-                    f"(len={scored.score_length:.2f}  lw={scored.score_loanword:.2f}  "
-                    f"cs={scored.score_code_switch:.2f}  "
-                    f"alpha={scored.score_alpha:.2f}  "
-                    f"ne={scored.score_named_entity:.2f})  "
-                    f"| ID: {scored.cqp_id}{status}"
-                )
-                click.echo(f"[{sent_idx}] {sentence}")
-                click.echo("-" * 60)
+            _write_record(rec, fh)
 
     if output:
         click.echo(f"[✓] Wrote {len(shown)} records to {output}", err=True)

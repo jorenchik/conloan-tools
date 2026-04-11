@@ -9,6 +9,7 @@ from tqdm import tqdm
 from conloan_tools.corpus.query import CandidateRecord
 from conloan_tools.annotation import annotation
 from .excel import write_sheet 
+import json
 
 
 def _load_candidates(path: str) -> list[CandidateRecord]:
