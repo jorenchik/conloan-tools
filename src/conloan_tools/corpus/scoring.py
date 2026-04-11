@@ -97,7 +97,7 @@ class ScoredResult:
     filtered: bool
     filter_reason: str
     score_length: float
-    score_cleanliness: float
+    score_alpha: float
     score_loanword: float
     score_code_switch: float
     score_named_entity: float
@@ -259,7 +259,7 @@ def _gaussian(x: float, mu: float, sigma: float) -> float:
 def _normalised_weights(cfg: ScoringConfig) -> dict[str, float]:
     raw = {
         "length":       cfg.weight_length,
-        "alpha":        cfg.alpha,
+        "alpha":        cfg.weight_alpha,
         "loanword":     cfg.weight_loanword,
         "code_switch":  cfg.weight_code_switch,
         "named_entity": cfg.weight_named_entity,
@@ -280,7 +280,7 @@ def _make_filtered(res: CQPResult, reason: str) -> ScoredResult:
         filtered=True,
         filter_reason=reason,
         score_length=0.0,
-        score_cleanliness=0.0,
+        score_alpha=0.0,
         score_loanword=0.0,
         score_code_switch=0.0,
         score_named_entity=0.0,
@@ -409,7 +409,7 @@ def score_sentence(
         filtered=False,
         filter_reason="",
         score_length=score_length,
-        score_cleanliness=score_clean,
+        score_alpha=score_alpha,
         score_loanword=score_loanword,
         score_code_switch=score_code_switch,
         score_named_entity=score_named_entity,

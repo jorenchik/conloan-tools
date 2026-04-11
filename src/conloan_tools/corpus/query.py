@@ -14,6 +14,7 @@ from conloan_tools.corpus import corpus
 from .scoring import (
     Token,
     CQPResult,
+    QueryProfile,
     ScoringConfig,
     ScoredResult,
     load_scoring_config,
@@ -23,7 +24,8 @@ from .scoring import (
 )
 
 DEFAULT_CQP_BIN = "cqp"
-DEFAULT_RESULTS = 200
+DEFAULT_LOOKUP  = 200
+DEFAULT_RESULTS = 20
 
 # ------ Data types -------
 
@@ -275,7 +277,7 @@ def _render_code_switch_results(
             f"(len={res.score_length:.2f}"
             f"  lw={res.score_loanword:.2f}"
             f"  cs={res.score_code_switch:.2f}"
-            f"  clean={res.score_cleanliness:.2f}"
+            f"  alpha={scored.score_alpha:.2f}  "
             f"  ne={res.score_named_entity:.2f})"
             f"  | Pos: {run.sent_idx}  ID: {res.cqp_id}  {status}"
         )
@@ -601,7 +603,7 @@ def build_or_query(lemmas: List[str]) -> str:
 def query_by_lemmas(
     corpus_name: str,
     lemmas: List[str],
-    limit: int = DEFAULT_RESULTS,
+    lookup: int = DEFAULT_LOOKUP,
     cqp_bin: str = DEFAULT_CQP_BIN,
     registry_dir: str = None,
     scoring_config: str = None,
@@ -611,11 +613,11 @@ def query_by_lemmas(
 ) -> List[ScoredResult]:
     raw_output = query_cqp_batch(
         corpus_name,
-        [(build_or_query(lemmas), limit)],
+        [(build_or_query(lemmas), lookup)],
         cqp_bin,
         registry_dir,
     )
-    cfg = load_scoring_config(scoring_config, profile="lemmas")
+    cfg = load_scoring_config(scoring_config, profile=QueryProfile.LEMMAS)
     lemma_set = {l.lower() for l in lemmas}
 
     if mask_src is None:
@@ -625,14 +627,14 @@ def query_by_lemmas(
         _assert_index_alignment(mask_src.surprisal_records, mask_src.ner_records)
 
     ref_records = mask_src.surprisal_records or mask_src.ner_records
-    ref_cpos_arr = src.surprisal_cpos if mask_src.surprisal_records else mask_src.ner_cpos
+    ref_cpos_arr = (
+        mask_src.surprisal_cpos if mask_src.surprisal_records else mask_src.ner_cpos
+    )
 
     seen_texts: dict[tuple, ScoredResult] = {}
     scored: List[ScoredResult] = []
 
     for parsed in tqdm(list(parse_cwb_output(raw_output[0])), disable=not verbose):
-        # sent_idx = parsed.cqp_id
-        breakpoint()
         if ref_cpos_arr is not None:
             sent_idx = _lookup_sent_idx(parsed.cqp_id, ref_cpos_arr, ref_records)
             if sent_idx is None:
@@ -715,7 +717,7 @@ def find_code_switch_sequences(
     cfg: ScoringConfig,
     cqp_bin: str = DEFAULT_CQP_BIN,
     registry_dir: Optional[str] = None,
-    limit_sentences: int | None = None,
+    lookup: int | None = None,        # renamed from limit_sentences
     mask_src: Optional[MaskSources] = None,
 ) -> list[CodeSwitchRun]:
     """Score all qualifying runs; caller is responsible for capping display."""
@@ -730,8 +732,7 @@ def find_code_switch_sequences(
         index_records=index_records,
         threshold=threshold,
         min_consecutive=min_consecutive,
-        max_results=0,  # no cap — score everything
-        limit_sentences=limit_sentences,
+        lookup=lookup,
     )
     if not candidates:
         return []
@@ -849,7 +850,13 @@ def query_group():
 @click.option("--threshold", type=float, required=True)
 @click.option("--min-consecutive", type=int, default=2, show_default=True)
 @click.option(
-    "--max-results",
+    "--lookup",
+    type=int,
+    default=None,
+    help="Scan only the first N sentences. Omit to scan all.",
+)
+@click.option(
+    "--results",
     type=int,
     default=DEFAULT_RESULTS,
     show_default=True,
@@ -857,12 +864,6 @@ def query_group():
 )
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
-@click.option(
-    "--limit-sentences",
-    type=int,
-    default=None,
-    help="Scan only the first N sentences. Omit to scan all.",
-)
 @scoring_config_option
 @click.option(
     "--ner-h5",
@@ -889,17 +890,17 @@ def query_code_switch(
     surprisal_h5,
     threshold,
     min_consecutive,
-    max_results,
+    lookup,
+    results,
     cqp_bin,
     registry_dir,
-    limit_sentences,
     scoring_config,
     ner_h5,
     loanword_file,
     ner_ignore_misc,
 ):
     """Find code-switch sequences using a surprisal HDF5 index."""
-    cfg = load_scoring_config(scoring_config, profile="code-switch")
+    cfg = load_scoring_config(scoring_config, profile=QueryProfile.CODE_SWITCH)
 
     mask_src = load_mask_sources(
         ner_h5=ner_h5,
@@ -907,11 +908,11 @@ def query_code_switch(
         ner_ignore_misc=ner_ignore_misc,
     )
 
-    click.echo("[*] Loading surprisal index...")
+    click.echo("[*] Loading surprisal index...", err=True)
     scores = _load_scores(surprisal_h5)
     index_records, _ = _load_index_records(surprisal_h5)
 
-    results = find_code_switch_sequences(
+    found = find_code_switch_sequences(
         scores=scores,
         index_records=index_records,
         threshold=threshold,
@@ -920,12 +921,12 @@ def query_code_switch(
         cfg=cfg,
         cqp_bin=cqp_bin,
         registry_dir=registry_dir,
-        limit_sentences=limit_sentences,
+        lookup=lookup,
         mask_src=mask_src,
     )
 
-    click.echo(f"[*] Found and scored {len(results)} candidate sequences")
-    shown = results if max_results == 0 else results[:max_results]
+    click.echo(f"[*] Found and scored {len(found)} candidate sequences", err=True)
+    shown = found if results == 0 else found[:results]
     if shown:
         _render_code_switch_results(shown, threshold)
 
@@ -933,28 +934,50 @@ def query_code_switch(
 @query_group.command("lemmas")
 @click.argument("corpus_name")
 @click.argument("lemmas")
-@click.option("--limit", type=int, default=DEFAULT_RESULTS, show_default=True)
+@click.option(
+    "--lookup",
+    type=int,
+    default=DEFAULT_LOOKUP,
+    show_default=True,
+    help="Number of corpus rows to fetch and process.",
+)
+@click.option(
+    "--results",
+    type=int,
+    default=DEFAULT_RESULTS,
+    show_default=True,
+    help="Number of top results to display.",
+)
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
-@click.option("--top", type=int, default=5, show_default=True)
 @scoring_config_option
 @mask_source_options
 def query_lemmas_command(
-    corpus_name, lemmas, limit, cqp_bin, registry_dir, scoring_config, top,
-    surprisal_h5, surprisal_threshold, ner_h5, loanword_file, ner_ignore_misc,
+    corpus_name,
+    lemmas,
+    lookup,
+    results,
+    cqp_bin,
+    registry_dir,
+    scoring_config,
+    surprisal_h5,
+    surprisal_threshold,
+    ner_h5,
+    loanword_file,
+    ner_ignore_misc,
 ):
     """Query corpus by lemma(s) and score results."""
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
-        surprisal_threshold=surprisal_threshold,  # was missing
+        surprisal_threshold=surprisal_threshold,
         ner_h5=ner_h5,
         loanword_file=loanword_file,
         ner_ignore_misc=ner_ignore_misc,
     )
-    results = query_by_lemmas(
+    found = query_by_lemmas(
         corpus_name=corpus_name,
         lemmas=lemmas.split(","),
-        limit=limit,
+        lookup=lookup,
         cqp_bin=cqp_bin,
         registry_dir=registry_dir,
         scoring_config=scoring_config,
@@ -962,20 +985,18 @@ def query_lemmas_command(
         mask_src=mask_src,
     )
 
-    click.echo(f"\nTop {top} results for '{lemmas}':")
+    click.echo(f"\nTop {results} results for '{lemmas}':")
     click.echo("-" * 60)
-    for r in results[:top]:
+    for r in found[:results]:
         click.echo(
             f"Score: {r.score_total:.4f}  "
             f"(len={r.score_length:.2f}  lw={r.score_loanword:.2f}  "
-            f"cs={r.score_code_switch:.2f}  clean={r.score_cleanliness:.2f}  "
+            f"cs={r.score_code_switch:.2f}  alpha={r.score_alpha:.2f}  "
             f"ne={r.score_named_entity:.2f})  | ID: {r.cqp_id}"
             f"{' [FILTERED: ' + r.filter_reason + ']' if r.filtered else ''}"
         )
         click.echo(" ".join(t.word for t in r.tokens))
         click.echo("-" * 60)
-
-
 
 
 @query_group.command("position")
@@ -1009,7 +1030,13 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
 )
 @click.option("--label", "labels", multiple=True)
 @click.option(
-    "--max-results",
+    "--lookup",
+    type=int,
+    default=None,
+    help="Scan only the first N sentences. Omit to scan all.",
+)
+@click.option(
+    "--results",
     type=int,
     default=DEFAULT_RESULTS,
     show_default=True,
@@ -1017,12 +1044,6 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
 )
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
-@click.option(
-    "--limit-sentences",
-    type=int,
-    default=None,
-    help="Scan only the first N sentences. Omit to scan all.",
-)
 @scoring_config_option
 @click.option(
     "--surprisal-h5",
@@ -1055,10 +1076,10 @@ def query_ner_entities(
     corpus_name,
     ner_h5,
     labels,
-    max_results,
+    lookup,
+    results,
     cqp_bin,
     registry_dir,
-    limit_sentences,
     scoring_config,
     surprisal_h5,
     surprisal_threshold,
@@ -1066,7 +1087,7 @@ def query_ner_entities(
     ner_ignore_misc,
 ):
     """Find and score sentences containing named entities."""
-    cfg = load_scoring_config(scoring_config, profile="ner")
+    cfg = load_scoring_config(scoring_config, profile=QueryProfile.NER)
 
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
@@ -1102,7 +1123,7 @@ def query_ner_entities(
         err=True,
     )
 
-    records = ner_records[:limit_sentences] if limit_sentences else ner_records
+    records = ner_records[:lookup] if lookup else ner_records
     matching: list[int] = []
     for sent_idx, record in enumerate(
         tqdm(records, desc="Scanning NER labels", unit="sent")
@@ -1153,9 +1174,7 @@ def query_ner_entities(
     scored_results.sort(key=lambda x: x[0].score_total, reverse=True)
     click.echo(f"[*] Scored {len(scored_results)} sentence(s)", err=True)
 
-    shown = (
-        scored_results if max_results == 0 else scored_results[:max_results]
-    )
+    shown = scored_results if results == 0 else scored_results[:results]
 
     click.echo("-" * 60)
     for scored, parts_str, sent_idx in shown:
@@ -1166,7 +1185,7 @@ def query_ner_entities(
             f"Score: {scored.score_total:.4f}  "
             f"(len={scored.score_length:.2f}  lw={scored.score_loanword:.2f}  "
             f"cs={scored.score_code_switch:.2f}  "
-            f"clean={scored.score_cleanliness:.2f}  "
+            f"alpha={scored.score_alpha:.2f}  "
             f"ne={scored.score_named_entity:.2f})  "
             f"| ID: {scored.cqp_id}{status}"
         )
