@@ -1,4 +1,5 @@
 import math
+from enum import Enum
 from dataclasses import dataclass, asdict
 from typing import List, Literal, Optional, Set
 try:
@@ -9,7 +10,13 @@ except ModuleNotFoundError:
 import click
 
 
-QueryProfile = Literal["lemma", "code_switch", "ner", "generic"]
+class QueryProfile(str, Enum):
+    LEMMAS = "lemmas"
+    CODE_SWITCH = "code-switch"
+    NER = "ner"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass
@@ -39,22 +46,21 @@ class CQPResult:
 
 @dataclass
 class ScoringConfig:
-    # Hard gates
-    min_tokens:      int   = 5
-    max_tokens:      int   = 60
-    min_alpha_ratio: float = 0.5
 
-    # Primary-signal gates (profiles set these)
+    # Hard gates
+    min_tokens:      int   = 0
+    max_tokens:      int   = 9999
+    min_alpha_ratio: float = 0.0
+
+    # Primary-signal gates
     filter_require_loanword:     bool = False
     filter_require_code_switch:  bool = False
     filter_require_named_entity: bool = False
 
-    # Mirror: forbid any presence of the signal
     filter_forbid_loanword:      bool = False
     filter_forbid_code_switch:   bool = False
     filter_forbid_named_entity:  bool = False
 
-    # Minimum density gates
     filter_min_loanword_density:     float = 0.0
     filter_min_code_switch_density:  float = 0.0
     filter_min_named_entity_density: float = 0.0
@@ -76,16 +82,11 @@ class ScoringConfig:
     named_entity_sigma: float = 0.08
 
     # Component weights (normalised at scoring time)
-    weight_length:       float = 0.20
-    weight_clean:        float = 0.40
-    weight_loanword:     float = 0.15
-    weight_code_switch:  float = 0.15
-    weight_named_entity: float = 0.10
-
-    # Cross-signal soft penalties
-    # Applied as: component_score *= (1 - penalty * offending_density)
-    penalty_excess_named_entity: float = 0.0
-    penalty_excess_code_switch:  float = 0.0
+    weight_length:       float = 0.0
+    weight_alpha:        float = 0.0
+    weight_loanword:     float = 0.0
+    weight_code_switch:  float = 0.0
+    weight_named_entity: float = 0.0
 
 
 @dataclass
@@ -104,73 +105,91 @@ class ScoredResult:
 
 
 _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
-    "lemma": {
+    QueryProfile.LEMMAS: {
+        "min_tokens":                      5,
+        "max_tokens":                      128,
+        "min_alpha_ratio":                 0.5,
         "filter_require_loanword":         True,
-        # "filter_require_code_switch":      False,
-        # "filter_require_named_entity":     False,
-        # "filter_forbid_loanword":          False,
-        # "filter_forbid_code_switch":       False,
         "filter_forbid_named_entity":      True,
-        "filter_min_loanword_density":     0.00,
-        "weight_loanword":                 0.40,
-        "weight_code_switch":              0.05,
-        "weight_named_entity":             0.05,
-        "weight_length":                   0.20,
-        "weight_clean":                    0.30,
-        "penalty_excess_named_entity":     0.30,
-        "penalty_excess_code_switch":      0.20,
+
+        "weight_length":                   0.33,
+        "weight_alpha":                    0.33,
+        "weight_loanword":                 0.33,
+
+        "code_switch_mu":                  12,
+        "code_switch_sigma":               4,
     },
-    "code_switch": {
-        # "filter_require_loanword":         False,
+    QueryProfile.CODE_SWITCH: {
+        "min_tokens":                      8,
+        "max_tokens":                      128,
+        "min_alpha_ratio":                 0.5,
         "filter_require_code_switch":      True,
-        # "filter_require_named_entity":     False,
-        # "filter_forbid_loanword":          False,
-        # "filter_forbid_code_switch":       False,
-        # "filter_forbid_named_entity":      False,
-        "filter_min_code_switch_density":  0.00,
+
         "weight_code_switch":              0.40,
-        "weight_loanword":                 0.10,
-        "weight_named_entity":             0.05,
         "weight_length":                   0.20,
-        "weight_clean":                    0.25,
+        "weight_alpha":                    0.25,
+
         "code_switch_mu":                  0.30,
         "code_switch_sigma":               0.15,
-        "min_tokens":                      8,
     },
-    "ner": {
-        # "filter_require_loanword":         False,
-        # "filter_require_code_switch":      False,
+    QueryProfile.NER: {
+        "min_tokens":                      5,
+        "max_tokens":                      128,
+        "min_alpha_ratio":                 0.5,
         "filter_require_named_entity":     True,
-        # "filter_forbid_loanword":          False,
-        # "filter_forbid_code_switch":       False,
-        # "filter_forbid_named_entity":      False,
-        "filter_min_named_entity_density":     0.00,
-        "weight_named_entity":                 0.40,
-        "weight_loanword":                     0.10,
-        "weight_code_switch":                  0.05,
-        "weight_length":                       0.20,
-        "weight_clean":                        0.25,
-        "named_entity_mu":                     0.15,
-        "named_entity_sigma":                  0.10,
+
+        "weight_named_entity":             0.33,
+        "weight_length":                   0.33,
+        "weight_alpha":                    0.33,
+
+        "named_entity_mu":                 0.15,
+        "named_entity_sigma":              0.10,
     },
-    "generic": {},
 }
+
+
+def _validate_profile_defaults(
+    profile: QueryProfile,
+    known_fields: set[str],
+) -> None:
+    """Raise if a profile references a field not in ScoringConfig."""
+    overrides = _PROFILE_DEFAULTS.get(profile, {})
+    unknown = {k for k in overrides if k not in known_fields}
+    if unknown:
+        raise RuntimeError(
+            f"Profile {profile!r} references unknown ScoringConfig "
+            f"field(s): {sorted(unknown)}"
+        )
+
+
+_KNOWN_FIELDS = set(asdict(ScoringConfig()).keys())
+for _p in QueryProfile:
+    _validate_profile_defaults(_p, _KNOWN_FIELDS)
 
 
 def load_scoring_config(
     path: Optional[str] = None,
-    profile: QueryProfile = "generic",
+    profile: QueryProfile | str = QueryProfile.LEMMAS,
 ) -> ScoringConfig:
     """
-    Build a ScoringConfig by merging four layers in order:
-        1. ScoringConfig dataclass defaults
-        2. Profile defaults (_PROFILE_DEFAULTS[profile])
-        3. [scoring] section in TOML file          (global overrides)
-        4. [scoring.profiles.<profile>] in TOML    (per-profile overrides)
-    Each layer only overrides what it explicitly specifies.
+    Build a ScoringConfig by merging layers in order:
+        1. ScoringConfig dataclass defaults  (all-zero weights — intentional)
+        2. Profile defaults
+        3. [scoring] section in TOML file
+        4. [scoring.profiles.<profile>] in TOML
+    A profile is always required; there is no generic/passthrough profile.
     """
+    if not isinstance(profile, QueryProfile):
+        try:
+            profile = QueryProfile(profile)
+        except ValueError:
+            valid = [p.value for p in QueryProfile]
+            raise click.UsageError(
+                f"Unknown profile {profile!r}. Valid profiles: {valid}"
+            )
+
     defaults = asdict(ScoringConfig())
-    merged: dict = {**defaults, **_PROFILE_DEFAULTS.get(profile, {})}
+    merged: dict = {**defaults, **_PROFILE_DEFAULTS[profile]}
 
     if path is not None:
         with open(path, "rb") as f:
@@ -178,7 +197,6 @@ def load_scoring_config(
 
         base: dict = data.get("scoring", {})
 
-        # Validate global keys
         unknown_global = {
             k for k in base if k not in defaults and k != "profiles"
         }
@@ -187,17 +205,16 @@ def load_scoring_config(
                 f"Unknown keys in [scoring]: {sorted(unknown_global)}"
             )
 
-        # Layer 3: global file overrides
         for k, v in base.items():
             if k in defaults:
                 merged[k] = type(defaults[k])(v)
 
-        # Layer 4: per-profile file overrides
-        profile_section: dict = base.get("profiles", {}).get(profile, {})
+        profile_key = profile.value
+        profile_section: dict = base.get("profiles", {}).get(profile_key, {})
         unknown_profile = {k for k in profile_section if k not in defaults}
         if unknown_profile:
             raise click.UsageError(
-                f"Unknown keys in [scoring.profiles.{profile}]: "
+                f"Unknown keys in [scoring.profiles.{profile_key}]: "
                 f"{sorted(unknown_profile)}"
             )
         for k, v in profile_section.items():
@@ -205,7 +222,6 @@ def load_scoring_config(
 
     cfg = ScoringConfig(**{k: merged[k] for k in defaults})
 
-    # Validate require/forbid contradictions
     pairs = [
         ("filter_require_loanword",     "filter_forbid_loanword",     "loanword"),
         ("filter_require_code_switch",  "filter_forbid_code_switch",  "code_switch"),
@@ -217,7 +233,7 @@ def load_scoring_config(
                 f"Contradictory config: filter_require_{label} and "
                 f"filter_forbid_{label} are both True."
             )
-    
+
     return cfg
 
 
@@ -243,7 +259,7 @@ def _gaussian(x: float, mu: float, sigma: float) -> float:
 def _normalised_weights(cfg: ScoringConfig) -> dict[str, float]:
     raw = {
         "length":       cfg.weight_length,
-        "clean":        cfg.weight_clean,
+        "alpha":        cfg.alpha,
         "loanword":     cfg.weight_loanword,
         "code_switch":  cfg.weight_code_switch,
         "named_entity": cfg.weight_named_entity,
@@ -331,13 +347,6 @@ def _compute_scores(
     named_entity_mask: List[int],
     cfg: ScoringConfig,
 ) -> tuple[float, float, float, float, float]:
-    """
-    Compute the five component scores.
-    Cross-signal penalties are applied here as multiplicative reductions
-    on the loanword component to avoid inflating loanword scores when
-    NE/CS density is high.
-    Returns: (length, clean, loanword, code_switch, named_entity)
-    """
     s_len = len(tokens)
     alpha_ratio = sum(1 for t in tokens if t.word.isalnum()) / s_len
 
@@ -346,16 +355,12 @@ def _compute_scores(
     ne_density = sum(named_entity_mask) / s_len
 
     score_length       = _gaussian(s_len,      cfg.length_mu,       cfg.length_sigma)
-    score_clean        = alpha_ratio
+    score_alpha        = alpha_ratio
     score_loanword     = _gaussian(lw_density, cfg.loanword_mu,     cfg.loanword_sigma)
     score_code_switch  = _gaussian(cs_density, cfg.code_switch_mu,  cfg.code_switch_sigma)
     score_named_entity = _gaussian(ne_density, cfg.named_entity_mu, cfg.named_entity_sigma)
 
-    # Cross-signal soft penalties on loanword score
-    score_loanword *= max(0.0, 1.0 - cfg.penalty_excess_named_entity * ne_density)
-    score_loanword *= max(0.0, 1.0 - cfg.penalty_excess_code_switch  * cs_density)
-
-    return score_length, score_clean, score_loanword, score_code_switch, score_named_entity
+    return score_length, score_alpha, score_loanword, score_code_switch, score_named_entity
 
 
 def score_sentence(
@@ -381,7 +386,7 @@ def score_sentence(
     if reason:
         return _make_filtered(res, reason)
 
-    score_length, score_clean, score_loanword, score_code_switch, score_named_entity = (
+    score_length, score_alpha, score_loanword, score_code_switch, score_named_entity = (
         _compute_scores(
             tokens, loanword_mask, code_switch_mask, named_entity_mask, cfg
         )
@@ -389,10 +394,10 @@ def score_sentence(
 
     w = _normalised_weights(cfg)
     score_total = (
-        w["length"]       * score_length
-        + w["clean"]      * score_clean
-        + w["loanword"]   * score_loanword
-        + w["code_switch"] * score_code_switch
+          w["length"]       * score_length
+        + w["alpha"]        * score_alpha
+        + w["loanword"]     * score_loanword
+        + w["code_switch"]  * score_code_switch
         + w["named_entity"] * score_named_entity
     )
 
