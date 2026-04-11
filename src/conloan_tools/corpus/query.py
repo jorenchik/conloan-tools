@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+import sys
 import subprocess
 import os
 import tempfile
@@ -9,6 +11,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 from dataclasses import dataclass
+import h5py
 
 from conloan_tools.corpus import corpus
 from .scoring import (
@@ -22,6 +25,7 @@ from .scoring import (
     build_loanword_mask,
     build_named_entity_mask,
 )
+
 
 DEFAULT_CQP_BIN = "cqp"
 DEFAULT_LOOKUP  = 200
@@ -44,6 +48,121 @@ class CodeSwitchRun:
     metrics: ScoredResult 
 
 # ------ Internal -------
+
+@dataclass
+class CandidateRecord:
+    mode: str
+    sentence: str
+    score_total: float
+    score_lw: float
+    score_cs: float
+    score_ne: float
+    score_length: float
+    score_alpha: float
+    cqp_id: int
+    cpos: int
+    spos: int | None
+    seed: int | None
+    filtered: bool
+    filter_reason: str | None
+    matched_lemmas: list[str]
+    tag_map: dict[str, str]  # e.g. {"L1": "computer", "CS1": "boot"}
+
+
+def _write_record(record: CandidateRecord, fh) -> None:
+    import dataclasses
+    fh.write(json.dumps(dataclasses.asdict(record)) + "\n")
+
+
+def _tag_code_switch_sentence(run: CodeSwitchRun) -> str:
+    index_set = set(run.token_indices)
+    parts = [
+        f"<CS>{t.word}</CS>" if i in index_set else t.word
+        for i, t in enumerate(run.tokens)
+    ]
+    return " ".join(parts)
+
+
+def tag_all_loanwords(parsed_result, lemma_set_lower, primary_lemma):
+    """Tag all loanwords in sentence with L1, L2, L3…"""
+    if parsed_result is None:
+        return None
+
+    loanword_positions = []
+    for i, token in enumerate(parsed_result.tokens):
+        token_lemma = token.lemma.lower()
+        if token_lemma in lemma_set_lower:
+            is_primary = token_lemma == primary_lemma.lower()
+            loanword_positions.append((i, token.word, is_primary))
+
+    if not loanword_positions:
+        return None
+
+    loanword_positions.sort(key=lambda x: (not x[2], x[0]))
+
+    tag_map = {}
+    for tag_num, (pos, _, _) in enumerate(loanword_positions, start=1):
+        tag_map[pos] = tag_num
+
+    tokens = []
+    for i, t in enumerate(parsed_result.tokens):
+        if i in tag_map:
+            n = tag_map[i]
+            tokens.append(f"<L{n}>{t.word}</L{n}>")
+        else:
+            tokens.append(t.word)
+
+    return " ".join(tokens)
+
+
+def _tag_ner_sentence(
+    parsed: CQPResult,
+    sent_idx: int,
+    ner_labels: np.ndarray,
+    ner_records: list[IndexRecord],
+    id2label: dict[int, str],
+    want: set[int],
+) -> str:
+    record = ner_records[sent_idx]
+    chunk = ner_labels[record.offset : record.offset + record.count]
+    parts = [
+        f'<NE label="{id2label[int(chunk[i])]}">{t.word}</NE>'
+        if i < len(chunk) and int(chunk[i]) in want
+        else t.word
+        for i, t in enumerate(parsed.tokens)
+    ]
+    return " ".join(parts)
+
+
+def _result_to_record(
+    mode: str,
+    sentence: str,
+    scored: ScoredResult,
+    matched_lemmas: list[str],
+    tag_map: dict[str, str],
+    cpos: int,
+    spos: int | None,
+    seed: int | None,
+) -> CandidateRecord:
+    return CandidateRecord(
+        mode=mode,
+        sentence=sentence,
+        score_total=scored.score_total,
+        score_lw=scored.score_loanword,
+        score_cs=scored.score_code_switch,
+        score_ne=scored.score_named_entity,
+        score_length=scored.score_length,
+        score_alpha=scored.score_alpha,
+        cqp_id=scored.cqp_id,
+        cpos=cpos,
+        spos=spos,
+        seed=seed,
+        filtered=scored.filtered,
+        filter_reason=scored.filter_reason,
+        matched_lemmas=matched_lemmas,
+        tag_map=tag_map,
+    )
+
 
 @dataclass
 class MaskSources:
@@ -221,62 +340,67 @@ def _scan_runs_vectorized(
     return output
 
 
+def _chunked_read(ds, out: np.ndarray, desc: str) -> None:
+    """Read an h5py dataset into a pre-allocated array with a progress bar."""
+    n = ds.shape[0]
+    chunk = ds.chunks[0] if ds.chunks else _CHUNK_TOKENS
+    with tqdm(total=n, unit="tok", desc=desc, leave=False) as pbar:
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            out[start:end] = ds[start:end]
+            pbar.update(end - start)
+
+
 def _load_scores(h5_path: Path) -> np.ndarray:
-    """Load flat token scores from HDF5 /scores/data, cast to float32."""
-    import h5py
-
     with h5py.File(h5_path, "r") as f:
-        return f["scores"]["data"][:].astype(np.float32)
+        ds = f["scores"]["data"]
+        out = np.empty(ds.shape[0], dtype=np.float32)
+        _chunked_read(ds, out, f"Loading scores {h5_path.name}")
+    return out
 
 
-def _load_index_records(h5_path: Path) -> tuple[list[IndexRecord], np.ndarray]:
-    """Returns (records, cpos_array). Records use flat offsets for score slicing;
-    cpos_array retains raw corpus positions for sentence lookup."""
-    import h5py
-
-    with h5py.File(h5_path, "r") as f:
-        cpos  = f["index"]["cpos"][:]
-        count = f["index"]["count"][:]
+def _build_records(count: np.ndarray) -> list[IndexRecord]:
     offsets = np.concatenate([[0], np.cumsum(count[:-1])])
-    records = [
-        IndexRecord(offset=int(o), count=int(n))
-        for o, n in zip(offsets, count)
-    ]
-    return records, cpos
+    return [IndexRecord(offset=int(o), count=int(n)) for o, n in zip(offsets, count)]
 
 
-def _load_ner_labels(h5_path: Path) -> tuple[np.ndarray, list[IndexRecord], dict[int, str]]:
-    """
-    Load NER label index from HDF5.
-    """
-    import h5py
-
+def _load_index_records(
+    h5_path: Path,
+) -> tuple[list[IndexRecord], np.ndarray]:
     with h5py.File(h5_path, "r") as f:
-        ner_output = f.attrs.get("ner_output", "labels")
-        raw = f["scores"]["data"][:]
+        cpos  = f["index"]["cpos"][:]   # small, no chunking needed
+        count = f["index"]["count"][:]
+    return _build_records(count), cpos
+
+
+def _load_ner_labels(
+    h5_path: Path,
+) -> tuple[np.ndarray, list[IndexRecord], dict[int, str], np.ndarray]:
+    with h5py.File(h5_path, "r") as f:
+        ner_output   = f.attrs.get("ner_output", "labels")
+        cpos         = f["index"]["cpos"][:]
+        count        = f["index"]["count"][:]
+        raw_id2label = json.loads(f.attrs["id2label"])
+        ds           = f["scores"]["data"]
+
         if ner_output == "logits":
-            if raw.ndim != 2:
+            if ds.ndim != 2:
                 raise click.UsageError(
-                    f"{h5_path.name}: expected 2-D logits array, "
-                    f"got shape {raw.shape}."
+                    f"{h5_path.name}: expected 2-D logits, got {ds.shape}."
                 )
+            raw = np.empty(ds.shape, dtype=ds.dtype)
+            _chunked_read(ds, raw, f"Loading NER logits {h5_path.name}")
             labels = np.argmax(raw, axis=-1).astype(np.uint8)
         elif ner_output == "labels":
-            labels = raw.astype(np.uint8)
+            labels = np.empty(ds.shape[0], dtype=np.uint8)
+            _chunked_read(ds, labels, f"Loading NER labels {h5_path.name}")
         else:
             raise click.UsageError(
                 f"{h5_path.name}: unknown ner_output='{ner_output}'."
             )
-        cpos = f["index"]["cpos"][:]
-        count  = f["index"]["count"][:]
-        raw_id2label = json.loads(f.attrs["id2label"])
 
     id2label = {int(k): v for k, v in raw_id2label.items()}
-    offsets = np.concatenate([[0], np.cumsum(count[:-1])])
-    records  = [
-        IndexRecord(offset=int(o), count=int(n))
-        for o, n in zip(offsets, count)
-    ]
+    records  = _build_records(count)
     return labels, records, id2label, cpos
 
 
@@ -523,8 +647,8 @@ def _parse_sgml_line(ordinal: int, line_content: str) -> Optional[CQPResult]:
 
 
 def parse_cwb_output(raw: str) -> Iterator[CQPResult]:
-    """Yield one CQPResult per <LINE> in SGML output."""
-    for ordinal, m in enumerate(_LINE_RE.finditer(raw)):
+    matches = list(_LINE_RE.finditer(raw))
+    for ordinal, m in tqdm(enumerate(matches), total=len(matches), desc="Parsing CQP output", unit="sent"):
         parsed = _parse_sgml_line(ordinal, m.group(1))
         if parsed:
             yield parsed
@@ -656,6 +780,8 @@ def query_by_lemmas(
     verbose: bool = False,
     mask_src: Optional[MaskSources] = None,
 ) -> List[ScoredResult]:
+
+    click.echo("[*] Querying CQP...", err=True)
     raw_output = query_cqp_batch(
         corpus_name,
         [(build_or_query(lemmas), lookup)],
@@ -833,7 +959,9 @@ def find_code_switch_sequences(
         sentence_map[sent_idx] = parsed
 
     results: list[CodeSwitchRun] = []
-    for sent_idx, token_indices, token_scores in candidates:
+    for sent_idx, token_indices, token_scores in tqdm(
+        candidates, desc="Scoring candidates", unit="sent"
+    ):
         parsed = sentence_map.get(sent_idx)
         if not parsed:
             continue
@@ -923,6 +1051,17 @@ def query_group():
     """Query corpus."""
 
 
+@contextmanager
+def _output_context(output: Path | None):
+    if output is None:
+        yield None
+    else:
+        with open(output, "w", encoding="utf-8") as fh:
+            yield fh
+
+
+
+
 @query_group.command("code-switch")
 @click.argument("corpus_name")
 @click.argument(
@@ -946,6 +1085,7 @@ def query_group():
 )
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
+@click.option("--seed", type=int, default=42, show_default=True)
 @scoring_config_option
 @click.option(
     "--ner-h5",
@@ -967,6 +1107,12 @@ def query_group():
     default=False,
     help="Treat MISC NER labels as O (exclude from named-entity mask).",
 )
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write JSONL records instead of pretty-printing.",
+)
 def query_code_switch(
     corpus_name,
     surprisal_h5,
@@ -976,10 +1122,12 @@ def query_code_switch(
     results,
     cqp_bin,
     registry_dir,
+    seed,
     scoring_config,
     ner_h5,
     loanword_file,
     ner_ignore_misc,
+    output,
 ):
     """Find code-switch sequences using a surprisal HDF5 index."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.CODE_SWITCH)
@@ -1009,8 +1157,61 @@ def query_code_switch(
 
     click.echo(f"[*] Found and scored {len(found)} candidate sequences", err=True)
     shown = found if results == 0 else found[:results]
-    if shown:
-        _render_code_switch_results(shown, threshold)
+
+    with _output_context(output) as fh:
+        for run in shown:
+            sentence = _tag_code_switch_sentence(run)
+            matched = [
+                run.tokens[i].lemma
+                for i in run.token_indices
+                if i < len(run.tokens)
+            ]
+            tag_map = {
+                f"CS{i+1}": run.tokens[idx].lemma
+                for i, idx in enumerate(run.token_indices)
+                if idx < len(run.tokens)
+            }
+            rec = _result_to_record(
+                mode="code_switch",
+                sentence=sentence,
+                scored=run.metrics,
+                matched_lemmas=matched,
+                tag_map=tag_map,
+                cpos=run.metrics.cqp_id,
+                spos=run.sent_idx,
+                seed=seed,
+            )
+            if fh:
+                _write_record(rec, fh)
+            else:
+                index_set = set(run.token_indices)
+                status = (
+                    f"[FILTERED: {run.metrics.filter_reason}]"
+                    if run.metrics.filtered else ""
+                )
+                click.echo(
+                    f"Score: {run.metrics.score_total:.4f}  "
+                    f"(len={run.metrics.score_length:.2f}"
+                    f"  lw={run.metrics.score_loanword:.2f}"
+                    f"  cs={run.metrics.score_code_switch:.2f}"
+                    f"  alpha={run.metrics.score_alpha:.2f}"
+                    f"  ne={run.metrics.score_named_entity:.2f})"
+                    f"  | Pos: {run.sent_idx}  ID: {run.metrics.cqp_id}  {status}"
+                )
+                parts = [
+                    f"[{t.word}]" if i in index_set else t.word
+                    for i, t in enumerate(run.tokens)
+                ]
+                click.echo(" ".join(parts))
+                run_details = "  ".join(
+                    f"{run.tokens[i].word}({s:.2f})"
+                    for i, s in zip(run.token_indices, run.token_scores)
+                )
+                click.echo(f"  ↳ run: {run_details}")
+                click.echo("-" * 60)
+
+    if output:
+        click.echo(f"[✓] Wrote {len(shown)} records to {output}", err=True)
 
 
 @query_group.command("lemmas")
@@ -1032,8 +1233,15 @@ def query_code_switch(
 )
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
+@click.option("--seed", type=int, default=42, show_default=True)
 @scoring_config_option
 @mask_source_options
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write JSONL records instead of pretty-printing.",
+)
 def query_lemmas_command(
     corpus_name,
     lemmas,
@@ -1041,12 +1249,14 @@ def query_lemmas_command(
     results,
     cqp_bin,
     registry_dir,
+    seed,
     scoring_config,
     surprisal_h5,
     surprisal_threshold,
     ner_h5,
     loanword_file,
     ner_ignore_misc,
+    output,
 ):
     """Query corpus by lemma(s) and score results."""
     mask_src = load_mask_sources(
@@ -1056,9 +1266,13 @@ def query_lemmas_command(
         loanword_file=loanword_file,
         ner_ignore_misc=ner_ignore_misc,
     )
+
+    lemma_list = lemmas.split(",")
+    lemma_set_lower = {l.lower(): l for l in lemma_list}
+
     found = query_by_lemmas(
         corpus_name=corpus_name,
-        lemmas=lemmas.split(","),
+        lemmas=lemma_list,
         lookup=lookup,
         cqp_bin=cqp_bin,
         registry_dir=registry_dir,
@@ -1067,18 +1281,44 @@ def query_lemmas_command(
         mask_src=mask_src,
     )
 
-    click.echo(f"\nTop {results} results for '{lemmas}':")
-    click.echo("-" * 60)
-    for r in found[:results]:
-        click.echo(
-            f"Score: {r.score_total:.4f}  "
-            f"(len={r.score_length:.2f}  lw={r.score_loanword:.2f}  "
-            f"cs={r.score_code_switch:.2f}  alpha={r.score_alpha:.2f}  "
-            f"ne={r.score_named_entity:.2f})  | ID: {r.cqp_id}"
-            f"{' [FILTERED: ' + r.filter_reason + ']' if r.filtered else ''}"
-        )
-        click.echo(" ".join(t.word for t in r.tokens))
-        click.echo("-" * 60)
+    shown = found[:results] if results > 0 else found
+
+    with _output_context(output) as fh:
+        for r in shown:
+            matched = [
+                t.lemma for t in r.tokens
+                if t.lemma.lower() in lemma_set_lower
+            ]
+            sentence = tag_all_loanwords(r, lemma_set_lower, lemma_list[0])
+            tag_map = {
+                f"L{i+1}": lemma_set_lower.get(m.lower(), m)
+                for i, m in enumerate(matched)
+            }
+            rec = _result_to_record(
+                mode="lemmas",
+                sentence=sentence or " ".join(t.word for t in r.tokens),
+                scored=r,
+                matched_lemmas=matched,
+                tag_map=tag_map,
+                cpos=r.cqp_id,
+                spos=None,
+                seed=seed,
+            )
+            if fh:
+                _write_record(rec, fh)
+            else:
+                click.echo(
+                    f"Score: {r.score_total:.4f}  "
+                    f"(len={r.score_length:.2f}  lw={r.score_loanword:.2f}  "
+                    f"cs={r.score_code_switch:.2f}  alpha={r.score_alpha:.2f}  "
+                    f"ne={r.score_named_entity:.2f})  | ID: {r.cqp_id}"
+                    f"{' [FILTERED: ' + r.filter_reason + ']' if r.filtered else ''}"
+                )
+                click.echo(" ".join(t.word for t in r.tokens))
+                click.echo("-" * 60)
+
+    if output:
+        click.echo(f"[✓] Wrote {len(shown)} records to {output}", err=True)
 
 
 @query_group.command("position")
@@ -1110,7 +1350,7 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
     "ner_h5",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
-@click.option("--label",         "labels",  multiple=True, help="Include only these NER labels.")
+@click.option("--label", "labels", multiple=True, help="Include only these NER labels.")
 @click.option("--exclude-label", "excl_labels", multiple=True, help="Drop sentences containing these NER labels.")
 @click.option(
     "--lookup",
@@ -1127,6 +1367,7 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
 )
 @click.option("--cqp-bin", default=DEFAULT_CQP_BIN, show_default=True)
 @click.option("--registry-dir", default=None)
+@click.option("--seed", type=int, default=42, show_default=True)
 @scoring_config_option
 @click.option(
     "--surprisal-h5",
@@ -1141,10 +1382,17 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
     default=None,
 )
 @click.option("--ignore-misc", "ner_ignore_misc", is_flag=True, default=False)
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write JSONL records instead of pretty-printing.",
+)
 def query_ner_entities(
     corpus_name, ner_h5, labels, excl_labels,
-    lookup, results, cqp_bin, registry_dir, scoring_config,
+    lookup, results, cqp_bin, registry_dir, seed, scoring_config,
     surprisal_h5, surprisal_threshold, loanword_file, ner_ignore_misc,
+    output,
 ):
     """Find and score sentences containing named entities."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.NER)
@@ -1198,11 +1446,12 @@ def query_ner_entities(
     mask_src.ner_exclude = exclude
 
     click.echo(
-        f"[*] Scanning for:  {sorted(id2label[k] for k in want)}", err=True
+        f"[*] Scanning for: {sorted(id2label[k] for k in want)}", err=True
     )
     if exclude:
         click.echo(
-            f"[*] Excluding sentences with: {sorted(id2label[k] for k in exclude)}",
+            f"[*] Excluding sentences with: "
+            f"{sorted(id2label[k] for k in exclude)}",
             err=True,
         )
 
@@ -1222,6 +1471,10 @@ def query_ner_entities(
         registry_dir=registry_dir,
     )
 
+    sentence_map: dict[int, CQPResult] = {}
+    for parsed, sent_idx in zip(parse_cwb_output(raw_output), matching):
+        sentence_map[sent_idx] = parsed
+
     scored_results: list[tuple[ScoredResult, str, int]] = []
     for parsed, sent_idx in tqdm(
         zip(parse_cwb_output(raw_output), matching),
@@ -1237,37 +1490,56 @@ def query_ner_entities(
             named_entity_mask=ne_mask,
             cfg=cfg,
         )
-
-        record = ner_records[sent_idx]
-        chunk  = ner_labels[record.offset : record.offset + record.count]
-        parts  = [
-            f"[{t.word}/{id2label[int(chunk[i])]}]"
-            if i < len(chunk) and int(chunk[i]) in want
-            else t.word
-            for i, t in enumerate(parsed.tokens)
-        ]
-        scored_results.append((scored, " ".join(parts), sent_idx))
+        sentence = _tag_ner_sentence(
+            parsed, sent_idx, ner_labels, ner_records, id2label, want
+        )
+        scored_results.append((scored, sentence, sent_idx))
 
     scored_results.sort(key=lambda x: x[0].score_total, reverse=True)
     click.echo(f"[*] Scored {len(scored_results)} sentence(s)", err=True)
 
     shown = scored_results if results == 0 else scored_results[:results]
 
-    click.echo("-" * 60)
-    for scored, parts_str, sent_idx in shown:
-        status = f" [FILTERED: {scored.filter_reason}]" if scored.filtered else ""
-        click.echo(
-            f"Score: {scored.score_total:.4f}  "
-            f"(len={scored.score_length:.2f}  lw={scored.score_loanword:.2f}  "
-            f"cs={scored.score_code_switch:.2f}  "
-            f"alpha={scored.score_alpha:.2f}  "
-            f"ne={scored.score_named_entity:.2f})  "
-            f"| ID: {scored.cqp_id}{status}"
-        )
-        click.echo(f"[{sent_idx}] " + parts_str)
-        click.echo("-" * 60)
+    with _output_context(output) as fh:
+        for scored, sentence, sent_idx in shown:
+            record = ner_records[sent_idx]
+            chunk = ner_labels[record.offset : record.offset + record.count]
+            matched = [
+                id2label[int(chunk[i])]
+                for i, t in enumerate(sentence_map[sent_idx].tokens)
+                if i < len(chunk) and int(chunk[i]) in want
+            ]
+            tag_map = {f"NE{i+1}": v for i, v in enumerate(matched)}
+            rec = _result_to_record(
+                mode="ner",
+                sentence=sentence,
+                scored=scored,
+                matched_lemmas=matched,
+                tag_map=tag_map,
+                cpos=scored.cqp_id,
+                spos=sent_idx,
+                seed=seed,
+            )
+            if fh:
+                _write_record(rec, fh)
+            else:
+                status = (
+                    f" [FILTERED: {scored.filter_reason}]"
+                    if scored.filtered else ""
+                )
+                click.echo(
+                    f"Score: {scored.score_total:.4f}  "
+                    f"(len={scored.score_length:.2f}  lw={scored.score_loanword:.2f}  "
+                    f"cs={scored.score_code_switch:.2f}  "
+                    f"alpha={scored.score_alpha:.2f}  "
+                    f"ne={scored.score_named_entity:.2f})  "
+                    f"| ID: {scored.cqp_id}{status}"
+                )
+                click.echo(f"[{sent_idx}] {sentence}")
+                click.echo("-" * 60)
 
-    click.echo(f"({len(shown)} of {len(scored_results)} sentences shown)")
+    if output:
+        click.echo(f"[✓] Wrote {len(shown)} records to {output}", err=True)
 
 
 if __name__ == "__main__":
