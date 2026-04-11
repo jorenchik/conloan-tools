@@ -47,18 +47,15 @@ class CodeSwitchRun:
 
 @dataclass
 class MaskSources:
-    """Holds optional pre-loaded index data for mask construction."""
-    # Surprisal
     surprisal_scores: Optional[np.ndarray] = None
     surprisal_records: Optional[list[IndexRecord]] = None
     surprisal_cpos: Optional[np.ndarray] = None
     surprisal_threshold: float = 0.0
-    # NER
     ner_labels: Optional[np.ndarray] = None
     ner_records: Optional[list[IndexRecord]] = None
     ner_cpos: Optional[np.ndarray] = None
     ner_id2label: Optional[dict[int, str]] = None
-    # Loanwords
+    ner_exclude: Optional[set[int]] = None
     lw_lemmas: Optional[set[str]] = None
     ner_ignore_misc: bool = False
 
@@ -70,17 +67,6 @@ def _assert_index_alignment(
         raise click.UsageError(
             f"Index alignment mismatch: {len(a)} vs {len(b)} sentences."
         )
-
-
-def _build_cpos_index(
-    records: list[IndexRecord],
-) -> tuple[list[int], list[int]]:
-    """
-    Returns (offsets, sent_indices) sorted by offset, suitable for
-    bisect lookup. Finds the sentence containing any cpos in O(log n).
-    """
-    offsets = [r.offset for r in records]
-    return offsets, list(range(len(records)))
 
 
 def _lookup_sent_idx(
@@ -157,48 +143,82 @@ def _run_cqp_command(
             os.remove(temp_file_path)
 
 
-def _find_consecutive_runs(
-    sent_scores: np.ndarray,
+def _scan_runs_vectorized(
+    flat: np.ndarray,
+    offsets: np.ndarray,   # int64, one per sentence
+    counts: np.ndarray,    # int32, one per sentence
     threshold: float,
     min_consecutive: int,
-) -> list[dict]:
+) -> list[tuple[int, list[int], list[float]]]:
     """
-    Return all runs of consecutive tokens above `threshold` that are at
-    least `min_consecutive` long.  Each entry is:
-        {start, end, length, indices, scores}
+    Returns (sent_idx, token_indices, token_scores) for the best run per
+    sentence, only for sentences that have at least one qualifying run.
     """
-    runs: list[dict] = []
-    current_start = 0
-    current_run = 0
+    n_sents = len(offsets)
 
-    for i, score in enumerate(sent_scores):
-        if score > threshold:
-            if current_run == 0:
-                current_start = i
-            current_run += 1
-        else:
-            if current_run >= min_consecutive:
-                runs.append({
-                    "start": current_start,
-                    "end": i - 1,
-                    "length": current_run,
-                    "indices": list(range(current_start, i)),
-                    "scores": sent_scores[current_start:i].tolist(),
-                })
-            current_run = 0
+    # 1. Boolean mask over the full flat slice
+    above = (flat > threshold)
 
-    # Flush trailing run
-    if current_run >= min_consecutive:
-        end = current_start + current_run
-        runs.append({
-            "start": current_start,
-            "end": end - 1,
-            "length": current_run,
-            "indices": list(range(current_start, end)),
-            "scores": sent_scores[current_start:end].tolist(),
-        })
+    # 2. Build sentence-id per token so we can reject cross-boundary runs.
+    sent_ids = np.repeat(np.arange(n_sents, dtype=np.int32), counts)
 
-    return runs
+    # 3. Find run starts / ends with a single diff pass.
+    padded = np.empty(len(above) + 2, dtype=np.int8)
+    padded[0] = 0
+    padded[1:-1] = above.view(np.int8)
+    padded[-1] = 0
+    diff = np.diff(padded)
+    run_starts = np.where(diff == 1)[0]   # inclusive
+    run_ends   = np.where(diff == -1)[0]  # exclusive
+
+    if run_starts.size == 0:
+        return []
+
+    run_lengths = run_ends - run_starts
+
+    # 4. Length gate
+    valid = run_lengths >= min_consecutive
+    if not valid.any():
+        return []
+    run_starts  = run_starts[valid]
+    run_ends    = run_ends[valid]
+    run_lengths = run_lengths[valid]
+
+    # 5. Discard runs that cross sentence boundaries (rare but possible).
+    same_sent = sent_ids[run_starts] == sent_ids[run_ends - 1]
+    run_starts  = run_starts[same_sent]
+    run_ends    = run_ends[same_sent]
+    run_lengths = run_lengths[same_sent]
+
+    if run_starts.size == 0:
+        return []
+
+    run_sent_ids = sent_ids[run_starts]
+
+    # 6. Keep only the longest run per sentence.
+    #    Process in length-descending order; first hit per sentence wins.
+    order = np.argsort(-run_lengths)
+    run_starts   = run_starts[order]
+    run_ends     = run_ends[order]
+    run_lengths  = run_lengths[order]
+    run_sent_ids = run_sent_ids[order]
+
+    seen: set[int] = set()
+    output: list[tuple[int, list[int], list[float]]] = []
+    for s, e, sid in zip(run_starts, run_ends, run_sent_ids):
+        sid = int(sid)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        # Token indices are relative to sentence start
+        sent_start = int(offsets[sid])
+        indices = list(range(int(s) - sent_start, int(e) - sent_start))
+        scores  = flat[s:e].tolist()
+        output.append((sid, indices, scores))
+
+    # Re-sort by sent_idx for stable downstream behaviour
+    output.sort(key=lambda x: x[0])
+    return output
 
 
 def _load_scores(h5_path: Path) -> np.ndarray:
@@ -360,7 +380,6 @@ def build_masks(
         and src.ner_records is not None
         and src.ner_id2label is not None
     ):
-        # rec = src.ner_labels_records[sent_idx]  
         rec = src.ner_records[sent_idx]
         sent_labels = src.ner_labels[rec.offset : rec.offset + rec.count]
 
@@ -370,10 +389,11 @@ def build_masks(
                 return False
             if src.ner_ignore_misc and label == "MISC":
                 return False
+            if src.ner_exclude and label_id in src.ner_exclude:
+                return False
             return True
 
-        ne_mask = [_is_ne(int(l)) for l in sent_labels]
-        ne_mask = [int(v) for v in ne_mask[:n]]
+        ne_mask = [int(_is_ne(int(l))) for l in sent_labels[:n]]
     else:
         ne_mask = build_named_entity_mask(parsed)
 
@@ -600,6 +620,31 @@ def build_or_query(lemmas: List[str]) -> str:
     return f'[lemma="{"|".join(escaped)}"]'
 
 
+def _lookup_sent_indices_batch(
+    cpos_values: np.ndarray,
+    cpos_array: np.ndarray,
+    records: list[IndexRecord],
+) -> np.ndarray:
+    """
+    Vectorized version of _lookup_sent_idx for a batch of cpos values.
+    Returns an int32 array of sent_idx, with -1 for misses.
+    """
+    counts = np.array([r.count for r in records], dtype=np.int32)
+    indices = np.searchsorted(cpos_array, cpos_values, side="right") - 1
+    result  = np.full(len(cpos_values), -1, dtype=np.int32)
+
+    valid = indices >= 0
+    idx_v = indices[valid]
+    cpos_v = cpos_values[valid]
+
+    in_range = (cpos_array[idx_v] <= cpos_v) & (
+        cpos_v < cpos_array[idx_v] + counts[idx_v]
+    )
+    result_valid = np.where(valid)[0]
+    result[result_valid[in_range]] = idx_v[in_range]
+    return result
+
+
 def query_by_lemmas(
     corpus_name: str,
     lemmas: List[str],
@@ -626,21 +671,31 @@ def query_by_lemmas(
     if mask_src.surprisal_records and mask_src.ner_records:
         _assert_index_alignment(mask_src.surprisal_records, mask_src.ner_records)
 
-    ref_records = mask_src.surprisal_records or mask_src.ner_records
+    ref_records  = mask_src.surprisal_records or mask_src.ner_records
     ref_cpos_arr = (
         mask_src.surprisal_cpos if mask_src.surprisal_records else mask_src.ner_cpos
     )
 
+    parsed_list = list(parse_cwb_output(raw_output[0]))
+
+    # Resolve all sent_idx values in one vectorized call
+    if ref_cpos_arr is not None and ref_records is not None:
+        cpos_values = np.array([p.cqp_id for p in parsed_list], dtype=np.int64)
+        sent_indices = _lookup_sent_indices_batch(cpos_values, ref_cpos_arr, ref_records)
+    else:
+        sent_indices = np.array([p.cqp_id for p in parsed_list], dtype=np.int32)
+
     seen_texts: dict[tuple, ScoredResult] = {}
     scored: List[ScoredResult] = []
 
-    for parsed in tqdm(list(parse_cwb_output(raw_output[0])), disable=not verbose):
-        if ref_cpos_arr is not None:
-            sent_idx = _lookup_sent_idx(parsed.cqp_id, ref_cpos_arr, ref_records)
-            if sent_idx is None:
-                continue
-        else:
-            sent_idx = parsed.cqp_id
+    for parsed, sent_idx in tqdm(
+        zip(parsed_list, sent_indices),
+        total=len(parsed_list),
+        disable=not verbose,
+    ):
+        sent_idx = int(sent_idx)
+        if sent_idx == -1:
+            continue
 
         lw_mask, cs_mask, ne_mask = build_masks(
             parsed, sent_idx, mask_src, lw_lemma_set=lemma_set
@@ -673,39 +728,66 @@ def scan_anomaly_candidates(
     index_records: list[IndexRecord],
     threshold: float,
     min_consecutive: int,
-    max_results: int = 100,
-    limit_sentences: int | None = None,
+    lookup: int | None = None,
 ) -> list[tuple[int, list[int], list[float]]]:
     """
-    Scan pre-loaded scores against pre-parsed index records.
-
-    Returns a list of (sentence_index, token_indices, token_scores) for the
-    longest qualifying run per sentence, sorted by run length descending and
-    capped at `max_results`.
+    Vectorized scan. Returns (sent_idx, token_indices, token_scores)
+    for the best run per sentence, sorted by run length descending.
     """
-    candidates: list[tuple[int, list[dict]]] = []
+    records = index_records[:lookup] if lookup else index_records
+    if not records:
+        return []
 
-    records = index_records[:limit_sentences] if limit_sentences else index_records
-    for sent_idx, record in enumerate(tqdm(records, desc="Scanning surprisal", unit="sent")):
-        sent_scores = scores[record.offset : record.offset + record.count]
-        runs = _find_consecutive_runs(sent_scores, threshold, min_consecutive)
-        if runs:
-            candidates.append((sent_idx, runs))
+    offsets = np.array([r.offset for r in records], dtype=np.int64)
+    counts  = np.array([r.count  for r in records], dtype=np.int32)
+    end_idx = int(offsets[-1]) + int(counts[-1])
 
-    candidates.sort(
-        key=lambda x: max(r["length"] for r in x[1]),
-        reverse=True,
+    flat = scores[:end_idx]
+
+    candidates = _scan_runs_vectorized(
+        flat, offsets, counts, threshold, min_consecutive
     )
 
-    if max_results > 0:
-        candidates = candidates[:max_results]
+    # Sort by run length descending (best first)
+    candidates.sort(key=lambda x: len(x[1]), reverse=True)
+    return candidates
 
-    output: list[tuple[int, list[int], list[float]]] = []
-    for sent_idx, runs in candidates:
-        best = max(runs, key=lambda r: r["length"])
-        output.append((sent_idx, best["indices"], best["scores"]))
 
-    return output
+def _ner_matching_sentences(
+    ner_labels: np.ndarray,
+    records: list[IndexRecord],
+    want: set[int],
+    exclude: set[int] | None = None,
+) -> list[int]:
+    """
+    Vectorized: return sorted sentence indices that contain any label in `want`
+    and NO token whose label is in `exclude` (if provided).
+    """
+    if not records:
+        return []
+
+    offsets = np.array([r.offset for r in records], dtype=np.int64)
+    counts  = np.array([r.count  for r in records], dtype=np.int32)
+    end_idx = int(offsets[-1]) + int(counts[-1])
+
+    flat     = ner_labels[:end_idx]
+    sent_ids = np.repeat(np.arange(len(records), dtype=np.int32), counts)
+
+    want_arr   = np.array(sorted(want), dtype=flat.dtype)
+    token_hits = np.isin(flat, want_arr)
+    if not token_hits.any():
+        return []
+
+    hit_sents = set(np.unique(sent_ids[token_hits]).tolist())
+
+    if exclude:
+        excl_arr  = np.array(sorted(exclude), dtype=flat.dtype)
+        excl_hits = np.isin(flat, excl_arr)
+        if excl_hits.any():
+            excl_sents = set(np.unique(sent_ids[excl_hits]).tolist())
+            hit_sents -= excl_sents
+
+    return sorted(hit_sents)
 
 
 def find_code_switch_sequences(
@@ -1028,7 +1110,8 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
     "ner_h5",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
-@click.option("--label", "labels", multiple=True)
+@click.option("--label",         "labels",  multiple=True, help="Include only these NER labels.")
+@click.option("--exclude-label", "excl_labels", multiple=True, help="Drop sentences containing these NER labels.")
 @click.option(
     "--lookup",
     type=int,
@@ -1049,42 +1132,19 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
     "--surprisal-h5",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="Surprisal HDF5 index; builds code-switch mask. Omit for all-zero.",
 )
-@click.option(
-    "--surprisal-threshold",
-    type=float,
-    default=0.0,
-    show_default=True,
-    help="Per-token surprisal threshold for code-switch mask.",
-)
+@click.option("--surprisal-threshold", type=float, default=0.0, show_default=True)
 @click.option(
     "--loanwords",
     "loanword_file",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="One lemma per line; builds loanword mask.",
 )
-@click.option(
-    "--ignore-misc",
-    "ner_ignore_misc",
-    is_flag=True,
-    default=False,
-    help="Treat MISC NER labels as O (exclude from named-entity mask).",
-)
+@click.option("--ignore-misc", "ner_ignore_misc", is_flag=True, default=False)
 def query_ner_entities(
-    corpus_name,
-    ner_h5,
-    labels,
-    lookup,
-    results,
-    cqp_bin,
-    registry_dir,
-    scoring_config,
-    surprisal_h5,
-    surprisal_threshold,
-    loanword_file,
-    ner_ignore_misc,
+    corpus_name, ner_h5, labels, excl_labels,
+    lookup, results, cqp_bin, registry_dir, scoring_config,
+    surprisal_h5, surprisal_threshold, loanword_file, ner_ignore_misc,
 ):
     """Find and score sentences containing named entities."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.NER)
@@ -1098,15 +1158,16 @@ def query_ner_entities(
 
     click.echo("[*] Loading NER index...", err=True)
     ner_labels, ner_records, id2label, ner_cpos = _load_ner_labels(ner_h5)
-    mask_src.ner_labels = ner_labels
-    mask_src.ner_records = ner_records
+    mask_src.ner_labels   = ner_labels
+    mask_src.ner_records  = ner_records
     mask_src.ner_id2label = id2label
-    mask_src.ner_cpos = ner_cpos
+    mask_src.ner_cpos     = ner_cpos
 
     if surprisal_h5 is not None and mask_src.surprisal_records is not None:
         _assert_index_alignment(mask_src.surprisal_records, ner_records)
 
     o_ids = {k for k, v in id2label.items() if v == "O"}
+
     if labels:
         want = {k for k, v in id2label.items() if v in set(labels)}
         if not want:
@@ -1118,19 +1179,35 @@ def query_ner_entities(
     else:
         want = set(id2label.keys()) - o_ids
 
+    exclude: set[int] | None = None
+    if excl_labels:
+        exclude = {k for k, v in id2label.items() if v in set(excl_labels)}
+        bad = set(excl_labels) - set(id2label.values())
+        if bad:
+            raise click.UsageError(
+                f"Unknown --exclude-label value(s): {sorted(bad)}. "
+                f"Available: {sorted(set(id2label.values()))}"
+            )
+        overlap = want & exclude
+        if overlap:
+            raise click.UsageError(
+                f"Labels appear in both --label and --exclude-label: "
+                f"{sorted(id2label[k] for k in overlap)}"
+            )
+
+    mask_src.ner_exclude = exclude
+
     click.echo(
-        f"[*] Scanning for labels: {sorted(id2label[k] for k in want)}",
-        err=True,
+        f"[*] Scanning for:  {sorted(id2label[k] for k in want)}", err=True
     )
+    if exclude:
+        click.echo(
+            f"[*] Excluding sentences with: {sorted(id2label[k] for k in exclude)}",
+            err=True,
+        )
 
     records = ner_records[:lookup] if lookup else ner_records
-    matching: list[int] = []
-    for sent_idx, record in enumerate(
-        tqdm(records, desc="Scanning NER labels", unit="sent")
-    ):
-        chunk = ner_labels[record.offset : record.offset + record.count]
-        if np.any(np.isin(chunk, list(want))):
-            matching.append(sent_idx)
+    matching = _ner_matching_sentences(ner_labels, records, want, exclude)
 
     click.echo(f"[*] Found {len(matching)} candidate sentence(s)", err=True)
     if not matching:
@@ -1162,8 +1239,8 @@ def query_ner_entities(
         )
 
         record = ner_records[sent_idx]
-        chunk = ner_labels[record.offset : record.offset + record.count]
-        parts = [
+        chunk  = ner_labels[record.offset : record.offset + record.count]
+        parts  = [
             f"[{t.word}/{id2label[int(chunk[i])]}]"
             if i < len(chunk) and int(chunk[i]) in want
             else t.word
@@ -1178,9 +1255,7 @@ def query_ner_entities(
 
     click.echo("-" * 60)
     for scored, parts_str, sent_idx in shown:
-        status = (
-            f" [FILTERED: {scored.filter_reason}]" if scored.filtered else ""
-        )
+        status = f" [FILTERED: {scored.filter_reason}]" if scored.filtered else ""
         click.echo(
             f"Score: {scored.score_total:.4f}  "
             f"(len={scored.score_length:.2f}  lw={scored.score_loanword:.2f}  "
