@@ -33,8 +33,11 @@ Once pyenv is installed, get the needed version.
 # Install the recommended version
 pyenv install 3.11.14
 
-# Set it locally for this project
+# (1) Set it locally for this project
 pyenv local 3.11.14
+
+# OR (2) Set it globally if you are on temp environment (e.g., remote cluster / instance). 
+pyenv global 3.11.14
 ```
 
 (Optional) It is recommended to create a virtual python environment.
@@ -44,10 +47,23 @@ python -m venv .venv
 source .venv/bin/activate
 ```
 
+Use pip to install `conloan-tools` (this is a lighter version with partial
+support that lacks neural model libraries; see next section for full version).
+
+```
+pip install conloan-tools
+```
+
 ### (Optional) Model related libraries
 
-Firstly, to use ML model related commands, we would need to get 
-pytorch if you need a specific version.
+Firstly, to use ML model related commands, we would need to get pytorch if you
+need a specific version. You can check `cuda` version with the following.
+
+```
+nvidia-smi | grep -i cuda
+```
+
+Then, to install torch (e.g., `cuda` 12.1).
 
 ```
 pip install torch --index-url https://download.pytorch.org/whl/cu121
@@ -60,13 +76,6 @@ pip install conloan-tools[models]
 ```
 
 ### Install
-
-Use pip to install `conloan-tools`.
-
-```
-pip install conloan-tools
-```
-
 
 ## Corpus
 
@@ -95,6 +104,15 @@ _CWB does not have a native Windows build. To use it on Windows, you must use
 Windows Subsystem for Linux (WSL). You can still use Conloan Tools excluding
 the corpus and annotation (limited usage) packages._
 
+#### Install example (Ubuntu 24.04)
+
+```
+curl https://master.dl.sourceforge.net/project/cwb/cwb/cwb-3.5/deb/cwb_3.5.0-1_amd64.deb?viasf=1 > cwb_3.5.0.deb
+apt install libpcre3
+dpkg -i cwb_3.5.0.deb 
+rm cwb_3.5.0.deb
+```
+
 ### Setting up the registry
 
 Once you obtain the `vert`. file of your corpus, you will need to encode it for
@@ -109,10 +127,9 @@ set to `/usr/local/share/cwb/registry` and `/usr/local/share/cwb/data`. A good
 option is to store it under `~/.local/share/cwb` for your user, which leads to
 less complications due to file permissions.
 
-_TODO: define CORPUS_DATA in the script._
-
 ```bash
 mkdir -p /home/<user>/.local/share/cwb/registry
+mkdir -p /home/<user>/.local/share/cwb/data
 ```
 
 **Configure the environment**
