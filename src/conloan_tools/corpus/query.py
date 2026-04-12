@@ -12,6 +12,7 @@ import numpy as np
 from tqdm import tqdm
 from dataclasses import dataclass
 import h5py
+import importlib
 
 from conloan_tools.corpus import corpus
 from .scoring import (
@@ -235,6 +236,26 @@ def _result_to_record(
         matched_lemmas=matched_lemmas,
         tag_map=tag_map,
     )
+
+
+def _make_lingua_detector():
+    from lingua import Language, LanguageDetectorBuilder
+    """Lazily import Lingua and build a detector for Latvian detection."""
+    return (
+        LanguageDetectorBuilder
+        .from_all_languages()
+        .with_low_accuracy_mode()
+        .build()
+    ), Language.LATVIAN
+
+
+def _is_latvian_context(text: str, detector, lv_lang) -> bool:
+    """Return True if the non-span context is predominantly Latvian."""
+    text = text.strip()
+    if not text:
+        return True  # nothing left to classify; give benefit of doubt
+    lang = detector.detect_language_of(text)
+    return lang == lv_lang
 
 
 @dataclass
@@ -1058,13 +1079,18 @@ def find_code_switch_sequences(
     lookup: int | None = None,        # renamed from limit_sentences
     mask_src: Optional[MaskSources] = None,
     allowed = None,
+    lingua_filter: bool = False,
 ) -> list[CodeSwitchRun]:
     """Score all qualifying runs; caller is responsible for capping display."""
+
+    detector, lv_lang = _make_lingua_detector() if lingua_filter else (None, None)
+
     if mask_src is None:
         mask_src = MaskSources()
 
     if mask_src.ner_records is not None:
         _assert_index_alignment(index_records, mask_src.ner_records)
+
 
     candidates = scan_anomaly_candidates(
         scores=scores,
@@ -1097,6 +1123,16 @@ def find_code_switch_sequences(
         parsed = sentence_map.get(sent_idx)
         if not parsed:
             continue
+
+        if detector is not None:
+            span_set = set(token_indices)
+            context_text = " ".join(
+                t.word
+                for i, t in enumerate(parsed.tokens)
+                if i not in span_set
+            )
+            if not _is_latvian_context(context_text, detector, lv_lang):
+                continue
 
         n = len(parsed.tokens)
         valid_indices = [i for i in token_indices if i < n]
@@ -1328,6 +1364,12 @@ def _render_candidates(records: list[CandidateRecord]) -> None:
     default=False,
     help="Scan in index order. Default: random by seed."
 )
+@click.option(
+    "--lingua-filter",
+    is_flag=True,
+    default=False,
+    help="Drop candidates where non-span context is not Latvian (requires lingua-language-detector).",
+)
 def query_code_switch(
     corpus_name,
     surprisal_h5,
@@ -1344,6 +1386,7 @@ def query_code_switch(
     ner_ignore_misc,
     output,
     sequential,
+    lingua_filter,
 ):
     """Find code-switch sequences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.CODE_SWITCH)
@@ -1385,6 +1428,7 @@ def query_code_switch(
         lookup=None,
         mask_src=mask_src,
         allowed=allowed,
+        lingua_filter=lingua_filter,
     )
 
     click.echo(f"[*] Found and scored {len(found)} candidate sequences", err=True)

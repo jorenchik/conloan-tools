@@ -17,6 +17,7 @@ dependencies = [
     "requests",
     "tqdm",
     "xlsxwriter",
+    "lingua-language-detector",
 ]
 
 [project.optional-dependencies]
