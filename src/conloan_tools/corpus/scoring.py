@@ -1,6 +1,6 @@
 import math
 from enum import Enum
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import List, Literal, Optional, Set
 try:
     import tomllib
@@ -60,6 +60,10 @@ class ScoringConfig:
     filter_forbid_loanword:      bool = False
     filter_forbid_code_switch:   bool = False
     filter_forbid_named_entity:  bool = False
+    filter_require_context_lang: str = ""
+
+    # NER label ignore list (replaces ner_ignore_misc)
+    ner_ignore_labels: set[str] = field(default_factory=set)
 
     filter_min_loanword_density:     float = 0.0
     filter_min_code_switch_density:  float = 0.0
@@ -310,6 +314,7 @@ def _apply_hard_gates(
     named_entity_mask: List[int],
     cfg: ScoringConfig,
     densities: tuple[int, float, float, float, float] | None = None,
+    detected_lang: str | None = None,
 ) -> Optional[str]:
     if densities is None:
         densities = _precompute_densities(
@@ -323,9 +328,10 @@ def _apply_hard_gates(
         return "too_short"
     if s_len > cfg.max_tokens:
         return "too_long"
-
     if alpha_ratio < cfg.min_alpha_ratio:
         return "low_alpha"
+    if cfg.filter_require_context_lang and detected_lang != cfg.filter_require_context_lang:
+        return "wrong_context_language"
 
     if cfg.filter_require_loanword and lw_density == 0.0:
         return "zero_loanwords"
@@ -388,6 +394,7 @@ def score_sentence(
     loanword_mask: Optional[List[int]] = None,
     code_switch_mask: Optional[List[int]] = None,
     named_entity_mask: Optional[List[int]] = None,
+    detected_lang: str | None = None,
     cfg: Optional[ScoringConfig] = None,
 ) -> ScoredResult:
     if cfg is None:
@@ -404,7 +411,8 @@ def score_sentence(
         tokens, loanword_mask, code_switch_mask, named_entity_mask
     )
     reason = _apply_hard_gates(
-        tokens, loanword_mask, code_switch_mask, named_entity_mask, cfg, densities
+        tokens, loanword_mask, code_switch_mask, named_entity_mask,
+        cfg, densities, detected_lang=detected_lang,
     )
     if reason:
         return _make_filtered(res, reason)

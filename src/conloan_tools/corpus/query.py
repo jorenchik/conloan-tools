@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import h5py
 import importlib
 
@@ -239,23 +239,8 @@ def _result_to_record(
 
 
 def _make_lingua_detector():
-    from lingua import Language, LanguageDetectorBuilder
-    """Lazily import Lingua and build a detector for Latvian detection."""
-    return (
-        LanguageDetectorBuilder
-        .from_all_languages()
-        .with_low_accuracy_mode()
-        .build()
-    ), Language.LATVIAN
-
-
-def _is_latvian_context(text: str, detector, lv_lang) -> bool:
-    """Return True if the non-span context is predominantly Latvian."""
-    text = text.strip()
-    if not text:
-        return True  # nothing left to classify; give benefit of doubt
-    lang = detector.detect_language_of(text)
-    return lang == lv_lang
+    from lingua import LanguageDetectorBuilder
+    return LanguageDetectorBuilder.from_all_languages().with_low_accuracy_mode().build()
 
 
 @dataclass
@@ -270,32 +255,7 @@ class MaskSources:
     ner_id2label: Optional[dict[int, str]] = None
     ner_exclude: Optional[set[int]] = None
     lw_lemmas: Optional[set[str]] = None
-    ner_ignore_misc: bool = False
-
-
-def _ne_exclusion_set(mask_src: MaskSources) -> set[int]:
-    """
-    Return sentence indices that contain any NE label.
-    Respects mask_src.ner_ignore_misc.
-    Returns an empty set if no NER data is loaded.
-    """
-    if (
-        mask_src.ner_labels is None
-        or mask_src.ner_records is None
-        or mask_src.ner_id2label is None
-    ):
-        return set()
-    o_ids = {k for k, v in mask_src.ner_id2label.items() if v == "O"}
-    ne_want = set(mask_src.ner_id2label.keys()) - o_ids
-    if mask_src.ner_ignore_misc:
-        ne_want -= {k for k, v in mask_src.ner_id2label.items() if v == "MISC"}
-    if not ne_want:
-        return set()
-    return set(
-        _ner_matching_sentences(mask_src.ner_labels, mask_src.ner_records, ne_want)
-    )
-
-
+    ner_ignore_labels: set[str] = field(default_factory=set)
 
 
 def _assert_index_alignment(
@@ -587,12 +547,12 @@ def load_mask_sources(
     surprisal_threshold: float = 0.0,
     ner_h5: Optional[Path] = None,
     loanword_file: Optional[Path] = None,
-    ner_ignore_misc: bool = False,
+    ner_ignore_labels: set[str] = frozenset(),
 ) -> MaskSources:
     """Load all optional index files into a MaskSources bundle."""
     src = MaskSources(
         surprisal_threshold=surprisal_threshold,
-        ner_ignore_misc=ner_ignore_misc,
+        ner_ignore_labels=set(ner_ignore_labels),
     )
 
     if surprisal_h5 is not None:
@@ -651,7 +611,7 @@ def build_masks(
             label = src.ner_id2label.get(label_id, "O")
             if label == "O":
                 return False
-            if src.ner_ignore_misc and label == "MISC":
+            if label in src.ner_ignore_labels:
                 return False
             if src.ner_exclude and label_id in src.ner_exclude:
                 return False
@@ -919,7 +879,10 @@ def query_by_lemmas(
     deduplicate: bool = True,
     verbose: bool = False,
     mask_src: Optional[MaskSources] = None,
+    lingua_lang: str | None = None,
 ) -> List[ScoredResult]:
+
+    detector = _make_lingua_detector() if lingua_lang else None
 
     click.echo("[*] Querying CQP...", err=True)
     raw_output = query_cqp_batch(
@@ -951,13 +914,6 @@ def query_by_lemmas(
     else:
         sent_indices = np.array([p.cqp_id for p in parsed_list], dtype=np.int32)
 
-    ne_excluded = _ne_exclusion_set(mask_src)
-    if ne_excluded:
-        click.echo(
-            f"[*] NE exclusion: {len(ne_excluded)} sentences will be skipped",
-            err=True,
-        )
-
     seen_texts: dict[tuple, ScoredResult] = {}
     scored: List[ScoredResult] = []
 
@@ -967,17 +923,24 @@ def query_by_lemmas(
         disable=not verbose,
     ):
         sent_idx = int(sent_idx)
-        if sent_idx == -1 or sent_idx in ne_excluded:
+        if sent_idx == -1:
             continue
 
         lw_mask, cs_mask, ne_mask = build_masks(
             parsed, sent_idx, mask_src, lw_lemma_set=lemma_set
         )
+
+        detected_lang = None
+        if detector is not None:
+            lang = detector.detect_language_of(parsed.text)
+            detected_lang = lang.iso_code_639_1.name.lower() if lang else None
+
         result = score_sentence(
             parsed,
             loanword_mask=lw_mask,
             code_switch_mask=cs_mask,
             named_entity_mask=ne_mask,
+            detected_lang=detected_lang,
             cfg=cfg,
         )
 
@@ -1079,11 +1042,11 @@ def find_code_switch_sequences(
     lookup: int | None = None,        # renamed from limit_sentences
     mask_src: Optional[MaskSources] = None,
     allowed = None,
-    lingua_filter: bool = False,
+    lingua_lang: str | None = None,
 ) -> list[CodeSwitchRun]:
     """Score all qualifying runs; caller is responsible for capping display."""
 
-    detector, lv_lang = _make_lingua_detector() if lingua_filter else (None, None)
+    detector = _make_lingua_detector() if lingua_lang else None
 
     if mask_src is None:
         mask_src = MaskSources()
@@ -1124,15 +1087,15 @@ def find_code_switch_sequences(
         if not parsed:
             continue
 
+        detected_lang = None
         if detector is not None:
             span_set = set(token_indices)
             context_text = " ".join(
-                t.word
-                for i, t in enumerate(parsed.tokens)
+                t.word for i, t in enumerate(parsed.tokens)
                 if i not in span_set
             )
-            if not _is_latvian_context(context_text, detector, lv_lang):
-                continue
+            lang = detector.detect_language_of(context_text)
+            detected_lang = lang.iso_code_639_1.name.lower() if lang else None
 
         n = len(parsed.tokens)
         valid_indices = [i for i in token_indices if i < n]
@@ -1149,6 +1112,7 @@ def find_code_switch_sequences(
             loanword_mask=lw_mask,
             code_switch_mask=cs_mask,
             named_entity_mask=ne_mask,
+            detected_lang=detected_lang,
             cfg=cfg,
         )
         results.append(
@@ -1195,11 +1159,18 @@ def mask_source_options(f):
         help="Surprisal HDF5 index; builds code-switch mask. Omit for all-zero.",
     )(f)
     f = click.option(
-        "--ignore-misc",
-        "ner_ignore_misc",
-        is_flag=True,
-        default=False,
-        help="Treat MISC NER labels as O (exclude from named-entity mask).",
+        "--ignore-label",
+        "ner_ignore_labels",
+        multiple=True,
+        default=[],
+        help="Treat these NER labels as O. Repeatable: --ignore-label MISC --ignore-label ORG",
+    )(f)
+    f = click.option(
+        "--lingua-lang",
+        "lingua_lang",
+        type=str,
+        default=None,
+        help="Required context language code (e.g. 'lv'). Enables Lingua detection.",
     )(f)
     return f
 
@@ -1309,12 +1280,9 @@ def _render_candidates(records: list[CandidateRecord]) -> None:
 
 @query_group.command("code-switch")
 @click.argument("corpus_name")
-@click.argument(
-    "surprisal_h5",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-)
 @click.option("--threshold", type=float, required=True)
 @click.option("--min-consecutive", type=int, default=2, show_default=True)
+@mask_source_options
 @click.option(
     "--lookup",
     type=int,
@@ -1333,26 +1301,6 @@ def _render_candidates(records: list[CandidateRecord]) -> None:
 @click.option("--seed", type=int, default=42, show_default=True)
 @scoring_config_option
 @click.option(
-    "--ner-h5",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=None,
-    help="NER HDF5 index; builds NE mask.",
-)
-@click.option(
-    "--loanwords",
-    "loanword_file",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=None,
-    help="One lemma per line; builds loanword mask.",
-)
-@click.option(
-    "--ignore-misc",
-    "ner_ignore_misc",
-    is_flag=True,
-    default=False,
-    help="Treat MISC NER labels as O.",
-)
-@click.option(
     "--output",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
@@ -1364,53 +1312,43 @@ def _render_candidates(records: list[CandidateRecord]) -> None:
     default=False,
     help="Scan in index order. Default: random by seed."
 )
-@click.option(
-    "--lingua-filter",
-    is_flag=True,
-    default=False,
-    help="Drop candidates where non-span context is not Latvian (requires lingua-language-detector).",
-)
 def query_code_switch(
     corpus_name,
     surprisal_h5,
+    surprisal_threshold,
     threshold,
     min_consecutive,
+    ner_h5,
+    loanword_file,
+    ner_ignore_labels,
+    lingua_lang,
     lookup,
     results,
     cqp_bin,
     registry_dir,
     seed,
     scoring_config,
-    ner_h5,
-    loanword_file,
-    ner_ignore_misc,
     output,
     sequential,
-    lingua_filter,
 ):
     """Find code-switch sequences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.CODE_SWITCH)
 
     mask_src = load_mask_sources(
+        surprisal_h5=surprisal_h5,
+        surprisal_threshold=surprisal_threshold,
         ner_h5=ner_h5,
         loanword_file=loanword_file,
-        ner_ignore_misc=ner_ignore_misc,
+        ner_ignore_labels=set(ner_ignore_labels),
     )
 
-    click.echo("[*] Loading surprisal index...", err=True)
-    scores = _load_scores(surprisal_h5)
-    index_records, _ = _load_index_records(surprisal_h5)
+    if mask_src.surprisal_scores is None:
+        raise click.UsageError("--surprisal-h5 is required for code-switch mode.")
 
+    scores = mask_src.surprisal_scores
+    index_records = mask_src.surprisal_records
     allowed = _sentence_index_set(len(index_records), sequential, seed, lookup)
-    ne_excl = _ne_exclusion_set(mask_src)
-    if ne_excl:
-        click.echo(
-            f"[*] NE exclusion: removing {len(ne_excl)} sentences", err=True
-        )
-        if allowed is None:
-            allowed = set(range(len(index_records))) - ne_excl
-        else:
-            allowed -= ne_excl
+
     click.echo(
         f"[*] Scanning in {'sequential' if sequential else f'random (seed={seed})'} order"
         + (f", {lookup} sentences" if lookup else ""),
@@ -1428,7 +1366,7 @@ def query_code_switch(
         lookup=None,
         mask_src=mask_src,
         allowed=allowed,
-        lingua_filter=lingua_filter,
+        lingua_lang=lingua_lang,
     )
 
     click.echo(f"[*] Found and scored {len(found)} candidate sequences", err=True)
@@ -1465,7 +1403,13 @@ def query_code_switch(
 
 @query_group.command("lemmas")
 @click.argument("corpus_name")
-@click.argument("lemmas")
+@click.argument("lemmas", required=False, default=None)
+@click.option(
+    "--lemmas-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Newline-separated file of lemmas. Alternative to LEMMAS argument.",
+)
 @click.option(
     "--lookup",
     type=int,
@@ -1494,6 +1438,7 @@ def query_code_switch(
 def query_lemmas_command(
     corpus_name,
     lemmas,
+    lemmas_file,
     lookup,
     results,
     cqp_bin,
@@ -1504,7 +1449,8 @@ def query_lemmas_command(
     surprisal_threshold,
     ner_h5,
     loanword_file,
-    ner_ignore_misc,
+    ner_ignore_labels,
+    lingua_lang,
     output,
 ):
     """Query corpus by lemma(s) and emit JSONL records."""
@@ -1513,10 +1459,16 @@ def query_lemmas_command(
         surprisal_threshold=surprisal_threshold,
         ner_h5=ner_h5,
         loanword_file=loanword_file,
-        ner_ignore_misc=ner_ignore_misc,
+        ner_ignore_labels=ner_ignore_labels,
     )
 
-    lemma_list = lemmas.split(",")
+    if lemmas_file is not None:
+        with open(lemmas_file, encoding="utf-8") as f:
+            lemma_list = [l.strip() for l in f if l.strip()]
+    elif lemmas is not None:
+        lemma_list = lemmas.split(",")
+    else:
+        raise click.UsageError("Provide either LEMMAS argument or --lemmas-file.")
     lemma_set_lower = {l.lower(): l for l in lemma_list}
 
     found = query_by_lemmas(
@@ -1607,19 +1559,7 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
 @click.option("--registry-dir", default=None)
 @click.option("--seed", type=int, default=42, show_default=True)
 @scoring_config_option
-@click.option(
-    "--surprisal-h5",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=None,
-)
-@click.option("--surprisal-threshold", type=float, default=0.0, show_default=True)
-@click.option(
-    "--loanwords",
-    "loanword_file",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=None,
-)
-@click.option("--ignore-misc", "ner_ignore_misc", is_flag=True, default=False)
+@mask_source_options
 @click.option(
     "--output",
     type=click.Path(dir_okay=False, path_type=Path),
@@ -1635,17 +1575,18 @@ def sentence_slice(corpus_name, range_str, cqp_bin, registry_dir):
 def query_ner_entities(
     corpus_name, ner_h5, labels, excl_labels,
     lookup, results, cqp_bin, registry_dir, seed, scoring_config,
-    surprisal_h5, surprisal_threshold, loanword_file, ner_ignore_misc,
-    output,
+    surprisal_h5, surprisal_threshold, ner_ignore_labels, loanword_file,
+    lingua_lang, output, sequential,
 ):
     """Find named entity sentences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.NER)
+    detector = _make_lingua_detector() if lingua_lang else None
 
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
         loanword_file=loanword_file,
-        ner_ignore_misc=ner_ignore_misc,
+        ner_ignore_labels=ner_ignore_labels,
     )
 
     click.echo("[*] Loading NER index...", err=True)
@@ -1707,7 +1648,7 @@ def query_ner_entities(
     )
 
     click.echo(
-        f"[*] Scanning {len(records)} sentences for matching labels...",
+        f"[*] Scanning {len(ner_records)} sentences for matching labels...",
         err=True,
     )
     matching = _ner_matching_sentences(ner_labels, ner_records, want, exclude, allowed=allowed)
@@ -1737,11 +1678,16 @@ def query_ner_entities(
         unit="sent",
     ):
         lw_mask, cs_mask, ne_mask = build_masks(parsed, sent_idx, mask_src)
+        detected_lang = None
+        if detector is not None:
+            lang = detector.detect_language_of(parsed.text)
+            detected_lang = lang.iso_code_639_1.name.lower() if lang else None
         scored = score_sentence(
             parsed,
             loanword_mask=lw_mask,
             code_switch_mask=cs_mask,
             named_entity_mask=ne_mask,
+            detected_lang=detected_lang,
             cfg=cfg,
         )
         sentence = _tag_ner_sentence(
