@@ -2,12 +2,14 @@ import json
 import sys
 from pathlib import Path
 
+import textwrap
 import click
 import re
 import h5py
 import numpy as np
 from tqdm import tqdm
 
+_LEN_SENTINEL = 255
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -695,3 +697,214 @@ def cmd_find_offset(
             f"spos={sp}  stored={stored}  actual={actual}  "
             f"diff={actual - stored:+d}"
         )
+
+def _is_lengths_file(f: h5py.File) -> bool:
+    return f.attrs.get("type") == "lengths"
+
+
+def _require_lengths(f: h5py.File, path: str) -> None:
+    if not _is_lengths_file(f):
+        click.echo(
+            f"Error: {path} is not a lengths index "
+            f"(type={f.attrs.get('type', 'unknown')!r}).",
+            err=True,
+        )
+        sys.exit(1)
+
+
+def _fmt_stats_block(label: str, s: dict) -> list[str]:
+    """Format one stats dict as an aligned block of lines."""
+    if s.get("n") is None or s["n"] == 0:
+        return [f"  {label}: no data"]
+    lines = [f"  {label}  (n={s['n']:,})"]
+    lines.append(f"    mean   : {s['mean']:.4f}")
+    lines.append(f"    std    : {s['std']:.4f}")
+    lines.append(f"    var    : {s['variance']:.4f}")
+    lines.append(f"    median : {s['median']:.4f}")
+    lines.append(f"    min    : {s['min']}")
+    lines.append(f"    max    : {s['max']}")
+    # ±1σ / ±2σ normal ranges
+    lo1, hi1 = s["mean"] - s["std"],     s["mean"] + s["std"]
+    lo2, hi2 = s["mean"] - 2*s["std"],   s["mean"] + 2*s["std"]
+    lines.append(f"    ±1σ    : [{lo1:.4f}, {hi1:.4f}]")
+    lines.append(f"    ±2σ    : [{lo2:.4f}, {hi2:.4f}]")
+    return lines
+
+
+def _load_stats(f: h5py.File) -> dict[str, dict]:
+    """Return the three pre-computed stats dicts from file attrs."""
+    out = {}
+    for key in ("stats_sent_len", "stats_word_char_len", "stats_word_byte_len"):
+        raw = f.attrs.get(key)
+        if raw is None:
+            out[key] = {}
+        else:
+            try:
+                out[key] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                out[key] = {}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# lengths info
+# ---------------------------------------------------------------------------
+
+
+@inspect_index.command("lengths-info")
+@click.argument("path")
+def cmd_lengths_info(path: str) -> None:
+    """Dump metadata and pre-computed statistics from a lengths index."""
+    with _open_h5(path) as f:
+        _require_lengths(f, path)
+        attrs = _attrs(f)
+        stats = _load_stats(f)
+
+        click.echo("=== Metadata ===")
+        skip = {"stats_sent_len", "stats_word_char_len", "stats_word_byte_len"}
+        for k, v in attrs.items():
+            if k not in skip:
+                click.echo(f"  {k}: {v}")
+
+        click.echo("\n=== Datasets ===")
+        def _visit(name, obj):
+            if isinstance(obj, h5py.Dataset):
+                click.echo(
+                    f"  /{name:<30}  shape={str(obj.shape):<20}  dtype={obj.dtype}"
+                )
+        f.visititems(_visit)
+
+        click.echo("\n=== Statistics ===")
+        for label, key in [
+            ("Sentence length (tokens)", "stats_sent_len"),
+            ("Word char length",         "stats_word_char_len"),
+            ("Word byte length",         "stats_word_byte_len"),
+        ]:
+            for line in _fmt_stats_block(label, stats.get(key, {})):
+                click.echo(line)
+            click.echo()
+
+
+# ---------------------------------------------------------------------------
+# lengths sent
+# ---------------------------------------------------------------------------
+
+
+@inspect_index.command("lengths-sent")
+@click.argument("path")
+@click.option("--spos", "lookup_spos", type=int, default=None)
+@click.option("--cpos", "lookup_cpos", type=int, default=None)
+@click.option("--head",  default=16, show_default=True, help="Max tokens to show.")
+def cmd_lengths_sent(
+    path: str,
+    lookup_spos: int | None,
+    lookup_cpos: int | None,
+    head: int,
+) -> None:
+    """Look up one sentence and show per-token char/byte lengths."""
+    if (lookup_spos is None) == (lookup_cpos is None):
+        click.echo("Error: provide exactly one of --spos or --cpos.", err=True)
+        sys.exit(1)
+
+    with _open_h5(path) as f:
+        _require_lengths(f, path)
+        cpos_ds  = f["index"]["cpos"]
+        count_ds = f["index"]["count"]
+        n_sents  = cpos_ds.shape[0]
+
+        if lookup_spos is not None:
+            if lookup_spos < 0 or lookup_spos >= n_sents:
+                click.echo(f"Error: spos {lookup_spos} out of range.", err=True)
+                sys.exit(1)
+            if "spos" in f["index"]:
+                matches = np.where(f["index"]["spos"][:] == lookup_spos)[0]
+                if len(matches) == 0:
+                    click.echo(f"Error: spos {lookup_spos} not found.", err=True)
+                    sys.exit(1)
+                row = int(matches[0])
+            else:
+                row = lookup_spos
+            cpos_val = int(cpos_ds[row])
+        else:
+            row, cpos_val = _find_sentence_by_cpos(cpos_ds, lookup_cpos)
+
+        count    = int(count_ds[row])
+        spos_val = int(f["index"]["spos"][row]) if "spos" in f["index"] else row
+
+        # read per-token arrays
+        offset    = int(f["index"]["count"][:row].sum())
+        char_arr  = f["tokens"]["char_len"][offset : offset + count]
+        byte_arr  = f["tokens"]["byte_len"][offset : offset + count]
+
+        click.echo(f"spos={spos_val}  cpos={cpos_val}  count={count}")
+        click.echo(f"{'idx':>6}  {'char_len':>8}  {'byte_len':>8}")
+        click.echo("-" * 28)
+        for i, (cl, bl) in enumerate(zip(char_arr[:head], byte_arr[:head])):
+            cl_s = "excl" if cl == _LEN_SENTINEL else str(cl)
+            bl_s = "excl" if bl == _LEN_SENTINEL else str(bl)
+            click.echo(f"{i:>6}  {cl_s:>8}  {bl_s:>8}")
+        if count > head:
+            click.echo(f"  ... (+{count - head} more tokens)")
+
+
+# ---------------------------------------------------------------------------
+# lengths hist
+# ---------------------------------------------------------------------------
+
+
+@inspect_index.command("lengths-hist")
+@click.argument("path")
+@click.option(
+    "--variable",
+    type=click.Choice(["sent_len", "char_len", "byte_len"]),
+    default="char_len",
+    show_default=True,
+)
+@click.option("--bins",          default=20,     show_default=True)
+@click.option("--max-sentences", default=50_000, show_default=True,
+              help="Cap sentences for sampling (0 = all).")
+@click.option("--show-excluded", is_flag=True, default=False,
+              help="Add a bar for sentinel-excluded tokens.")
+def cmd_lengths_hist(
+    path: str,
+    variable: str,
+    bins: int,
+    max_sentences: int,
+    show_excluded: bool,
+) -> None:
+    """ASCII histogram of sentence/word lengths from a lengths index."""
+    with _open_h5(path) as f:
+        _require_lengths(f, path)
+
+        if variable == "sent_len":
+            count_ds = f["index"]["count"][:]
+            cap = max_sentences if max_sentences > 0 else len(count_ds)
+            data = count_ds[:cap].astype(np.float32)
+            click.echo(f"Variable: sentence length (tokens) — {len(data):,} sentences")
+        else:
+            ds_name = "char_len" if variable == "char_len" else "byte_len"
+            count_ds = f["index"]["count"][:]
+            cap = max_sentences if max_sentences > 0 else len(count_ds)
+            n_tok = int(count_ds[:cap].sum())
+            raw   = f["tokens"][ds_name][:n_tok]
+            n_excluded = int((raw == _LEN_SENTINEL).sum())
+            data  = raw[raw != _LEN_SENTINEL].astype(np.float32)
+            click.echo(
+                f"Variable: {variable} — {len(data):,} tokens "
+                f"({n_excluded:,} excluded)"
+            )
+
+        counts, edges = np.histogram(data, bins=bins)
+        max_count = counts.max()
+        bar_width = 50
+
+        click.echo(f"mean={data.mean():.4f}  std={data.std():.4f}  "
+                   f"median={float(np.median(data)):.4f}\n")
+
+        for i, c in enumerate(counts):
+            bar = "█" * int(c / max_count * bar_width)
+            lo, hi = edges[i], edges[i + 1]
+            click.echo(f"  {lo:>7.2f} – {hi:<7.2f}  {bar:<{bar_width}}  {c:>8,}")
+
+        if show_excluded and variable != "sent_len":
+            click.echo(f"\n  {'excl':>7}         {'░' * int(n_excluded / max_count * bar_width):<{bar_width}}  {n_excluded:>8,}")

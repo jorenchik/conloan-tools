@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 import h5py
 import numpy as np
+import struct
 
 from conloan_tools.corpus import corpus
 from conloan_tools.corpus.query import is_clean_word
@@ -20,7 +21,7 @@ SENT_ID_RE = re.compile(r'id="([^"]+)"')
 _GZIP_LEVEL   = 4
 _CHUNK_TOKENS = 8_192
 _CHUNK_SENTS  = 1_024
-
+_LEN_SENTINEL = np.uint8(255)
 
 def _iter_surprisal_scores(
     lm: WittenBellCharLM,
@@ -514,6 +515,231 @@ def build_ner_index_command(
         name=name,
         ner_output=ner_output,
         batch_size=batch_size,
+        store_spos=not no_spos,
+        limit_lines=limit_lines,
+        limit_sentences=limit_sentences,
+        limit_mb=limit_mb,
+    )
+    click.echo("[✓] Finished", err=True)
+    click.echo(f"    {h5_path} ({h5_path.stat().st_size:,} B)", err=True)
+
+
+def _iter_length_scores(
+    input_path: str,
+    filter_clean: bool,
+    limit_lines: int | None,
+    limit_sentences: int | None,
+    limit_mb: float | None,
+):
+    """
+    Yields (cpos, char_len_arr, byte_len_arr) per sentence.
+    Tokens excluded by is_clean_word are stored as _LEN_SENTINEL (255).
+    """
+    for _, tokens, cpos in iter_vert_sentences(
+        input_path,
+        limit_lines=limit_lines,
+        limit_sentences=limit_sentences,
+        limit_mb=limit_mb,
+    ):
+        char_lens = []
+        byte_lens = []
+        for tok in tokens:
+            if filter_clean and not is_clean_word(tok, allow_ner=False):
+                char_lens.append(_LEN_SENTINEL)
+                byte_lens.append(_LEN_SENTINEL)
+            else:
+                cl = len(tok)
+                bl = len(tok.encode("utf-8"))
+                char_lens.append(min(cl, int(_LEN_SENTINEL) - 1))
+                byte_lens.append(min(bl, int(_LEN_SENTINEL) - 1))
+
+        yield cpos, np.array(char_lens, dtype=np.uint8), np.array(byte_lens, dtype=np.uint8)
+
+
+def _create_lengths_hdf5(path: Path, meta: dict, store_spos: bool) -> h5py.File:
+    f = h5py.File(path, "w")
+    for k, v in meta.items():
+        f.attrs[k] = json.dumps(v) if isinstance(v, (dict, list)) else v
+
+    so = _ds_opts((_CHUNK_SENTS,))
+    idx = f.create_group("index")
+    idx.create_dataset("cpos",  shape=(0,), maxshape=(None,), dtype=np.uint64, **so)
+    idx.create_dataset("count", shape=(0,), maxshape=(None,), dtype=np.uint32, **so)
+    if store_spos:
+        idx.create_dataset("spos", shape=(0,), maxshape=(None,), dtype=np.uint64, **so)
+
+    to = _ds_opts((_CHUNK_TOKENS,))
+    tokens = f.create_group("tokens")
+    tokens.create_dataset("char_len", shape=(0,), maxshape=(None,), dtype=np.uint8, **to)
+    tokens.create_dataset("byte_len", shape=(0,), maxshape=(None,), dtype=np.uint8, **to)
+
+    return f
+
+
+def _lengths_flush(
+    f: h5py.File,
+    cpos_buf: list[int],
+    count_buf: list[int],
+    spos_buf: list[int] | None,
+    char_buf: list[np.ndarray],
+    byte_buf: list[np.ndarray],
+    store_spos: bool,
+) -> None:
+    if not cpos_buf:
+        return
+
+    def _append(ds: h5py.Dataset, arr: np.ndarray) -> None:
+        old = ds.shape[0]
+        ds.resize(old + arr.shape[0], axis=0)
+        ds[old:] = arr
+
+    idx = f["index"]
+    _append(idx["cpos"],  np.array(cpos_buf, dtype=np.uint64))
+    _append(idx["count"], np.array(count_buf, dtype=np.uint32))
+    if store_spos and spos_buf is not None:
+        _append(idx["spos"], np.array(spos_buf, dtype=np.uint64))
+    _append(f["tokens"]["char_len"], np.concatenate(char_buf))
+    _append(f["tokens"]["byte_len"], np.concatenate(byte_buf))
+
+    cpos_buf.clear()
+    count_buf.clear()
+    if spos_buf is not None:
+        spos_buf.clear()
+    char_buf.clear()
+    byte_buf.clear()
+
+
+def _compute_length_stats(arr: np.ndarray, sentinel: int) -> dict:
+    """Compute stats over arr, excluding sentinel values."""
+    clean = arr[arr != sentinel].astype(np.float64)
+    n = len(clean)
+    if n == 0:
+        return {"n": 0, "mean": None, "variance": None, "std": None,
+                "median": None, "min": None, "max": None}
+    mean     = float(clean.mean())
+    variance = float(clean.var(ddof=1))
+    return {
+        "n":        n,
+        "mean":     mean,
+        "variance": variance,
+        "std":      float(np.sqrt(variance)),
+        "median":   float(np.median(clean)),
+        "min":      int(clean.min()),
+        "max":      int(clean.max()),
+    }
+
+
+def build_lengths_index(
+    input_path: str,
+    output_dir: str,
+    name: str,
+    filter_clean: bool = True,
+    store_spos: bool = True,
+    flush_every: int = IDX_FLUSH_EVERY,
+    limit_lines: int | None = None,
+    limit_sentences: int | None = None,
+    limit_mb: float | None = None,
+) -> Path:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    h5_path = out / f"{name}.lengths.h5"
+
+    meta = {
+        "type":              "lengths",
+        "input":             str(input_path),
+        "filter_clean":      filter_clean,
+        "excluded_sentinel": int(_LEN_SENTINEL),
+        "date":              datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "store_spos":        store_spos,
+    }
+
+    f = _create_lengths_hdf5(h5_path, meta, store_spos)
+    try:
+        cpos_buf:  list[int]        = []
+        count_buf: list[int]        = []
+        spos_buf:  list[int] | None = [] if store_spos else None
+        char_buf:  list[np.ndarray] = []
+        byte_buf:  list[np.ndarray] = []
+        spos = 0
+
+        for cpos, char_arr, byte_arr in _iter_length_scores(
+            input_path, filter_clean, limit_lines, limit_sentences, limit_mb
+        ):
+            cpos_buf.append(cpos)
+            count_buf.append(char_arr.shape[0])
+            if spos_buf is not None:
+                spos_buf.append(spos)
+            char_buf.append(char_arr)
+            byte_buf.append(byte_arr)
+            spos += 1
+
+            if len(cpos_buf) >= flush_every:
+                _lengths_flush(f, cpos_buf, count_buf, spos_buf,
+                               char_buf, byte_buf, store_spos)
+
+        _lengths_flush(f, cpos_buf, count_buf, spos_buf,
+                       char_buf, byte_buf, store_spos)
+
+        # --- compute and store stats ---
+        sentinel = int(_LEN_SENTINEL)
+        char_all = f["tokens"]["char_len"][:]
+        byte_all = f["tokens"]["byte_len"][:]
+        sent_counts = f["index"]["count"][:].astype(np.float64)
+
+        stats = {
+            "stats_sent_len":       _compute_length_stats(
+                                        f["index"]["count"][:].astype(np.uint8),
+                                        sentinel=256,   # sentinel irrelevant; count never 255
+                                    ),
+            "stats_word_char_len":  _compute_length_stats(char_all, sentinel),
+            "stats_word_byte_len":  _compute_length_stats(byte_all, sentinel),
+        }
+        # sentence length — compute directly (no sentinel needed)
+        sc = sent_counts
+        n  = len(sc)
+        stats["stats_sent_len"] = {
+            "n":        n,
+            "mean":     float(sc.mean()),
+            "variance": float(sc.var(ddof=1)),
+            "std":      float(sc.std(ddof=1)),
+            "median":   float(np.median(sc)),
+            "min":      int(sc.min()),
+            "max":      int(sc.max()),
+        }
+
+        for k, v in stats.items():
+            f.attrs[k] = json.dumps(v)
+
+    finally:
+        f.close()
+
+    return h5_path
+
+
+@build_index.command("lengths")
+@click.option("--input",           "input_path", required=True, help=".vert corpus")
+@click.option("--output-dir",      required=True, help="Output directory")
+@click.option("--name",            required=True, help="Base name for output file")
+@click.option("--no-filter",       is_flag=True, default=False,
+              help="Disable is_clean_word filtering (include punctuation etc.)")
+@click.option("--no-spos",         is_flag=True, default=False, help="Omit spos dataset")
+@click.option("--limit-lines",     type=int)
+@click.option("--limit-sentences", type=int)
+@click.option("--limit-mb",        type=float)
+def build_lengths_index_command(
+    input_path, output_dir, name,
+    no_filter, no_spos,
+    limit_lines, limit_sentences, limit_mb,
+) -> None:
+    """
+    Compute per-token char/byte lengths and sentence lengths.
+    Stores raw uint8 arrays + pre-computed corpus-wide statistics.
+    """
+    h5_path = build_lengths_index(
+        input_path=input_path,
+        output_dir=output_dir,
+        name=name,
+        filter_clean=not no_filter,
         store_spos=not no_spos,
         limit_lines=limit_lines,
         limit_sentences=limit_sentences,
