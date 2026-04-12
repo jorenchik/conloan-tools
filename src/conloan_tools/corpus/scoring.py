@@ -66,20 +66,20 @@ class ScoringConfig:
     filter_min_named_entity_density: float = 0.0
 
     # Length Gaussian
-    length_mu:    float = 18.0
-    length_sigma: float = 7.0
+    length_mu:    float = 20.0
+    length_sigma: float = 10.0
 
     # Loanword density Gaussian
-    loanword_mu:    float = 0.10
-    loanword_sigma: float = 0.08
+    loanword_mu:    float = 0.15
+    loanword_sigma: float = 0.10
 
     # Code-switch density Gaussian
     code_switch_mu:    float = 0.15
     code_switch_sigma: float = 0.10
 
     # Named-entity density Gaussian
-    named_entity_mu:    float = 0.05
-    named_entity_sigma: float = 0.08
+    named_entity_mu:    float = 0.15
+    named_entity_sigma: float = 0.10
 
     # Component weights (normalised at scoring time)
     weight_length:       float = 0.0
@@ -116,22 +116,22 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_alpha":                    0.33,
         "weight_loanword":                 0.33,
 
-        "code_switch_mu":                  12,
-        "code_switch_sigma":               4,
+        "code_switch_mu":                  21,
+        "code_switch_sigma":               15,
     },
     QueryProfile.CODE_SWITCH: {
-        "min_tokens":                      8,
+        "min_tokens":                      5,
         "max_tokens":                      128,
         "min_alpha_ratio":                 0.5,
         "filter_require_code_switch":      True,
         "filter_forbid_named_entity":      True,
 
-        "weight_code_switch":              0.40,
-        "weight_length":                   0.20,
-        "weight_alpha":                    0.25,
+        "weight_code_switch":              0.33,
+        "weight_length":                   0.33,
+        "weight_alpha":                    0.33,
 
-        "code_switch_mu":                  0.30,
-        "code_switch_sigma":               0.15,
+        "length_mu":                       0.30,
+        "length_sigma":                    0.15,
     },
     QueryProfile.NER: {
         "min_tokens":                      5,
@@ -143,8 +143,8 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_length":                   0.33,
         "weight_alpha":                    0.33,
 
-        "named_entity_mu":                 0.15,
-        "named_entity_sigma":              0.10,
+        "named_entity_mu":                 0.30,
+        "named_entity_sigma":              0.15,
     },
 }
 
