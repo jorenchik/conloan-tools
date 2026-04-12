@@ -1,4 +1,3 @@
-
 import math
 import re
 from collections import defaultdict
@@ -14,25 +13,27 @@ from conloan_tools.wb import wb
 # ----- Language model -----
 
 class WittenBellCharLM:
-    """Char n-gram LM with Witten-Bell smoothing.
+    """Byte n-gram LM with Witten-Bell smoothing.
 
-    Counts are stored as numpy int64 arrays keyed by context string,
-    one array of shape (vocab_size,) per context.  This replaces the
-    nested-defaultdict approach and cuts memory ~3-4x.
+    Tokens are UTF-8 encoded before processing; the vocabulary is the
+    fixed 256-byte alphabet so _build_alphabet is a no-op and vocab_size
+    is always 256.
+
+    Counts are stored as numpy int32 arrays keyed by context bytes,
+    one array of shape (256,) per context.
     """
 
     def __init__(self, n: int = 3):
         self.n = n
-        self.char2id: dict[str, int] = {}
-        self.vocab_size: int = 0
+        self.vocab_size: int = 256
         # index 0 unused; orders 1..n
-        self.counts: list[dict[str, np.ndarray[np.int32]]] = [{}] + [
+        self.counts: list[dict[bytes, np.ndarray]] = [{}] + [
             {} for _ in range(n)
         ]
-        self.totals: list[dict[str, int]] = [{}] + [
+        self.totals: list[dict[bytes, int]] = [{}] + [
             {} for _ in range(n)
         ]
-        self.types: list[dict[str, int]] = [{}] + [
+        self.types: list[dict[bytes, int]] = [{}] + [
             {} for _ in range(n)
         ]
         self._score_cache: dict[tuple[str, str], float] = {}
@@ -41,9 +42,8 @@ class WittenBellCharLM:
 
     def train(self, path: str) -> None:
         words = self._parse_freq_list(path)
-        self._build_alphabet(words)
         click.echo(
-            f"  alphabet: {self.vocab_size}  |  "
+            f"  alphabet: 256 bytes  |  "
             f"word types: {len(words):,}",
             err=True,
         )
@@ -73,27 +73,16 @@ class WittenBellCharLM:
                 out.append((word.lower(), freq))
         return out
 
-    def _build_alphabet(self, words: list[tuple[str, int]]) -> None:
-        chars: set[str] = {" "}
-        for w, _ in words:
-            chars.update(w)
-        for i, c in enumerate(sorted(chars)):
-            self.char2id[c] = i
-        self.vocab_size = len(self.char2id)
-
     def _add_word(self, word: str, freq: int) -> None:
-        pad = " " * (self.n - 1)
-        padded = f"{pad}{word} "
-        get_id = self.char2id.get
+        pad = b" " * (self.n - 1)
+        padded = pad + word.encode("utf-8") + b" "
 
         for i in range(len(padded)):
-            cid = get_id(padded[i])
-            if cid is None:
-                continue
+            cid = padded[i]          # already an int in 0-255
             for order in range(1, self.n + 1):
                 if i < order - 1:
                     continue
-                ctx = padded[i - (order - 1) : i]
+                ctx = bytes(padded[i - (order - 1) : i])
                 counts_o = self.counts[order]
                 totals_o = self.totals[order]
                 types_o  = self.types[order]
@@ -110,9 +99,9 @@ class WittenBellCharLM:
 
     # ---- inference --------------------------------------------------------
 
-    def get_probability(self, context: str, char: str, order: int) -> float:
+    def get_probability(self, context: bytes, char: int, order: int) -> float:
         if order <= 0:
-            return 1.0 / self.vocab_size if self.vocab_size else 1e-7
+            return 1.0 / self.vocab_size
 
         n_c = self.totals[order].get(context, 0)
         r_c = self.types[order].get(context, 0)
@@ -120,12 +109,8 @@ class WittenBellCharLM:
         if n_c == 0:
             return self.get_probability(context[1:], char, order - 1)
 
-        cid = self.char2id.get(char)
-        c_i = 0
-        if cid is not None:
-            arr = self.counts[order].get(context)
-            if arr is not None and cid < len(arr):
-                c_i = int(arr[cid])
+        arr = self.counts[order].get(context)
+        c_i = int(arr[char]) if arr is not None else 0
 
         if c_i > 0:
             return c_i / (n_c + r_c)
@@ -137,13 +122,13 @@ class WittenBellCharLM:
     def score_token(self, token: str) -> tuple[float, float]:
         """Return (max_surprisal, geometric_mean_probability)."""
         token = token.lower()
-        pad = " " * (self.n - 1)
-        padded = f"{pad}{token} "
+        pad = b" " * (self.n - 1)
+        padded = pad + token.encode("utf-8") + b" "
         surprisals: list[float] = []
 
         for i in range(self.n - 1, len(padded)):
-            ctx = padded[i - (self.n - 1) : i]
-            char = padded[i]
+            ctx  = bytes(padded[i - (self.n - 1) : i])
+            char = padded[i]                            # int 0-255
             prob = self.get_probability(ctx, char, self.n)
             if prob <= 0:
                 prob = 1e-10
@@ -153,50 +138,40 @@ class WittenBellCharLM:
             return 0.0, 0.0
         return max(surprisals), 2 ** -(sum(surprisals) / len(surprisals))
 
-
-    def sample_next_char(self, context: str, temperature: float = 1.0) -> str:
-        """Sample a character from the distribution at the given temperature."""
-        context = context[-(self.n - 1) :] if self.n > 1 else ""
+    def sample_next_byte(self, context: bytes, temperature: float = 1.0) -> int:
+        """Sample the next byte value (0-255) at the given temperature."""
+        context = context[-(self.n - 1) :] if self.n > 1 else b""
         probs = np.zeros(self.vocab_size)
-        
-        # Invert char2id for lookup
-        id2char = {i: c for c, i in self.char2id.items()}
-        
-        for char, cid in self.char2id.items():
-            probs[cid] = self.get_probability(context, char, self.n)
+
+        for b in range(self.vocab_size):
+            probs[b] = self.get_probability(context, b, self.n)
 
         if temperature <= 0:
-            return id2char[np.argmax(probs)]
-        
-        # Apply temperature
+            return int(np.argmax(probs))
+
         probs = np.exp(np.log(probs + 1e-10) / temperature)
         probs /= probs.sum()
-        
-        return np.random.choice(list(id2char.values()), p=probs)
+        return int(np.random.choice(self.vocab_size, p=probs))
 
     def generate(self, length: int = 20, temperature: float = 1.0) -> str:
         """Generate a string of text."""
-        res = " " * (self.n - 1)
+        buf = b" " * (self.n - 1)
         for _ in range(length):
-            next_c = self.sample_next_char(res, temperature)
-            res += next_c
-            if next_c == " " and len(res.strip()) > 0: # Stop at word end or continue
+            next_b = self.sample_next_byte(buf, temperature)
+            buf += bytes([next_b])
+            if next_b == ord(" ") and buf.strip():
                 break
-        return res.strip()
-
+        return buf.strip().decode("utf-8", errors="replace")
 
     def complete(self, prefix: str, max_chars: int = 20, temperature: float = 0.0) -> str:
         """Complete a word given a prefix."""
-        res = prefix
+        buf = prefix.encode("utf-8")
         for _ in range(max_chars):
-            # We use a very low temperature or 0 (greedy) for completions
-            next_c = self.sample_next_char(res, temperature=temperature)
-            
-            # If the model predicts a space, the word is finished
-            if next_c == " ":
+            next_b = self.sample_next_byte(buf, temperature=temperature)
+            if next_b == ord(" "):
                 break
-            res += next_c
-        return res
+            buf += bytes([next_b])
+        return buf.decode("utf-8", errors="replace")
 
     # ---- scoring helpers --------------------------------------------------
 
