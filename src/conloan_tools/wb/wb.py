@@ -2,7 +2,7 @@ import math
 import re
 from collections import defaultdict
 from tqdm import tqdm
-import pickle
+import compress_pickle
 import functools
 import click
 import numpy as np
@@ -190,15 +190,14 @@ class WittenBellCharLM:
 
     def save(self, path: str) -> None:
         """Serialise the model to a pickle file."""
-        with open(path, "wb") as f:
-            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+        click.echo(f"Saving the model to {path}")
+        compress_pickle.dump(self, path, compression="lz4")
         click.echo(f"[*] Model saved to {path}", err=True)
 
     @classmethod
     def load(cls, path: str) -> "WittenBellCharLM":
         """Deserialise a model from a pickle file."""
-        with open(path, "rb") as f:
-            obj = pickle.load(f)
+        obj = compress_pickle.load(path, compression="lz4")
         if not isinstance(obj, cls):
             raise TypeError(f"Expected {cls.__name__}, got {type(obj).__name__}")
         click.echo(f"[*] Model loaded from {path}", err=True)
@@ -237,6 +236,18 @@ def _load_or_prompt(wb_pkl: str | None) -> WittenBellCharLM:
 def build(train, output, n):
     """Train a WittenBell char LM and save it to a pickle file."""
     lm = _load_lm(train, n)
+    lm.save(output)
+
+
+@click.command("interact")
+@click.option("--wb-pkl", default=None, help="Path to a pre-built .pkl model")
+def interact(wb_pkl):
+    """Interactive playground for generation, scoring, and completion."""
+
+    lm = _load_or_prompt(wb_pkl)
+    # Store temperature in a local state for runtime config
+    state = {"temp": 1.0}
+    
     lm.save(output)
 
 

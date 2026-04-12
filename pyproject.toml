@@ -18,6 +18,7 @@ dependencies = [
     "tqdm",
     "xlsxwriter",
     "lingua-language-detector",
+    "compress-pickle[lz4]",
 ]
 
 [project.optional-dependencies]
