@@ -109,6 +109,7 @@ def build_row(
 def select_greedy(
     pool: list[CandidateRecord],
     max_sentences_per_lemma: int = 1,
+    verbose: bool = False,
 ) -> list[CandidateRecord]:
     """Greedy coverage selection over a pre-fetched pool."""
     lemma_usage_count: dict[str, int] = defaultdict(int)
@@ -132,10 +133,30 @@ def select_greedy(
             skipped += 1
 
     covered = sum(1 for v in lemma_usage_count.values() if v > 0)
+    all_lemmas = set(lemma_usage_count.keys())
+    saturated = sum(1 for v in lemma_usage_count.values() if v >= max_sentences_per_lemma)
+    density_counts = [len(r.matched_lemmas) for r in final]
+    avg_density = sum(density_counts) / len(density_counts) if density_counts else 0
+    multi_lemma = sum(1 for d in density_counts if d > 1)
+    uncovered_lemmas = sorted(all_lemmas - {l for r in final for l in r.matched_lemmas})
+
     click.echo(
-        f"Greedy: {len(final)} kept, {skipped} skipped. "
-        f"Covered {covered} unique lemmas."
+        f"\nGreedy selection summary"
+        f"\n  Pool size      : {len(pool)}"
+        f"\n  Kept           : {len(final)}  ({100 * len(final) / len(pool):.1f}%)"
+        f"\n  Skipped        : {skipped}"
+        f"\n  Unique lemmas  : {len(all_lemmas)}"
+        f"\n  Covered        : {covered}  ({100 * covered / len(all_lemmas):.1f}%)"
+        f"\n  Saturated      : {saturated}  (hit {max_sentences_per_lemma}-sentence cap)"
+        f"\n  Uncovered      : {len(uncovered_lemmas)}"
+        f"\n  Avg density    : {avg_density:.2f} lemmas/sentence"
+        f"\n  Multi-lemma    : {multi_lemma} sentences ({100 * multi_lemma / len(final):.1f}%)"
     )
+    if verbose and uncovered_lemmas:
+        click.echo("  Uncovered lemmas:")
+        for lemma in uncovered_lemmas:
+            click.echo(f"    - {lemma}")
+
     return final
 
 
@@ -167,15 +188,16 @@ def _record_to_row(rec: CandidateRecord) -> dict:
     show_default=True,
 )
 @click.option("--max-per-lemma", type=int, default=1, show_default=True)
+@click.option("--verbose-stats", is_flag=True, default=False, help="List uncovered lemmas.")
 @click.option("--results", type=int, default=0, show_default=True, help="0 = all")
 @click.option("--missing-placeholder", is_flag=True, default=False)
-def make_sheet(candidates, output, strategy, max_per_lemma, results, missing_placeholder):
+def make_sheet(candidates, output, strategy, max_per_lemma, results, missing_placeholder, verbose_stats):
     """Generate annotation sheet from a JSONL candidates file."""
     pool = _load_candidates(candidates)
     click.echo(f"Loaded {len(pool)} candidates from {candidates}.")
 
     if strategy == "greedy":
-        selected = select_greedy(pool, max_sentences_per_lemma=max_per_lemma)
+        selected = select_greedy(pool, max_sentences_per_lemma=max_per_lemma, verbose=verbose_stats)
     else:
         selected = select_top(pool, results=results)
 
@@ -196,7 +218,15 @@ def make_sheet(candidates, output, strategy, max_per_lemma, results, missing_pla
         click.echo(f"{len(all_lemmas - visited)} placeholder rows added.")
 
     write_sheet(rows, output)
-    click.echo(f"Written {len(rows)} rows to {output}.")
+    placeholder_count = sum(1 for r in rows if r.get("Cluster_ID") is None)
+    real_count = len(rows) - placeholder_count
+    click.echo(
+        f"\nOutput summary"
+        f"\n  File           : {output}"
+        f"\n  Total rows     : {len(rows)}"
+        f"\n  Real sentences : {real_count}"
+        f"\n  Placeholders   : {placeholder_count}"
+    )
 
 
 if __name__ == "__main__":
