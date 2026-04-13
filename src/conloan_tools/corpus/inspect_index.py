@@ -861,6 +861,8 @@ def cmd_lengths_sent(
     show_default=True,
 )
 @click.option("--bins",          default=20,     show_default=True)
+@click.option("--integer-bins",  is_flag=True,   default=False,
+              help="One bin per integer value (overrides --bins).")
 @click.option("--max-sentences", default=50_000, show_default=True,
               help="Cap sentences for sampling (0 = all).")
 @click.option("--show-excluded", is_flag=True, default=False,
@@ -869,14 +871,18 @@ def cmd_lengths_sent(
               help="Centre for sigma-range query.")
 @click.option("--sigma", default=None, type=float,
               help="Spread for sigma-range query; requires --mu.")
+@click.option("--percentile-of", "percentile_of", default=None, type=float,
+              help="Print the empirical percentile rank of this value.")
 def cmd_lengths_hist(
     path: str,
     variable: str,
     bins: int,
+    integer_bins: bool,
     max_sentences: int,
     show_excluded: bool,
     mu: float | None,
     sigma: float | None,
+    percentile_of: float | None,
 ) -> None:
     """ASCII histogram of sentence/word lengths from a lengths index."""
     if (mu is None) != (sigma is None):
@@ -904,7 +910,13 @@ def cmd_lengths_hist(
                 f"({n_excluded:,} excluded)"
             )
 
-    counts, edges = np.histogram(data, bins=bins)
+    if integer_bins:
+        lo_edge = int(data.min())
+        hi_edge = int(data.max()) + 1
+        bin_edges = np.arange(lo_edge, hi_edge + 1, dtype=np.float32)
+        counts, edges = np.histogram(data, bins=bin_edges)
+    else:
+        counts, edges = np.histogram(data, bins=bins)
     max_count = counts.max()
     bar_width = 50
 
@@ -943,4 +955,12 @@ def cmd_lengths_hist(
             f"\nσ-range  μ={mu:.4f}  σ={sigma:.4f}  "
             f"[{lo_q:.4f}, {hi_q:.4f}]  "
             f"→  {in_range:,} / {n_total:,}  =  {pct_in:.2f}%"
+        )
+
+    # percentile-of query
+    if percentile_of is not None:
+        pct = _pct(percentile_of)
+        click.echo(
+            f"\npercentile-of  value={percentile_of:.4f}  →  {pct:.2f}th percentile"
+            f"  ({int(pct / 100 * n_total):,} / {n_total:,} values ≤ {percentile_of:.4f})"
         )
