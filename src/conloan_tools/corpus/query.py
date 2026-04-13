@@ -582,7 +582,7 @@ def _render_code_switch_results(
             f"(len={res.score_length:.2f}"
             f"  lw={res.score_loanword:.2f}"
             f"  cs={res.score_code_switch:.2f}"
-            f"  alpha={scored.score_alpha:.2f}  "
+            f"  alpha={res.score_alpha:.2f}  "
             f"  ne={res.score_named_entity:.2f})"
             f"  | Pos: {run.sent_idx}  ID: {res.cqp_id}  {status}"
         )
@@ -1047,6 +1047,7 @@ def scan_anomaly_candidates(
     min_consecutive: int,
     lookup: int | None = None,
     allowed=None,
+    desc: str = "Scanning",
 ) -> list[tuple[int, list[int], list[float]]]:
     """
     Vectorized scan. Returns (sent_idx, token_indices, token_scores)
@@ -1056,15 +1057,33 @@ def scan_anomaly_candidates(
     if not records:
         return []
 
-    offsets = np.array([r.offset for r in records], dtype=np.int64)
-    counts  = np.array([r.count  for r in records], dtype=np.int32)
-    end_idx = int(offsets[-1]) + int(counts[-1])
-
-    flat = scores[:end_idx]
-
-    candidates = _scan_runs_vectorized(
-        flat, offsets, counts, threshold, min_consecutive, allowed=allowed
-    )
+    CHUNK = 50_000
+    candidates: list[tuple[int, list[int], list[float]]] = []
+    n = len(records)
+    with tqdm(total=n, desc=desc, unit="sent") as pbar:
+        for chunk_start in range(0, n, CHUNK):
+            chunk_end = min(chunk_start + CHUNK, n)
+            chunk_records = records[chunk_start:chunk_end]
+            offsets = np.array([r.offset for r in chunk_records], dtype=np.int64)
+            counts  = np.array([r.count  for r in chunk_records], dtype=np.int32)
+            chunk_flat_start = int(offsets[0])
+            end_idx = int(offsets[-1]) + int(counts[-1])
+            flat = scores[chunk_flat_start:end_idx]
+            offsets = offsets - chunk_flat_start
+            chunk_allowed = (
+                None
+                if allowed is None
+                else {i - chunk_start for i in allowed if chunk_start <= i < chunk_end}
+            )
+            chunk_hits = _scan_runs_vectorized(
+                flat, offsets, counts, threshold, min_consecutive,
+                allowed=chunk_allowed,
+            )
+            candidates.extend(
+                (sid + chunk_start, indices, token_scores)
+                for sid, indices, token_scores in chunk_hits
+            )
+            pbar.update(chunk_end - chunk_start)
 
     # Sort by run length descending (best first)
     candidates.sort(key=lambda x: len(x[1]), reverse=True)
@@ -1077,6 +1096,7 @@ def _ner_matching_sentences(
     want: set[int],
     exclude: set[int] | None = None,
     allowed: set[int] | None = None,
+    desc: str = "Scanning NER",
 ) -> list[int]:
     """
     Vectorized: return sorted sentence indices that contain any label in `want`
@@ -1085,29 +1105,38 @@ def _ner_matching_sentences(
     if not records:
         return []
 
-    offsets = np.array([r.offset for r in records], dtype=np.int64)
-    counts  = np.array([r.count  for r in records], dtype=np.int32)
-    end_idx = int(offsets[-1]) + int(counts[-1])
+    CHUNK = 50_000
+    want_arr = np.array(sorted(want), dtype=ner_labels.dtype)
+    excl_arr = (
+        np.array(sorted(exclude), dtype=ner_labels.dtype) if exclude else None
+    )
+    hit_sents:  set[int] = set()
+    excl_sents: set[int] = set()
+    n = len(records)
+    with tqdm(total=n, desc=desc, unit="sent") as pbar:
+        for chunk_start in range(0, n, CHUNK):
+            chunk_end = min(chunk_start + CHUNK, n)
+            chunk_records = records[chunk_start:chunk_end]
+            offsets  = np.array([r.offset for r in chunk_records], dtype=np.int64)
+            counts   = np.array([r.count  for r in chunk_records], dtype=np.int32)
+            chunk_flat_start = int(offsets[0])
+            end_idx  = int(offsets[-1]) + int(counts[-1])
+            flat     = ner_labels[chunk_flat_start:end_idx]
+            sent_ids = np.repeat(
+                np.arange(chunk_start, chunk_end, dtype=np.int32), counts
+            )
+            token_hits = np.isin(flat, want_arr)
+            if token_hits.any():
+                hit_sents |= set(np.unique(sent_ids[token_hits]).tolist())
+            if excl_arr is not None:
+                excl_hits = np.isin(flat, excl_arr)
+                if excl_hits.any():
+                    excl_sents |= set(np.unique(sent_ids[excl_hits]).tolist())
+            pbar.update(chunk_end - chunk_start)
 
-    flat     = ner_labels[:end_idx]
-    sent_ids = np.repeat(np.arange(len(records), dtype=np.int32), counts)
-
-    want_arr   = np.array(sorted(want), dtype=flat.dtype)
-    token_hits = np.isin(flat, want_arr)
-    if not token_hits.any():
-        return []
-
-    hit_sents = set(np.unique(sent_ids[token_hits]).tolist())
+    hit_sents -= excl_sents
     if allowed is not None:
         hit_sents &= allowed
-
-    if exclude:
-        excl_arr  = np.array(sorted(exclude), dtype=flat.dtype)
-        excl_hits = np.isin(flat, excl_arr)
-        if excl_hits.any():
-            excl_sents = set(np.unique(sent_ids[excl_hits]).tolist())
-            hit_sents -= excl_sents
-
     return sorted(hit_sents)
 
 
@@ -1168,22 +1197,22 @@ def find_code_switch_sequences(
         if not parsed:
             continue
 
-        detected_lang = None
-        if detector is not None:
-            span_set = set(token_indices)
-            context_text = " ".join(
-                t.word for i, t in enumerate(parsed.tokens)
-                if i not in span_set
-            )
-            lang = detector.detect_language_of(context_text)
-            detected_lang = lang.iso_code_639_1.name.lower() if lang else None
-
         n = len(parsed.tokens)
         valid_indices = [i for i in token_indices if i < n]
         valid_scores = [s for i, s in zip(token_indices, token_scores) if i < n]
 
         if len(valid_indices) < min_consecutive:
             continue
+
+        detected_lang = None
+        if detector is not None:
+            span_set = set(valid_indices)
+            context_text = " ".join(
+                t.word for i, t in enumerate(parsed.tokens)
+                if i not in span_set
+            )
+            lang = detector.detect_language_of(context_text)
+            detected_lang = lang.iso_code_639_1.name.lower() if lang else None
 
         cs_mask = [1 if i in set(valid_indices) else 0 for i in range(n)]
         lw_mask, _, ne_mask = build_masks(parsed, sent_idx, mask_src)
@@ -1576,6 +1605,7 @@ def query_lemmas_command(
         scoring_config=scoring_config,
         verbose=True,
         mask_src=mask_src,
+        lingua_lang=lingua_lang,
     )
 
     shown = found[:results] if results > 0 else found

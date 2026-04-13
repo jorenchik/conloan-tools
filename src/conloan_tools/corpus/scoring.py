@@ -129,6 +129,7 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "min_alpha_ratio":                 0.5,
         "filter_require_code_switch":      True,
         "filter_forbid_named_entity":      True,
+        "filter_require_context_lang":     "lv",
 
         "weight_code_switch":              0.33,
         "weight_length":                   0.33,
