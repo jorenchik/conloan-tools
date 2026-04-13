@@ -88,8 +88,7 @@ def _iter_ner_scores(
                 )
                 arr = np.array(
                     [
-                        row if is_clean_word(w, allow_ner=True) else np.zeros_like(row)
-                        for w, row in zip(words, rows)
+                        row for w, row in zip(words, rows)
                     ],
                     dtype=scores_dtype,
                 )
@@ -97,8 +96,7 @@ def _iter_ner_scores(
                 label_ids = t.argmax(dim=-1).cpu().numpy()
                 arr = np.array(
                     [
-                        int(lid) if is_clean_word(w, allow_ner=True) else 0
-                        for w, lid in zip(words, label_ids)
+                        int(lid) for w, lid in zip(words, label_ids)
                     ],
                     dtype=np.uint8,
                 )

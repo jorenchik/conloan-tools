@@ -116,11 +116,11 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "filter_require_loanword":         True,
         "filter_forbid_named_entity":      True,
 
-        "weight_length":                   0.33,
-        "weight_alpha":                    0.33,
-        "weight_loanword":                 0.33,
+        "weight_length":                   0.4,
+        "weight_alpha":                    0.4,
+        "weight_loanword":                 0.2,
 
-        "length_mu":                       21, # real median
+        "length_mu":                       30, # real median
         "length_sigma":                    10, # 15.6 real sigma -> 10
     },
     QueryProfile.CODE_SWITCH: {
@@ -134,7 +134,7 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_length":                   0.33,
         "weight_alpha":                    0.33,
 
-        "length_mu":                       21,
+        "length_mu":                       30,
         "length_sigma":                    10,
 
         "code_switch_mu":                  0.30,
@@ -150,7 +150,7 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_length":                   0.33,
         "weight_alpha":                    0.33,
 
-        "length_mu":                       21,
+        "length_mu":                       30,
         "length_sigma":                    10,
 
         "named_entity_mu":                 0.30,
