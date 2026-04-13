@@ -110,7 +110,7 @@ class ScoredResult:
 
 _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
     QueryProfile.LEMMAS: {
-        "min_tokens":                      5,
+        "min_tokens":                      8,
         "max_tokens":                      128,
         "min_alpha_ratio":                 0.5,
         "filter_require_loanword":         True,
@@ -120,8 +120,8 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_alpha":                    0.33,
         "weight_loanword":                 0.33,
 
-        "length_mu":                       20,
-        "length_sigma":                    10,
+        "length_mu":                       21, # real median
+        "length_sigma":                    10, # 15.6 real sigma -> 10
     },
     QueryProfile.CODE_SWITCH: {
         "min_tokens":                      5,
@@ -134,7 +134,7 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_length":                   0.33,
         "weight_alpha":                    0.33,
 
-        "length_mu":                       20,
+        "length_mu":                       21,
         "length_sigma":                    10,
 
         "code_switch_mu":                  0.30,
@@ -150,7 +150,7 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_length":                   0.33,
         "weight_alpha":                    0.33,
 
-        "length_mu":                       20,
+        "length_mu":                       21,
         "length_sigma":                    10,
 
         "named_entity_mu":                 0.30,
