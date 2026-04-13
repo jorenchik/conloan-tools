@@ -264,7 +264,7 @@ class MaskSources:
     ner_exclude: Optional[set[int]] = None
     lw_lemmas: Optional[set[str]] = None
     ner_confidence: Optional[np.ndarray] = None
-    ner_confidence_threshold: float = 0.0
+    ner_confidence_thresholds: dict[str, float] = field(default_factory=dict)
     ner_ignore_labels: set[str] = field(default_factory=set)
 
 
@@ -522,13 +522,15 @@ def _apply_ner_confidence_filter(
     labels: np.ndarray,
     confidence: np.ndarray,
     o_id: int,
-    threshold: float,
+    id2label: dict[int, str],
+    thresholds: dict[str, float],
 ) -> np.ndarray:
     """
-    Return a copy of `labels` where any run of non-O tokens whose first
-    token has confidence < threshold is entirely replaced with o_id.
+    Return a copy of `labels` where any run of non-O tokens whose first token
+    has confidence below the label-specific threshold is replaced with o_id.
+    Labels not present in `thresholds` are left untouched.
     """
-    if threshold <= 0.0:
+    if not thresholds:
         return labels
 
     out = labels.copy()
@@ -542,9 +544,25 @@ def _apply_ner_confidence_filter(
         while i < n and out[i] != o_id:
             i += 1
         run_end = i  # exclusive
-        if confidence[run_start] < threshold:
+        label_name = id2label.get(int(out[run_start]), "O")
+        thr = thresholds.get(label_name)
+        if thr is not None and confidence[run_start] < thr:
             out[run_start:run_end] = o_id
     return out
+
+def _parse_label_thresholds(raw: tuple[str, ...]) -> dict[str, float]:
+    """Parse ('MISC:0.8', 'ORG:0.6') into {'MISC': 0.8, 'ORG': 0.6}."""
+    result = {}
+    for entry in raw:
+        try:
+            label, val = entry.rsplit(":", 1)
+            result[label.strip()] = float(val)
+        except ValueError:
+            raise click.UsageError(
+                f"Invalid --ner-confidence-threshold: {entry!r}. "
+                "Expected format LABEL:VALUE (e.g. MISC:0.8)."
+            )
+    return result
 
 
 def _render_code_switch_results(
@@ -590,14 +608,14 @@ def load_mask_sources(
     surprisal_h5: Optional[Path] = None,
     surprisal_threshold: float = 0.0,
     ner_h5: Optional[Path] = None,
-    ner_confidence_threshold: float = 0.0,
+    ner_confidence_thresholds: dict[str, float] = {},
     loanword_file: Optional[Path] = None,
     ner_ignore_labels: set[str] = frozenset(),
 ) -> MaskSources:
     """Load all optional index files into a MaskSources bundle."""
     src = MaskSources(
         surprisal_threshold=surprisal_threshold,
-        ner_confidence_threshold=ner_confidence_threshold,
+        ner_confidence_thresholds=ner_confidence_thresholds,
         ner_ignore_labels=set(ner_ignore_labels),
     )
 
@@ -611,7 +629,7 @@ def load_mask_sources(
         src.ner_labels, src.ner_confidence, src.ner_records, src.ner_id2label, src.ner_cpos = (
             _load_ner_labels(ner_h5)
         )
-        if ner_confidence_threshold > 0.0:
+        if ner_confidence_thresholds:
             if src.ner_confidence is None:
                 raise click.UsageError(
                     "--ner-confidence-threshold requires logits-mode NER index "
@@ -619,12 +637,12 @@ def load_mask_sources(
                 )
             o_id = next(k for k, v in src.ner_id2label.items() if v == "O")
             click.echo(
-                f"[*] Applying NER confidence filter "
-                f"(threshold={ner_confidence_threshold:.2f})",
+                f"[*] Applying per-label NER confidence filter: {ner_confidence_thresholds}",
                 err=True,
             )
             src.ner_labels = _apply_ner_confidence_filter(
-                src.ner_labels, src.ner_confidence, o_id, ner_confidence_threshold
+                src.ner_labels, src.ner_confidence, o_id,
+                src.ner_id2label, ner_confidence_thresholds,
             )
 
     if surprisal_h5 is not None and ner_h5 is not None:
@@ -1197,13 +1215,12 @@ def mask_source_options(f):
     --ner-h5, and --loanwords to a command."""
     f = click.option(
         "--ner-confidence-threshold",
-        "ner_confidence_threshold",
-        type=float,
-        default=0.0,
-        show_default=True,
+        "ner_confidence_thresholds",
+        multiple=True,
+        default=[],
         help=(
-            "Discard any NER span whose first token has softmax confidence "
-            "below this value [0-1]. Requires logits-mode NER index."
+            "Label-specific confidence threshold: LABEL:VALUE "
+            "(e.g. MISC:0.8). Repeatable. Requires logits-mode NER index."
         ),
     )(f)
     f = click.option(
@@ -1395,7 +1412,7 @@ def query_code_switch(
     ner_h5,
     loanword_file,
     ner_ignore_labels,
-    ner_confidence_threshold,
+    ner_confidence_thresholds,
     lingua_lang,
     lookup,
     results,
@@ -1413,7 +1430,7 @@ def query_code_switch(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
         ner_h5=ner_h5,
-        ner_confidence_threshold=ner_confidence_threshold,
+        ner_confidence_thresholds=_parse_label_thresholds(ner_confidence_thresholds),
         loanword_file=loanword_file,
         ner_ignore_labels=set(ner_ignore_labels),
 
@@ -1525,7 +1542,7 @@ def query_lemmas_command(
     surprisal_h5,
     surprisal_threshold,
     ner_h5,
-    ner_confidence_threshold,
+    ner_confidence_thresholds,
     loanword_file,
     ner_ignore_labels,
     lingua_lang,
@@ -1536,7 +1553,7 @@ def query_lemmas_command(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
         ner_h5=ner_h5,
-        ner_confidence_threshold=ner_confidence_threshold,
+        ner_confidence_thresholds=_parse_label_thresholds(ner_confidence_thresholds),
         loanword_file=loanword_file,
         ner_ignore_labels=ner_ignore_labels,
     )
@@ -1655,7 +1672,7 @@ def query_ner_entities(
     corpus_name, ner_h5, labels, excl_labels,
     lookup, results, cqp_bin, registry_dir, seed, scoring_config,
     surprisal_h5, surprisal_threshold, ner_ignore_labels, loanword_file,
-    ner_confidence_threshold, lingua_lang, output, sequential,
+    ner_confidence_thresholds, lingua_lang, output, sequential,
 ):
     """Find named entity sentences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.NER)
@@ -1665,7 +1682,7 @@ def query_ner_entities(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
         loanword_file=loanword_file,
-        ner_confidence_threshold=ner_confidence_threshold,
+        ner_confidence_thresholds=_parse_label_thresholds(ner_confidence_thresholds),
         ner_ignore_labels=ner_ignore_labels,
     )
 
@@ -1677,7 +1694,8 @@ def query_ner_entities(
     mask_src.ner_id2label = id2label
     mask_src.ner_cpos     = ner_cpos
 
-    if ner_confidence_threshold > 0.0:
+    thresholds = _parse_label_thresholds(ner_confidence_thresholds)
+    if thresholds:
         if ner_confidence is None:
             raise click.UsageError(
                 "--ner-confidence-threshold requires logits-mode NER index "
@@ -1685,12 +1703,11 @@ def query_ner_entities(
             )
         o_id = next(k for k, v in id2label.items() if v == "O")
         click.echo(
-            f"[*] Applying NER confidence filter "
-            f"(threshold={ner_confidence_threshold:.2f})",
+            f"[*] Applying per-label NER confidence filter: {thresholds}",
             err=True,
         )
         mask_src.ner_labels = _apply_ner_confidence_filter(
-            ner_labels, ner_confidence, o_id, ner_confidence_threshold
+            ner_labels, ner_confidence, o_id, id2label, thresholds
         )
 
     if surprisal_h5 is not None and mask_src.surprisal_records is not None:
