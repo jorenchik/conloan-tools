@@ -162,7 +162,7 @@ def _tag_code_switch_sentence(run: CodeSwitchRun) -> str:
 
 
 def tag_all_loanwords(parsed_result, lemma_set_lower, primary_lemma):
-    """Tag all loanwords in sentence with L1, L2, L3…"""
+    """Tag all loanwords in sentence with L1, L2, L3… (each token individually)."""
     if parsed_result is None:
         return None
 
@@ -182,8 +182,15 @@ def tag_all_loanwords(parsed_result, lemma_set_lower, primary_lemma):
     for tag_num, (pos, _, _) in enumerate(loanword_positions, start=1):
         tag_map[pos] = tag_num
 
-    tagged = [(t.word, i in tag_map) for i, t in enumerate(parsed_result.tokens)]
-    return _collapse_spans(tagged, "L")
+    parts = []
+    for i, t in enumerate(parsed_result.tokens):
+        if i in tag_map:
+            n = tag_map[i]
+            parts.append(f"<L{n}>{t.word}</L{n}>")
+        else:
+            parts.append(t.word)
+
+    return " ".join(parts)
 
 
 def _tag_ner_sentence(
