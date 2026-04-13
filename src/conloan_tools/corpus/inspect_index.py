@@ -865,14 +865,24 @@ def cmd_lengths_sent(
               help="Cap sentences for sampling (0 = all).")
 @click.option("--show-excluded", is_flag=True, default=False,
               help="Add a bar for sentinel-excluded tokens.")
+@click.option("--mu",    default=None, type=float,
+              help="Centre for sigma-range query.")
+@click.option("--sigma", default=None, type=float,
+              help="Spread for sigma-range query; requires --mu.")
 def cmd_lengths_hist(
     path: str,
     variable: str,
     bins: int,
     max_sentences: int,
     show_excluded: bool,
+    mu: float | None,
+    sigma: float | None,
 ) -> None:
     """ASCII histogram of sentence/word lengths from a lengths index."""
+    if (mu is None) != (sigma is None):
+        click.echo("Error: --mu and --sigma must be provided together.", err=True)
+        sys.exit(1)
+
     with _open_h5(path) as f:
         _require_lengths(f, path)
 
@@ -894,17 +904,43 @@ def cmd_lengths_hist(
                 f"({n_excluded:,} excluded)"
             )
 
-        counts, edges = np.histogram(data, bins=bins)
-        max_count = counts.max()
-        bar_width = 50
+    counts, edges = np.histogram(data, bins=bins)
+    max_count = counts.max()
+    bar_width = 50
 
-        click.echo(f"mean={data.mean():.4f}  std={data.std():.4f}  "
-                   f"median={float(np.median(data)):.4f}\n")
+    # empirical CDF for per-bin percentiles
+    sorted_data = np.sort(data)
+    n_total     = len(sorted_data)
 
-        for i, c in enumerate(counts):
-            bar = "█" * int(c / max_count * bar_width)
-            lo, hi = edges[i], edges[i + 1]
-            click.echo(f"  {lo:>7.2f} – {hi:<7.2f}  {bar:<{bar_width}}  {c:>8,}")
+    def _pct(value: float) -> float:
+        """Empirical percentile rank of `value` in sorted_data."""
+        return float(np.searchsorted(sorted_data, value, side="right")) / n_total * 100.0
 
-        if show_excluded and variable != "sent_len":
-            click.echo(f"\n  {'excl':>7}         {'░' * int(n_excluded / max_count * bar_width):<{bar_width}}  {n_excluded:>8,}")
+    click.echo(f"mean={data.mean():.4f}  std={data.std():.4f}  "
+               f"median={float(np.median(data)):.4f}\n")
+
+    for i, c in enumerate(counts):
+        bar  = "█" * int(c / max_count * bar_width)
+        lo, hi = edges[i], edges[i + 1]
+        p_lo = _pct(lo)
+        p_hi = _pct(hi)
+        click.echo(
+            f"  {lo:>7.2f} – {hi:<7.2f}  "
+            f"[{p_lo:>5.1f}% – {p_hi:>5.1f}%]  "
+            f"{bar:<{bar_width}}  {c:>8,}"
+        )
+
+    if show_excluded and variable != "sent_len":
+        click.echo(f"\n  {'excl':>7}         {'░' * int(n_excluded / max_count * bar_width):<{bar_width}}  {n_excluded:>8,}")
+
+    # sigma-range query
+    if mu is not None:
+        lo_q = mu - sigma
+        hi_q = mu + sigma
+        in_range = int(((sorted_data >= lo_q) & (sorted_data <= hi_q)).sum())
+        pct_in   = in_range / n_total * 100.0
+        click.echo(
+            f"\nσ-range  μ={mu:.4f}  σ={sigma:.4f}  "
+            f"[{lo_q:.4f}, {hi_q:.4f}]  "
+            f"→  {in_range:,} / {n_total:,}  =  {pct_in:.2f}%"
+        )
