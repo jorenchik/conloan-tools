@@ -93,6 +93,7 @@ class CandidateRecord:
     filter_reason: str | None
     matched_lemmas: list[str]
     tag_map: dict[str, str]  # e.g. {"L1": "computer", "CS1": "boot"}
+    token_surprisals: dict[str, float] = field(default_factory=dict)
 
 
 def _write_record(record: CandidateRecord, fh) -> None:
@@ -222,6 +223,7 @@ def _result_to_record(
     scored: ScoredResult,
     matched_lemmas: list[str],
     tag_map: dict[str, str],
+    token_surprisals: dict[str, float],
     cpos: int,
     spos: int | None,
     seed: int | None,
@@ -243,6 +245,8 @@ def _result_to_record(
         filter_reason=scored.filter_reason,
         matched_lemmas=matched_lemmas,
         tag_map=tag_map,
+        token_surprisals=token_surprisals,
+
     )
 
 
@@ -587,17 +591,12 @@ def _render_code_switch_results(
             f"  | Pos: {run.sent_idx}  ID: {res.cqp_id}  {status}"
         )
 
-        parts = [
-            f"[{t.word}]" if i in index_set else t.word
-            for i, t in enumerate(run.tokens)
-        ]
-        click.echo(" ".join(parts))
-
-        run_details = "  ".join(
-            f"{run.tokens[i].word}({s:.2f})"
-            for i, s in zip(run.token_indices, run.token_scores)
+        surp_parts = "  ".join(
+            f"{tag}={word!r} surprisal={rec.token_surprisals.get(tag, 0.0):.3f}"
+            for tag, word in rec.tag_map.items()
+            if tag.startswith("CS")
         )
-        click.echo(f"  ↳ run: {run_details}")
+        click.echo(f"  ↳ surprisal: [{surp_parts}]")
         click.echo("-" * 60)
 
     click.echo(f"({len(results)} sequences shown)")
@@ -1395,6 +1394,13 @@ def _render_candidates(records: list[CandidateRecord]) -> None:
         click.echo(rec.sentence)
         if rec.tag_map:
             click.echo(f"  ↳ tags: {rec.tag_map}")
+        if rec.token_surprisals:
+            surp_parts = "  ".join(
+                f"{tag}={word!r} surprisal={rec.token_surprisals.get(tag, 0.0):.3f}"
+                for tag, word in rec.tag_map.items()
+                if tag.startswith("CS")
+            )
+            click.echo(f"  ↳ surprisal: [{surp_parts}]")
         click.echo("-" * 60)
 
 
@@ -1508,12 +1514,20 @@ def query_code_switch(
                 for i, idx in enumerate(run.token_indices)
                 if idx < len(run.tokens)
             }
+            token_surprisals = {
+                f"CS{i+1}": s
+                for i, (idx, s) in enumerate(
+                    zip(run.token_indices, run.token_scores)
+                )
+                if idx < len(run.tokens)
+            }
             rec = _result_to_record(
                 mode="code_switch",
                 sentence=sentence,
                 scored=run.metrics,
                 matched_lemmas=matched,
                 tag_map=tag_map,
+                token_surprisals=token_surprisals,
                 cpos=run.metrics.cqp_id,
                 spos=run.sent_idx,
                 seed=seed,
@@ -1627,6 +1641,7 @@ def query_lemmas_command(
                 scored=r,
                 matched_lemmas=matched,
                 tag_map=tag_map,
+                token_surprisals={},
                 cpos=r.cqp_id,
                 spos=None,
                 seed=seed,
@@ -1860,6 +1875,7 @@ def query_ner_entities(
                 scored=scored,
                 matched_lemmas=matched,
                 tag_map=tag_map,
+                token_surprisals={},
                 cpos=scored.cqp_id,
                 spos=sent_idx,
                 seed=seed,
