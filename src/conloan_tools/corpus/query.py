@@ -5,6 +5,7 @@ import os
 import tempfile
 import click
 import json
+from scipy.special import softmax
 from typing import List, Optional, Tuple, Literal, Iterator
 import re
 from pathlib import Path
@@ -262,6 +263,8 @@ class MaskSources:
     ner_id2label: Optional[dict[int, str]] = None
     ner_exclude: Optional[set[int]] = None
     lw_lemmas: Optional[set[str]] = None
+    ner_confidence: Optional[np.ndarray] = None
+    ner_confidence_threshold: float = 0.0
     ner_ignore_labels: set[str] = field(default_factory=set)
 
 
@@ -461,7 +464,7 @@ def _load_index_records(
 
 def _load_ner_labels(
     h5_path: Path,
-) -> tuple[np.ndarray, list[IndexRecord], dict[int, str], np.ndarray]:
+) -> tuple[np.ndarray, Optional[np.ndarray], list[IndexRecord], dict[int, str], np.ndarray]:
     with h5py.File(h5_path, "r") as f:
         ner_output   = f.attrs.get("ner_output", "labels")
         cpos         = f["index"]["cpos"][:]
@@ -481,15 +484,20 @@ def _load_ner_labels(
                 )
             n_tokens, n_labels = ds.shape
             labels = np.empty(n_tokens, dtype=np.uint8)
+            confidence = np.empty(n_tokens, dtype=np.float32)
             chunk = ds.chunks[0] if ds.chunks else _CHUNK_TOKENS
             with tqdm(total=n_tokens, unit="tok", desc=f"Loading NER logits {h5_path.name}", leave=False) as pbar:
                 for start in range(0, n_tokens, chunk):
                     end = min(start + chunk, n_tokens)
-                    labels[start:end] = np.argmax(ds[start:end], axis=-1).astype(np.uint8)
+                    chunk_logits = ds[start:end]
+                    probs = softmax(chunk_logits.astype(np.float32), axis=-1)
+                    labels[start:end]     = np.argmax(probs, axis=-1).astype(np.uint8)
+                    confidence[start:end] = probs.max(axis=-1)
                     pbar.update(end - start)
         elif ner_output == "labels":
             labels = np.empty(ds.shape[0], dtype=np.uint8)
             _chunked_read(ds, labels, f"Loading NER labels {h5_path.name}")
+            confidence = None
         else:
             raise click.UsageError(
                 f"{h5_path.name}: unknown ner_output='{ner_output}'."
@@ -507,7 +515,36 @@ def _load_ner_labels(
         f"labels={sorted(set(id2label.values()))}",
         err=True,
     )
-    return labels, records, id2label, cpos
+    return labels, confidence, records, id2label, cpos
+
+
+def _apply_ner_confidence_filter(
+    labels: np.ndarray,
+    confidence: np.ndarray,
+    o_id: int,
+    threshold: float,
+) -> np.ndarray:
+    """
+    Return a copy of `labels` where any run of non-O tokens whose first
+    token has confidence < threshold is entirely replaced with o_id.
+    """
+    if threshold <= 0.0:
+        return labels
+
+    out = labels.copy()
+    n = len(out)
+    i = 0
+    while i < n:
+        if out[i] == o_id:
+            i += 1
+            continue
+        run_start = i
+        while i < n and out[i] != o_id:
+            i += 1
+        run_end = i  # exclusive
+        if confidence[run_start] < threshold:
+            out[run_start:run_end] = o_id
+    return out
 
 
 def _render_code_switch_results(
@@ -553,12 +590,14 @@ def load_mask_sources(
     surprisal_h5: Optional[Path] = None,
     surprisal_threshold: float = 0.0,
     ner_h5: Optional[Path] = None,
+    ner_confidence_threshold: float = 0.0,
     loanword_file: Optional[Path] = None,
     ner_ignore_labels: set[str] = frozenset(),
 ) -> MaskSources:
     """Load all optional index files into a MaskSources bundle."""
     src = MaskSources(
         surprisal_threshold=surprisal_threshold,
+        ner_confidence_threshold=ner_confidence_threshold,
         ner_ignore_labels=set(ner_ignore_labels),
     )
 
@@ -569,7 +608,24 @@ def load_mask_sources(
 
     if ner_h5 is not None:
         click.echo(f"[*] Loading NER index: {ner_h5}", err=True)
-        src.ner_labels, src.ner_records, src.ner_id2label, src.ner_cpos = _load_ner_labels(ner_h5)
+        src.ner_labels, src.ner_confidence, src.ner_records, src.ner_id2label, src.ner_cpos = (
+            _load_ner_labels(ner_h5)
+        )
+        if ner_confidence_threshold > 0.0:
+            if src.ner_confidence is None:
+                raise click.UsageError(
+                    "--ner-confidence-threshold requires logits-mode NER index "
+                    "(ner_output=logits); got pre-computed labels."
+                )
+            o_id = next(k for k, v in src.ner_id2label.items() if v == "O")
+            click.echo(
+                f"[*] Applying NER confidence filter "
+                f"(threshold={ner_confidence_threshold:.2f})",
+                err=True,
+            )
+            src.ner_labels = _apply_ner_confidence_filter(
+                src.ner_labels, src.ner_confidence, o_id, ner_confidence_threshold
+            )
 
     if surprisal_h5 is not None and ner_h5 is not None:
         _assert_index_alignment(src.surprisal_records, src.ner_records)
@@ -1140,6 +1196,17 @@ def mask_source_options(f):
     """Decorator that adds --surprisal-h5, --surprisal-threshold,
     --ner-h5, and --loanwords to a command."""
     f = click.option(
+        "--ner-confidence-threshold",
+        "ner_confidence_threshold",
+        type=float,
+        default=0.0,
+        show_default=True,
+        help=(
+            "Discard any NER span whose first token has softmax confidence "
+            "below this value [0-1]. Requires logits-mode NER index."
+        ),
+    )(f)
+    f = click.option(
         "--loanwords",
         "loanword_file",
         type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -1328,6 +1395,7 @@ def query_code_switch(
     ner_h5,
     loanword_file,
     ner_ignore_labels,
+    ner_confidence_threshold,
     lingua_lang,
     lookup,
     results,
@@ -1345,8 +1413,10 @@ def query_code_switch(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
         ner_h5=ner_h5,
+        ner_confidence_threshold=ner_confidence_threshold,
         loanword_file=loanword_file,
         ner_ignore_labels=set(ner_ignore_labels),
+
     )
 
     if mask_src.surprisal_scores is None:
@@ -1455,6 +1525,7 @@ def query_lemmas_command(
     surprisal_h5,
     surprisal_threshold,
     ner_h5,
+    ner_confidence_threshold,
     loanword_file,
     ner_ignore_labels,
     lingua_lang,
@@ -1465,6 +1536,7 @@ def query_lemmas_command(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
         ner_h5=ner_h5,
+        ner_confidence_threshold=ner_confidence_threshold,
         loanword_file=loanword_file,
         ner_ignore_labels=ner_ignore_labels,
     )
@@ -1583,7 +1655,7 @@ def query_ner_entities(
     corpus_name, ner_h5, labels, excl_labels,
     lookup, results, cqp_bin, registry_dir, seed, scoring_config,
     surprisal_h5, surprisal_threshold, ner_ignore_labels, loanword_file,
-    lingua_lang, output, sequential,
+    ner_confidence_threshold, lingua_lang, output, sequential,
 ):
     """Find named entity sentences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.NER)
@@ -1593,15 +1665,33 @@ def query_ner_entities(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
         loanword_file=loanword_file,
+        ner_confidence_threshold=ner_confidence_threshold,
         ner_ignore_labels=ner_ignore_labels,
     )
 
     click.echo("[*] Loading NER index...", err=True)
-    ner_labels, ner_records, id2label, ner_cpos = _load_ner_labels(ner_h5)
+    ner_labels, ner_confidence, ner_records, id2label, ner_cpos = _load_ner_labels(ner_h5)
     mask_src.ner_labels   = ner_labels
+    mask_src.ner_confidence = ner_confidence
     mask_src.ner_records  = ner_records
     mask_src.ner_id2label = id2label
     mask_src.ner_cpos     = ner_cpos
+
+    if ner_confidence_threshold > 0.0:
+        if ner_confidence is None:
+            raise click.UsageError(
+                "--ner-confidence-threshold requires logits-mode NER index "
+                "(ner_output=logits); got pre-computed labels."
+            )
+        o_id = next(k for k, v in id2label.items() if v == "O")
+        click.echo(
+            f"[*] Applying NER confidence filter "
+            f"(threshold={ner_confidence_threshold:.2f})",
+            err=True,
+        )
+        mask_src.ner_labels = _apply_ner_confidence_filter(
+            ner_labels, ner_confidence, o_id, ner_confidence_threshold
+        )
 
     if surprisal_h5 is not None and mask_src.surprisal_records is not None:
         _assert_index_alignment(mask_src.surprisal_records, ner_records)
@@ -1658,7 +1748,7 @@ def query_ner_entities(
         f"[*] Scanning {len(ner_records)} sentences for matching labels...",
         err=True,
     )
-    matching = _ner_matching_sentences(ner_labels, ner_records, want, exclude, allowed=allowed)
+    matching = _ner_matching_sentences(mask_src.ner_labels, ner_records, want, exclude, allowed=allowed)
     click.echo(f"[*] Found {len(matching)} candidate sentence(s)", err=True)
 
     if not matching:
@@ -1698,7 +1788,7 @@ def query_ner_entities(
             cfg=cfg,
         )
         sentence = _tag_ner_sentence(
-            parsed, sent_idx, ner_labels, ner_records, id2label, want
+            parsed, sent_idx, mask_src.ner_labels, ner_records, id2label, want
         )
         scored_results.append((scored, sentence, sent_idx))
 
@@ -1710,7 +1800,7 @@ def query_ner_entities(
     with _output_context(output) as fh:
         for scored, sentence, sent_idx in shown:
             record = ner_records[sent_idx]
-            chunk = ner_labels[record.offset : record.offset + record.count]
+            chunk = mask_src.ner_labels[record.offset : record.offset + record.count]
             matched = [
                 id2label[int(chunk[i])]
                 for i, t in enumerate(sentence_map[sent_idx].tokens)
