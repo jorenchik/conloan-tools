@@ -120,8 +120,8 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_alpha":                    0.33,
         "weight_loanword":                 0.33,
 
-        "code_switch_mu":                  21,
-        "code_switch_sigma":               15,
+        "length_mu":                       20,
+        "length_sigma":                    10,
     },
     QueryProfile.CODE_SWITCH: {
         "min_tokens":                      5,
@@ -134,8 +134,11 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_length":                   0.33,
         "weight_alpha":                    0.33,
 
-        "length_mu":                       0.30,
-        "length_sigma":                    0.15,
+        "length_mu":                       20,
+        "length_sigma":                    10,
+
+        "code_switch_mu":                  0.30,
+        "code_switch_sigma":               0.15,
     },
     QueryProfile.NER: {
         "min_tokens":                      5,
@@ -146,6 +149,9 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_named_entity":             0.33,
         "weight_length":                   0.33,
         "weight_alpha":                    0.33,
+
+        "length_mu":                       20,
+        "length_sigma":                    10,
 
         "named_entity_mu":                 0.30,
         "named_entity_sigma":              0.15,
