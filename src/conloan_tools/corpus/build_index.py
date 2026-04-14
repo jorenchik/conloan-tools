@@ -31,7 +31,7 @@ def _iter_surprisal_scores(
     limit_mb: float | None,
 ):
     """
-    Yields (cpos, mean_arr, max_arr, dm_sigma_arr, dm_mad_arr) per sentence.
+    Yields (cpos, mean_arr, dm_mad_arr) per sentence.
 
     All arrays are float16 with shape (n_tokens,).
     Tokens excluded by is_clean_word are stored as 0.0 in every array.
@@ -46,8 +46,6 @@ def _iter_surprisal_scores(
     ):
         n = len(tokens)
         mean_arr     = np.zeros(n, dtype=np.float16)
-        max_arr      = np.zeros(n, dtype=np.float16)
-        dm_sigma_arr = np.zeros(n, dtype=np.float16)
         dm_mad_arr   = np.zeros(n, dtype=np.float16)
 
         clean_idx: list[int]        = []
@@ -60,16 +58,13 @@ def _iter_surprisal_scores(
             clean_idx.append(i)
             clean_bscores.append(bs)
             mean_arr[i] = float(bs.mean())
-            max_arr[i]  = float(bs.max())
 
         if clean_bscores:
-            dm_s = WittenBellCharLM.reduce_dm_sigma(clean_bscores)  # float16
             dm_m = WittenBellCharLM.reduce_dm_mad(clean_bscores)    # float16
             for j, i in enumerate(clean_idx):
-                dm_sigma_arr[i] = dm_s[j]
                 dm_mad_arr[i]   = dm_m[j]
 
-        yield cpos, mean_arr, max_arr, dm_sigma_arr, dm_mad_arr
+        yield cpos, mean_arr, dm_mad_arr
 
 
 def _iter_ner_scores(
@@ -339,7 +334,7 @@ def _create_surprisal_hdf5(
 
     to = _ds_opts((_CHUNK_TOKENS,))
     sc = f.create_group("scores")
-    for col in ("mean", "max", "dm_sigma", "dm_mad"):
+    for col in ("mean", "dm_mad"):
         sc.create_dataset(col, shape=(0,), maxshape=(None,), dtype=np.float16, **to)
 
     return f
@@ -351,8 +346,6 @@ def _surprisal_flush(
     count_buf: list[int],
     spos_buf: list[int] | None,
     mean_buf: list[np.ndarray],
-    max_buf: list[np.ndarray],
-    dm_sigma_buf: list[np.ndarray],
     dm_mad_buf: list[np.ndarray],
     store_spos: bool,
 ) -> None:
@@ -372,15 +365,12 @@ def _surprisal_flush(
 
     sc = f["scores"]
     _append(sc["mean"],     np.concatenate(mean_buf).astype(np.float16))
-    _append(sc["max"],      np.concatenate(max_buf).astype(np.float16))
-    _append(sc["dm_sigma"], np.concatenate(dm_sigma_buf).astype(np.float16))
     _append(sc["dm_mad"],   np.concatenate(dm_mad_buf).astype(np.float16))
 
     cpos_buf.clear(); count_buf.clear()
     if spos_buf is not None:
         spos_buf.clear()
-    mean_buf.clear(); max_buf.clear()
-    dm_sigma_buf.clear(); dm_mad_buf.clear()
+    mean_buf.clear(); dm_mad_buf.clear()
 
 
 def _build_surprisal_index_from_iter(
@@ -393,31 +383,27 @@ def _build_surprisal_index_from_iter(
     count_buf:    list[int]        = []
     spos_buf:     list[int] | None = [] if store_spos else None
     mean_buf:     list[np.ndarray] = []
-    max_buf:      list[np.ndarray] = []
-    dm_sigma_buf: list[np.ndarray] = []
     dm_mad_buf:   list[np.ndarray] = []
     spos = 0
 
-    for cpos, mean_arr, max_arr, dm_sigma_arr, dm_mad_arr in score_iter:
+    for cpos, mean_arr, dm_mad_arr in score_iter:
         cpos_buf.append(cpos)
         count_buf.append(mean_arr.shape[0])
         if spos_buf is not None:
             spos_buf.append(spos)
         mean_buf.append(mean_arr)
-        max_buf.append(max_arr)
-        dm_sigma_buf.append(dm_sigma_arr)
         dm_mad_buf.append(dm_mad_arr)
         spos += 1
 
         if len(cpos_buf) >= flush_every:
             _surprisal_flush(
                 f, cpos_buf, count_buf, spos_buf,
-                mean_buf, max_buf, dm_sigma_buf, dm_mad_buf, store_spos,
+                mean_buf, dm_mad_buf, store_spos,
             )
 
     _surprisal_flush(
         f, cpos_buf, count_buf, spos_buf,
-        mean_buf, max_buf, dm_sigma_buf, dm_mad_buf, store_spos,
+        mean_buf, dm_mad_buf, store_spos,
     )
 
 
@@ -472,7 +458,7 @@ def build_surprisal_index(
     meta = {
         "type":       "surprisal",
         "input":      str(input_path),
-        "scores":     ["mean", "max", "dm_sigma", "dm_mad"],
+        "scores":     ["mean", "dm_mad"],
         "n":          lm.n,
         "model":      "WittenBellCharLM",
         "date":       datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -581,7 +567,7 @@ def build_surprisal_index_command(
     wb_pkl, input_path, output_dir, name,
     no_spos, limit_lines, limit_sentences, limit_mb,
 ):
-    """Score every token with mean, max, dm_sigma, dm_mad surprisal. Streams to HDF5."""
+    """Score every token with mean and dm_mad surprisal. Streams to HDF5."""
     lm = WittenBellCharLM.load(wb_pkl)
     h5_path = build_surprisal_index(
         lm=lm,

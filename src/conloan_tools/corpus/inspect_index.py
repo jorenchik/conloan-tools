@@ -10,7 +10,7 @@ import numpy as np
 from tqdm import tqdm
 
 _LEN_SENTINEL = 255
-_SURPRISAL_COLS = ("mean", "max", "dm_sigma", "dm_mad")
+_SURPRISAL_COLS = ("mean", "dm_mad")
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ def _fmt_scores_1d(
 
 def _fmt_surprisal(arr: np.ndarray, head_tokens: int) -> list[str]:
     """
-    arr: (n_tokens, 4) float16, columns = _SURPRISAL_COLS.
+    arr: (n_tokens, 2) float16, columns = _SURPRISAL_COLS.
     Excluded tokens are stored as 0.0 — marked as '--'.
     """
     header = f"  {'idx':>6}  " + "  ".join(f"{c:>10}" for c in _SURPRISAL_COLS)
@@ -179,7 +179,7 @@ def _print_sentence_scores(
     head_labels: int,
 ) -> None:
     if _is_surprisal(f):
-        click.echo("scores (surprisal — mean / max / dm_sigma / dm_mad):")
+        click.echo("scores (surprisal — mean / dm_mad):")
         for line in _fmt_surprisal(arr, head_tokens):
             click.echo(line)
     elif _is_logits(f):

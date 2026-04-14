@@ -1304,7 +1304,7 @@ def mask_source_options(f):
     )(f)
     f = click.option(
         "--surprisal-reduction",
-        type=click.Choice(["mean", "max", "dm_sigma", "dm_mad"]),
+        type=click.Choice(["mean", "dm_mad"]),
         default="mean",
         show_default=True,
         help="Which surprisal score column to use as the code-switch signal.",

@@ -201,17 +201,6 @@ class WittenBellCharLM:
     # ---- sentence-level reduction helpers --------------------------------
 
     @staticmethod
-    def reduce_dm_sigma(token_scores: list[np.ndarray]) -> np.ndarray:
-        token_means = np.array([s.mean() for s in token_scores], dtype=np.float64)
-        if len(token_means) < 2:
-            return np.zeros(len(token_means), dtype=np.float16)
-        center = token_means.mean()
-        sigma = token_means.std(ddof=1)
-        if sigma == 0:
-            return np.zeros(len(token_means), dtype=np.float16)
-        return ((token_means - center) / sigma).astype(np.float16)
-
-    @staticmethod
     def reduce_dm_mad(token_scores: list[np.ndarray]) -> np.ndarray:
         token_means = np.array([s.mean() for s in token_scores], dtype=np.float64)
         if len(token_means) < 2:
@@ -308,12 +297,10 @@ def interact(wb_pkl):
                     continue
                 token = parts[1]
                 bscores = lm.compute_byte_scores(token)
-                max_s  = float(bscores.max())
                 mean_s = float(bscores.mean())
                 geom_p = 2.0 ** -mean_s
                 
                 click.echo(f"Token: {token}")
-                click.echo(f"  Max Surprisal:     {max_s:.4f}")
                 click.echo(f"  Mean Surprisal:    {mean_s:.4f}")
                 click.echo(f"  Geom Mean Prob:    {geom_p:.6f}")
 
@@ -336,76 +323,12 @@ def interact(wb_pkl):
             click.echo(f"Error: {e}")
 
 
-@click.command("tune")
-@click.option("--input", "input_path", required=True, help="Plain text file")
-@click.option("--wb-pkl", default=None, help="Path to a pre-built .pkl model")
-@click.option(
-    "--reduction",
-    type=click.Choice(["max", "mean"]),
-    default="mean",
-    show_default=True,
-)
-def tune(input_path, wb_pkl, reduction):
-    """Interactive threshold tuning on a plain-text file."""
-    lm = _load_or_prompt(wb_pkl)
-
-    with open(input_path, "r", encoding="utf-8") as f:
-        raw_text = f.read()
-
-    # whitespace tokenisation – one sentence per non-blank line
-    sentences: list[dict] = []
-    for line in raw_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        scored = []
-        for t in line.split():
-            if not any(c.isalnum() for c in t):
-                continue
-            bscores = lm.compute_byte_scores(t)
-            score = float(bscores.max() if reduction == "max" else bscores.mean())
-            avg_p = 2.0 ** -float(bscores.mean())
-            scored.append({"text": t, "score": score, "prob": avg_p})
-        if scored:
-            sentences.append({"text": line, "tokens": scored})
-
-    click.echo("\n[!] Entering Interactive Mode")
-    click.echo("Commands: Enter a float for threshold, or 'q' to quit.")
-
-    while True:
-        try:
-            val = input(f"\nSet Threshold (reduction: {reduction}) > ")
-            if val.lower() == "q":
-                break
-            threshold = float(val)
-        except (ValueError, EOFError):
-            click.echo("Invalid input. Enter a number.")
-            continue
-
-        for sent in sentences:
-            suspects = [
-                f"{t['text']}(S:{t['score']:.1f}, P:{t['prob']:.4f})"
-                for t in sent["tokens"]
-                if t["score"] > threshold
-            ]
-            all_words = [
-                f"{t['text']}(S:{t['score']:.1f}, P:{t['prob']:.4f})"
-                for t in sent["tokens"]
-            ]
-            status = "[!] OOD" if suspects else "[ ] CLN"
-            click.echo(f"\n{status}: {sent['text']}")
-            click.echo(f"    All tokens: {', '.join(all_words)}")
-            if suspects:
-                click.echo(f"    Suspects:   {', '.join(suspects)}")
-
-
 @click.group("wb")
 def wb():
     """Witten Bell language model."""
 
 
 wb.add_command(build)
-wb.add_command(tune)
 wb.add_command(interact)
 
 
