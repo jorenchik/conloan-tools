@@ -60,7 +60,8 @@ class ScoringConfig:
     filter_forbid_loanword:      bool = False
     filter_forbid_code_switch:   bool = False
     filter_forbid_named_entity:  bool = False
-    filter_require_context_lang: str = ""
+    filter_require_context_lang: bool = False
+    filter_require_span_lang:    bool = False
 
     # NER label ignore list (replaces ner_ignore_misc)
     ner_ignore_labels: set[str] = field(default_factory=set)
@@ -127,9 +128,11 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "min_tokens":                      5,
         "max_tokens":                      128,
         "min_alpha_ratio":                 0.5,
+
         "filter_require_code_switch":      True,
         "filter_forbid_named_entity":      True,
-        "filter_require_context_lang":     "lv",
+        "filter_require_context_lang":     True,
+        "filter_require_span_lang":        True,
 
         "weight_code_switch":              0.33,
         "weight_length":                   0.33,
@@ -322,6 +325,8 @@ def _apply_hard_gates(
     cfg: ScoringConfig,
     densities: tuple[int, float, float, float, float] | None = None,
     detected_lang: str | None = None,
+    span_lang: str | None = None,
+    lingua_lang: str | None = None,
 ) -> Optional[str]:
     if densities is None:
         densities = _precompute_densities(
@@ -337,8 +342,20 @@ def _apply_hard_gates(
         return "too_long"
     if alpha_ratio < cfg.min_alpha_ratio:
         return "low_alpha"
-    if cfg.filter_require_context_lang and detected_lang != cfg.filter_require_context_lang:
-        return "wrong_context_language"
+    if cfg.filter_require_context_lang:
+        if lingua_lang is None:
+            raise click.UsageError(
+                "filter_require_context_lang is set but --lingua-lang was not provided."
+            )
+        if detected_lang != lingua_lang:
+            return "wrong_context_language"
+    if cfg.filter_require_span_lang:
+        if lingua_lang is None:
+            raise click.UsageError(
+                "filter_require_span_lang is set but --lingua-lang was not provided."
+            )
+        if span_lang == lingua_lang:
+            return "span_not_foreign"
 
     if cfg.filter_require_loanword and lw_density == 0.0:
         return "zero_loanwords"
@@ -402,6 +419,8 @@ def score_sentence(
     code_switch_mask: Optional[List[int]] = None,
     named_entity_mask: Optional[List[int]] = None,
     detected_lang: str | None = None,
+    span_lang: str | None = None,
+    lingua_lang: str | None = None,
     cfg: Optional[ScoringConfig] = None,
 ) -> ScoredResult:
     if cfg is None:
@@ -419,7 +438,10 @@ def score_sentence(
     )
     reason = _apply_hard_gates(
         tokens, loanword_mask, code_switch_mask, named_entity_mask,
-        cfg, densities, detected_lang=detected_lang,
+        cfg, densities,
+        detected_lang=detected_lang,
+        span_lang=span_lang,
+        lingua_lang=lingua_lang,
     )
     if reason:
         return _make_filtered(res, reason)

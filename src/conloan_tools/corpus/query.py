@@ -960,6 +960,33 @@ def _lookup_sent_indices_batch(
     return result
 
 
+def _detect_langs(
+    detector,
+    parsed: CQPResult,
+    span_mask: list[int],
+) -> tuple[str | None, str | None]:
+    """
+    Returns (context_lang, span_lang) using Lingua.
+    context_lang: detected language of non-span tokens.
+    span_lang:    detected language of span tokens.
+    Either is None if detection fails or the text is empty.
+    """
+    if detector is None:
+        return None, None
+
+    span_set     = {i for i, v in enumerate(span_mask) if v}
+    context_text = " ".join(t.word for i, t in enumerate(parsed.tokens) if i not in span_set)
+    span_text    = " ".join(t.word for i, t in enumerate(parsed.tokens) if i in span_set)
+
+    def _detect(text: str) -> str | None:
+        if not text.strip():
+            return None
+        lang = detector.detect_language_of(text)
+        return lang.iso_code_639_1.name.lower() if lang else None
+
+    return _detect(context_text), _detect(span_text)
+
+
 def query_by_lemmas(
     corpus_name: str,
     lemmas: List[str],
@@ -983,6 +1010,11 @@ def query_by_lemmas(
         registry_dir,
     )
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.LEMMAS)
+    if (cfg.filter_require_context_lang or cfg.filter_require_span_lang) and not lingua_lang:
+        raise click.UsageError(
+            "This scoring profile requires --lingua-lang "
+            "(filter_require_context_lang or filter_require_span_lang is set)."
+        )
     lemma_set = {l.lower() for l in lemmas}
 
     if mask_src is None:
@@ -1021,10 +1053,7 @@ def query_by_lemmas(
             parsed, sent_idx, mask_src, lw_lemma_set=lemma_set
         )
 
-        detected_lang = None
-        if detector is not None:
-            lang = detector.detect_language_of(parsed.text)
-            detected_lang = lang.iso_code_639_1.name.lower() if lang else None
+        detected_lang, span_lang = _detect_langs(detector, parsed, lw_mask)
 
         result = score_sentence(
             parsed,
@@ -1032,6 +1061,8 @@ def query_by_lemmas(
             code_switch_mask=cs_mask,
             named_entity_mask=ne_mask,
             detected_lang=detected_lang,
+            span_lang=span_lang,
+            lingua_lang=lingua_lang,
             cfg=cfg,
         )
 
@@ -1214,18 +1245,9 @@ def find_code_switch_sequences(
         if len(valid_indices) < min_consecutive:
             continue
 
-        detected_lang = None
-        if detector is not None:
-            span_set = set(valid_indices)
-            context_text = " ".join(
-                t.word for i, t in enumerate(parsed.tokens)
-                if i not in span_set
-            )
-            lang = detector.detect_language_of(context_text)
-            detected_lang = lang.iso_code_639_1.name.lower() if lang else None
-
         cs_mask = [1 if i in set(valid_indices) else 0 for i in range(n)]
         lw_mask, _, ne_mask = build_masks(parsed, sent_idx, mask_src)
+        detected_lang, span_lang = _detect_langs(detector, parsed, cs_mask)
 
         metrics = score_sentence(
             parsed,
@@ -1234,6 +1256,8 @@ def find_code_switch_sequences(
             named_entity_mask=ne_mask,
             detected_lang=detected_lang,
             cfg=cfg,
+            span_lang=span_lang,
+            lingua_lang=lingua_lang,
         )
         results.append(
             CodeSwitchRun(
@@ -1479,6 +1503,11 @@ def query_code_switch(
 ):
     """Find code-switch sequences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.CODE_SWITCH)
+    if (cfg.filter_require_context_lang or cfg.filter_require_span_lang) and not lingua_lang:
+        raise click.UsageError(
+            "This scoring profile requires --lingua-lang "
+            "(filter_require_context_lang or filter_require_span_lang is set)."
+        )
 
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
@@ -1743,6 +1772,11 @@ def query_ner_entities(
 ):
     """Find named entity sentences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.NER)
+    if (cfg.filter_require_context_lang or cfg.filter_require_span_lang) and not lingua_lang:
+        raise click.UsageError(
+            "This scoring profile requires --lingua-lang "
+            "(filter_require_context_lang or filter_require_span_lang is set)."
+        )
     detector = _make_lingua_detector() if lingua_lang else None
 
     mask_src = load_mask_sources(
@@ -1856,16 +1890,16 @@ def query_ner_entities(
     for sent_idx in tqdm(matching, desc="Scoring", unit="sent"):
         parsed = sentence_map[sent_idx]
         lw_mask, cs_mask, ne_mask = build_masks(parsed, sent_idx, mask_src)
-        detected_lang = None
-        if detector is not None:
-            lang = detector.detect_language_of(parsed.text)
-            detected_lang = lang.iso_code_639_1.name.lower() if lang else None
+        detected_lang, span_lang = _detect_langs(detector, parsed, ne_mask)
+
         scored = score_sentence(
             parsed,
             loanword_mask=lw_mask,
             code_switch_mask=cs_mask,
             named_entity_mask=ne_mask,
             detected_lang=detected_lang,
+            lingua_lang=lingua_lang,
+            span_lang=span_lang,
             cfg=cfg,
         )
         sentence = _tag_ner_sentence(
