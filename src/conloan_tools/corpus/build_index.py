@@ -26,24 +26,50 @@ _LEN_SENTINEL = np.uint8(255)
 def _iter_surprisal_scores(
     lm: WittenBellCharLM,
     input_path: str,
-    reduction: str,
     limit_lines: int | None,
     limit_sentences: int | None,
     limit_mb: float | None,
 ):
+    """
+    Yields (cpos, mean_arr, max_arr, dm_sigma_arr, dm_mad_arr) per sentence.
+
+    All arrays are float16 with shape (n_tokens,).
+    Tokens excluded by is_clean_word are stored as 0.0 in every array.
+    dm_sigma / dm_mad are computed only over the clean subset; positions
+    for excluded tokens are left as 0.0.
+    """
     for _, tokens, cpos in iter_vert_sentences(
         input_path,
         limit_lines=limit_lines,
         limit_sentences=limit_sentences,
         limit_mb=limit_mb,
     ):
-        scores = [
-            lm.compute_score(tok, reduction)
-            if is_clean_word(tok, allow_ner=False)
-            else 0.0
-            for tok in tokens
-        ]
-        yield cpos, np.array(scores, dtype=np.float16)
+        n = len(tokens)
+        mean_arr     = np.zeros(n, dtype=np.float16)
+        max_arr      = np.zeros(n, dtype=np.float16)
+        dm_sigma_arr = np.zeros(n, dtype=np.float16)
+        dm_mad_arr   = np.zeros(n, dtype=np.float16)
+
+        clean_idx: list[int]        = []
+        clean_bscores: list[np.ndarray] = []
+
+        for i, tok in enumerate(tokens):
+            if not is_clean_word(tok, allow_ner=False):
+                continue
+            bs = lm.compute_byte_scores(tok)   # float64 per-byte surprisals
+            clean_idx.append(i)
+            clean_bscores.append(bs)
+            mean_arr[i] = float(bs.mean())
+            max_arr[i]  = float(bs.max())
+
+        if clean_bscores:
+            dm_s = WittenBellCharLM.reduce_dm_sigma(clean_bscores)  # float16
+            dm_m = WittenBellCharLM.reduce_dm_mad(clean_bscores)    # float16
+            for j, i in enumerate(clean_idx):
+                dm_sigma_arr[i] = dm_s[j]
+                dm_mad_arr[i]   = dm_m[j]
+
+        yield cpos, mean_arr, max_arr, dm_sigma_arr, dm_mad_arr
 
 
 def _iter_ner_scores(
@@ -295,6 +321,107 @@ def _create_hdf5(
     return f
 
 
+def _create_surprisal_hdf5(
+    path: Path,
+    meta: dict,
+    store_spos: bool,
+) -> h5py.File:
+    f = h5py.File(path, "w")
+    for k, v in meta.items():
+        f.attrs[k] = json.dumps(v) if isinstance(v, (dict, list)) else v
+
+    so = _ds_opts((_CHUNK_SENTS,))
+    idx = f.create_group("index")
+    idx.create_dataset("cpos",  shape=(0,), maxshape=(None,), dtype=np.uint64, **so)
+    idx.create_dataset("count", shape=(0,), maxshape=(None,), dtype=np.uint32, **so)
+    if store_spos:
+        idx.create_dataset("spos", shape=(0,), maxshape=(None,), dtype=np.uint64, **so)
+
+    to = _ds_opts((_CHUNK_TOKENS,))
+    sc = f.create_group("scores")
+    for col in ("mean", "max", "dm_sigma", "dm_mad"):
+        sc.create_dataset(col, shape=(0,), maxshape=(None,), dtype=np.float16, **to)
+
+    return f
+
+
+def _surprisal_flush(
+    f: h5py.File,
+    cpos_buf: list[int],
+    count_buf: list[int],
+    spos_buf: list[int] | None,
+    mean_buf: list[np.ndarray],
+    max_buf: list[np.ndarray],
+    dm_sigma_buf: list[np.ndarray],
+    dm_mad_buf: list[np.ndarray],
+    store_spos: bool,
+) -> None:
+    if not cpos_buf:
+        return
+
+    def _append(ds: h5py.Dataset, arr: np.ndarray) -> None:
+        old = ds.shape[0]
+        ds.resize(old + arr.shape[0], axis=0)
+        ds[old:] = arr
+
+    idx = f["index"]
+    _append(idx["cpos"],  np.array(cpos_buf,  dtype=np.uint64))
+    _append(idx["count"], np.array(count_buf, dtype=np.uint32))
+    if store_spos and spos_buf is not None:
+        _append(idx["spos"], np.array(spos_buf, dtype=np.uint64))
+
+    sc = f["scores"]
+    _append(sc["mean"],     np.concatenate(mean_buf).astype(np.float16))
+    _append(sc["max"],      np.concatenate(max_buf).astype(np.float16))
+    _append(sc["dm_sigma"], np.concatenate(dm_sigma_buf).astype(np.float16))
+    _append(sc["dm_mad"],   np.concatenate(dm_mad_buf).astype(np.float16))
+
+    cpos_buf.clear(); count_buf.clear()
+    if spos_buf is not None:
+        spos_buf.clear()
+    mean_buf.clear(); max_buf.clear()
+    dm_sigma_buf.clear(); dm_mad_buf.clear()
+
+
+def _build_surprisal_index_from_iter(
+    score_iter,
+    f: h5py.File,
+    store_spos: bool,
+    flush_every: int,
+) -> None:
+    cpos_buf:     list[int]        = []
+    count_buf:    list[int]        = []
+    spos_buf:     list[int] | None = [] if store_spos else None
+    mean_buf:     list[np.ndarray] = []
+    max_buf:      list[np.ndarray] = []
+    dm_sigma_buf: list[np.ndarray] = []
+    dm_mad_buf:   list[np.ndarray] = []
+    spos = 0
+
+    for cpos, mean_arr, max_arr, dm_sigma_arr, dm_mad_arr in score_iter:
+        cpos_buf.append(cpos)
+        count_buf.append(mean_arr.shape[0])
+        if spos_buf is not None:
+            spos_buf.append(spos)
+        mean_buf.append(mean_arr)
+        max_buf.append(max_arr)
+        dm_sigma_buf.append(dm_sigma_arr)
+        dm_mad_buf.append(dm_mad_arr)
+        spos += 1
+
+        if len(cpos_buf) >= flush_every:
+            _surprisal_flush(
+                f, cpos_buf, count_buf, spos_buf,
+                mean_buf, max_buf, dm_sigma_buf, dm_mad_buf, store_spos,
+            )
+
+    _surprisal_flush(
+        f, cpos_buf, count_buf, spos_buf,
+        mean_buf, max_buf, dm_sigma_buf, dm_mad_buf, store_spos,
+    )
+
+
+
 def _hdf5_flush(
     f: h5py.File,
     cpos_buf: list[int],
@@ -332,7 +459,6 @@ def build_surprisal_index(
     input_path: str,
     output_dir: str,
     name: str,
-    reduction: str = "max",
     store_spos: bool = True,
     flush_every: int = IDX_FLUSH_EVERY,
     limit_lines: int | None = None,
@@ -346,7 +472,7 @@ def build_surprisal_index(
     meta = {
         "type":       "surprisal",
         "input":      str(input_path),
-        "reduction":  reduction,
+        "scores":     ["mean", "max", "dm_sigma", "dm_mad"],
         "n":          lm.n,
         "model":      "WittenBellCharLM",
         "date":       datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -354,12 +480,11 @@ def build_surprisal_index(
         "store_spos": store_spos,
     }
 
-    f = _create_hdf5(h5_path, np.float16, meta, store_spos, num_labels=None)
+    f = _create_surprisal_hdf5(h5_path, meta, store_spos)
     try:
-        _build_index_from_iter(
+        _build_surprisal_index_from_iter(
             _iter_surprisal_scores(
-                lm, input_path, reduction,
-                limit_lines, limit_sentences, limit_mb,
+                lm, input_path, limit_lines, limit_sentences, limit_mb,
             ),
             f, store_spos, flush_every,
         )
@@ -448,24 +573,21 @@ def build_index():
 @click.option("--input",           "input_path", required=True, help=".vert corpus")
 @click.option("--output-dir",      required=True, help="Output directory")
 @click.option("--name",            required=True, help="Base name for output file")
-@click.option("--n",               default=3, show_default=True)
-@click.option("--reduction",       type=click.Choice(["max", "mean"]), default="mean", show_default=True)
 @click.option("--no-spos",         is_flag=True, default=False, help="Omit spos dataset")
 @click.option("--limit-lines",     type=int)
 @click.option("--limit-sentences", type=int)
 @click.option("--limit-mb",        type=float)
 def build_surprisal_index_command(
-    wb_pkl, input_path, output_dir, name, n,
-    reduction, no_spos, limit_lines, limit_sentences, limit_mb,
+    wb_pkl, input_path, output_dir, name,
+    no_spos, limit_lines, limit_sentences, limit_mb,
 ):
-    """Score every token in a .vert corpus with surprisal. Streams to HDF5."""
+    """Score every token with mean, max, dm_sigma, dm_mad surprisal. Streams to HDF5."""
     lm = WittenBellCharLM.load(wb_pkl)
     h5_path = build_surprisal_index(
         lm=lm,
         input_path=input_path,
         output_dir=output_dir,
         name=name,
-        reduction=reduction,
         store_spos=not no_spos,
         limit_lines=limit_lines,
         limit_sentences=limit_sentences,

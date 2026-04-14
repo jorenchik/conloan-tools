@@ -36,7 +36,8 @@ class WittenBellCharLM:
         self.types: list[dict[bytes, int]] = [{}] + [
             {} for _ in range(n)
         ]
-        self._score_cache: dict[tuple[str, str], float] = {}
+        self._byte_score_cache: dict[str, np.ndarray] = {}
+
 
     # ---- training ---------------------------------------------------------
 
@@ -119,32 +120,39 @@ class WittenBellCharLM:
                 context[1:], char, order - 1
             )
 
-    def score_token(self, token: str) -> tuple[float, float]:
-        """Return (max_surprisal, geometric_mean_probability)."""
+    def compute_byte_scores(self, token: str) -> np.ndarray:
+        """Return per-position surprisal (bits) as float64 array."""
         token = token.lower()
+        if token in self._byte_score_cache:
+            return self._byte_score_cache[token]
+
         pad = b" " * (self.n - 1)
         padded = pad + token.encode("utf-8") + b" "
         surprisals: list[float] = []
 
         for i in range(self.n - 1, len(padded)):
-            ctx  = bytes(padded[i - (self.n - 1) : i])
-            char = padded[i]                            # int 0-255
+            ctx = bytes(padded[i - (self.n - 1) : i])
+            char = padded[i]
             prob = self.get_probability(ctx, char, self.n)
             if prob <= 0:
                 prob = 1e-10
             surprisals.append(-math.log2(prob))
 
-        if not surprisals:
-            return 0.0, 0.0
-        return max(surprisals), 2 ** -(sum(surprisals) / len(surprisals))
+        arr = (
+            np.array(surprisals, dtype=np.float64)
+            if surprisals
+            else np.zeros(1, dtype=np.float64)
+        )
+        self._byte_score_cache[token] = arr
+        return arr
 
     def sample_next_byte(self, context: bytes, temperature: float = 1.0) -> int:
         """Sample the next byte value (0-255) at the given temperature."""
         context = context[-(self.n - 1) :] if self.n > 1 else b""
         probs = np.zeros(self.vocab_size)
 
-        for b in range(self.vocab_size):
-            probs[b] = self.get_probability(context, b, self.n)
+        for bi in range(self.vocab_size):
+            probs[bi] = self.get_probability(context, bi, self.n)
 
         if temperature <= 0:
             return int(np.argmax(probs))
@@ -173,19 +181,6 @@ class WittenBellCharLM:
             buf += bytes([next_b])
         return buf.decode("utf-8", errors="replace")
 
-    # ---- scoring helpers --------------------------------------------------
-
-    def compute_score(self, token: str, reduction: str) -> float:
-        key = (token, reduction)
-        if key in self._score_cache:
-            return self._score_cache[key]
-        max_s, avg_p = self.score_token(token)
-        result = max_s if reduction == "max" else (
-            -math.log2(avg_p) if avg_p > 0 else 999.0
-        )
-        self._score_cache[key] = result
-        return result
-
     # ---- persistence ------------------------------------------------------
 
     def save(self, path: str) -> None:
@@ -202,6 +197,37 @@ class WittenBellCharLM:
             raise TypeError(f"Expected {cls.__name__}, got {type(obj).__name__}")
         click.echo(f"[*] Model loaded from {path}", err=True)
         return obj
+
+    # ---- sentence-level reduction helpers --------------------------------
+
+    @staticmethod
+    def reduce_dm_sigma(token_scores: list[np.ndarray]) -> np.ndarray:
+        """Per-token z-score relative to the sentence median.
+
+        Returns (mean_char_surprisal - sentence_median) / sentence_std
+        as float16.  Returns zeros when std is 0.
+        """
+        token_means = np.array([s.mean() for s in token_scores], dtype=np.float64)
+        median = np.median(token_means)
+        sigma = token_means.std(ddof=1)
+        if sigma == 0:
+            return np.zeros(len(token_means), dtype=np.float16)
+        return ((token_means - median) / sigma).astype(np.float16)
+
+    @staticmethod
+    def reduce_dm_mad(token_scores: list[np.ndarray]) -> np.ndarray:
+        """Per-token MAD-normalised deviation from the sentence median.
+
+        Returns (mean_char_surprisal - sentence_median) / MAD as float16.
+        Returns zeros when MAD is 0.
+        """
+        token_means = np.array([s.mean() for s in token_scores], dtype=np.float64)
+        median = np.median(token_means)
+        mad = np.median(np.abs(token_means - median))
+        if mad == 0:
+            return np.zeros(len(token_means), dtype=np.float16)
+        return ((token_means - median) / mad).astype(np.float16)
+
 
 
 # ----- Helpers -----
@@ -236,18 +262,6 @@ def _load_or_prompt(wb_pkl: str | None) -> WittenBellCharLM:
 def build(train, output, n):
     """Train a WittenBell char LM and save it to a pickle file."""
     lm = _load_lm(train, n)
-    lm.save(output)
-
-
-@click.command("interact")
-@click.option("--wb-pkl", default=None, help="Path to a pre-built .pkl model")
-def interact(wb_pkl):
-    """Interactive playground for generation, scoring, and completion."""
-
-    lm = _load_or_prompt(wb_pkl)
-    # Store temperature in a local state for runtime config
-    state = {"temp": 1.0}
-    
     lm.save(output)
 
 
@@ -299,9 +313,10 @@ def interact(wb_pkl):
                     click.echo("Usage: s <token>")
                     continue
                 token = parts[1]
-                max_s, geom_p = lm.score_token(token)
-                # Mean surprisal is -log2 of geometric mean probability
-                mean_s = -math.log2(geom_p) if geom_p > 0 else 999.0
+                bscores = lm.compute_byte_scores(token)
+                max_s  = float(bscores.max())
+                mean_s = float(bscores.mean())
+                geom_p = 2.0 ** -mean_s
                 
                 click.echo(f"Token: {token}")
                 click.echo(f"  Max Surprisal:     {max_s:.4f}")
@@ -353,8 +368,9 @@ def tune(input_path, wb_pkl, reduction):
         for t in line.split():
             if not any(c.isalnum() for c in t):
                 continue
-            score = lm.compute_score(t, reduction)
-            _, avg_p = lm.score_token(t)
+            bscores = lm.compute_byte_scores(t)
+            score = float(bscores.max() if reduction == "max" else bscores.mean())
+            avg_p = 2.0 ** -float(bscores.mean())
             scored.append({"text": t, "score": score, "prob": avg_p})
         if scored:
             sentences.append({"text": line, "tokens": scored})
