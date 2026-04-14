@@ -14,9 +14,22 @@ specific PyTorch binaries or other packages.
 If your system Python is a different version, I recommend using pyenv to
 manage your environment.
 
-First make sure your environment has all the necessary prerequisites in order to install pyenv 
-(see [suggested build environment](https://github.com/pyenv/pyenv/wiki#suggested-build-environment)).
-Then follow the official instruction of getting pyenv (see [getting pyenv](https://github.com/pyenv/pyenv?tab=readme-ov-file#a-getting-pyenv)).
+- First make sure your environment has all the necessary prerequisites in order
+  to install pyenv (see [suggested build
+  environment](https://github.com/pyenv/pyenv/wiki#suggested-build-environment)).
+- Then follow the official instruction of getting pyenv (see [getting
+  pyenv](https://github.com/pyenv/pyenv?tab=readme-ov-file#a-getting-pyenv)).
+
+**Install example (Ubuntu 24.04)**
+
+```
+sudo apt update; sudo apt install make build-essential libssl-dev zlib1g-dev \
+libbz2-dev libreadline-dev libsqlite3-dev curl git \
+libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
+curl -fsSL https://pyenv.run | bash
+```
+
+**Pyenv configuration**
 
 Make sure to add this to your environment. Example for bash.
 
