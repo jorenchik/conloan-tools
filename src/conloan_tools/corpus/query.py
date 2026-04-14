@@ -1194,6 +1194,7 @@ def find_code_switch_sequences(
     mask_src: Optional[MaskSources] = None,
     allowed = None,
     lingua_lang: str | None = None,
+    ne_exclude_span_only: bool = False,
 ) -> list[CodeSwitchRun]:
     """Score all qualifying runs; caller is responsible for capping display."""
 
@@ -1247,6 +1248,11 @@ def find_code_switch_sequences(
 
         cs_mask = [1 if i in set(valid_indices) else 0 for i in range(n)]
         lw_mask, _, ne_mask = build_masks(parsed, sent_idx, mask_src)
+
+        if ne_exclude_span_only:
+            span_set = set(valid_indices)
+            ne_mask = [v if i in span_set else 0 for i, v in enumerate(ne_mask)]
+
         detected_lang, span_lang = _detect_langs(detector, parsed, cs_mask)
 
         metrics = score_sentence(
@@ -1480,6 +1486,16 @@ def _render_candidates(records: list[CandidateRecord]) -> None:
     default=False,
     help="Scan in index order. Default: random by seed."
 )
+@click.option(
+    "--ne-exclude-span-only",
+    "ne_exclude_span_only",
+    is_flag=True,
+    default=False,
+    help=(
+        "Apply NE-based filtering/penalty only to tokens within the "
+        "code-switch span, not the whole sentence."
+    ),
+)
 def query_code_switch(
     corpus_name,
     surprisal_h5,
@@ -1500,6 +1516,7 @@ def query_code_switch(
     scoring_config,
     output,
     sequential,
+    ne_exclude_span_only,
 ):
     """Find code-switch sequences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.CODE_SWITCH)
@@ -1517,7 +1534,6 @@ def query_code_switch(
         ner_confidence_thresholds=_parse_label_thresholds(ner_confidence_thresholds),
         loanword_file=loanword_file,
         ner_ignore_labels=set(ner_ignore_labels),
-
     )
 
     if mask_src.surprisal_scores is None:
@@ -1545,6 +1561,7 @@ def query_code_switch(
         mask_src=mask_src,
         allowed=allowed,
         lingua_lang=lingua_lang,
+        ne_exclude_span_only=ne_exclude_span_only,
     )
 
     click.echo(f"[*] Found and scored {len(found)} candidate sequences", err=True)
