@@ -42,7 +42,7 @@ def _is_logits(f: h5py.File) -> bool:
 
 
 def _is_surprisal(f: h5py.File) -> bool:
-    return "mean" in f["scores"]
+    return f.attrs.get("type") == "surprisal" or "mean" in f["scores"]
 
 
 def _id2label(attrs: dict) -> dict[int, str] | None:
@@ -98,6 +98,11 @@ def _get_sentence_scores(f: h5py.File, row: int) -> np.ndarray:
         ]
         return np.stack(cols, axis=1)  # (n_tokens, 4)
 
+    if "data" not in f["scores"]:
+        raise KeyError(
+            f"scores/data not found and file is not surprisal type "
+            f"(type={f.attrs.get('type')!r}, scores keys={list(f['scores'].keys())})"
+        )
     return f["scores"]["data"][offset : offset + count]
 
 
@@ -635,7 +640,7 @@ def cmd_hist(path: str, bins: int, col: str, max_sentences: int) -> None:
             else f["scores"]["data"].shape[0]
         )
         logits    = _is_logits(f)
-        ner       = _is_ner(attrs)
+        ner = attrs.get("type") == "ner"
         id2label  = _id2label(attrs)
 
         cap = max_sentences

@@ -202,26 +202,20 @@ class WittenBellCharLM:
 
     @staticmethod
     def reduce_dm_sigma(token_scores: list[np.ndarray]) -> np.ndarray:
-        """Per-token z-score relative to the sentence median.
-
-        Returns (mean_char_surprisal - sentence_median) / sentence_std
-        as float16.  Returns zeros when std is 0.
-        """
         token_means = np.array([s.mean() for s in token_scores], dtype=np.float64)
-        median = np.median(token_means)
+        if len(token_means) < 2:
+            return np.zeros(len(token_means), dtype=np.float16)
+        center = token_means.mean()
         sigma = token_means.std(ddof=1)
         if sigma == 0:
             return np.zeros(len(token_means), dtype=np.float16)
-        return ((token_means - median) / sigma).astype(np.float16)
+        return ((token_means - center) / sigma).astype(np.float16)
 
     @staticmethod
     def reduce_dm_mad(token_scores: list[np.ndarray]) -> np.ndarray:
-        """Per-token MAD-normalised deviation from the sentence median.
-
-        Returns (mean_char_surprisal - sentence_median) / MAD as float16.
-        Returns zeros when MAD is 0.
-        """
         token_means = np.array([s.mean() for s in token_scores], dtype=np.float64)
+        if len(token_means) < 2:
+            return np.zeros(len(token_means), dtype=np.float16)
         median = np.median(token_means)
         mad = np.median(np.abs(token_means - median))
         if mad == 0:
