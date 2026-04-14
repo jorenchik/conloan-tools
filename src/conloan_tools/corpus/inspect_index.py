@@ -10,6 +10,8 @@ import numpy as np
 from tqdm import tqdm
 
 _LEN_SENTINEL = 255
+_SURPRISAL_COLS = ("mean", "max", "dm_sigma", "dm_mad")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,11 +37,12 @@ def _attrs(f: h5py.File) -> dict:
 
 
 def _is_logits(f: h5py.File) -> bool:
-    return f["scores"]["data"].ndim == 2
+    ds = f["scores"].get("data")
+    return ds is not None and ds.ndim == 2
 
 
-def _is_ner(attrs: dict) -> bool:
-    return attrs.get("type") == "ner"
+def _is_surprisal(f: h5py.File) -> bool:
+    return "mean" in f["scores"]
 
 
 def _id2label(attrs: dict) -> dict[int, str] | None:
@@ -80,9 +83,21 @@ def _validate_cpos_lookup(cpos_val: int, count: int, target: int) -> None:
         )
 
 
+def _token_offset(f: h5py.File, row: int) -> int:
+    return int(f["index"]["count"][:row].sum())
+
+
 def _get_sentence_scores(f: h5py.File, row: int) -> np.ndarray:
-    offset = int(f["index"]["count"][:row].sum())
+    offset = _token_offset(f, row)
     count  = int(f["index"]["count"][row])
+
+    if _is_surprisal(f):
+        cols = [
+            f["scores"][col][offset : offset + count].astype(np.float16)
+            for col in _SURPRISAL_COLS
+        ]
+        return np.stack(cols, axis=1)  # (n_tokens, 4)
+
     return f["scores"]["data"][offset : offset + count]
 
 
@@ -95,6 +110,25 @@ def _fmt_scores_1d(
     suffix = f"  ... (+{len(arr) - head} more)" if len(arr) > head else ""
     vals = "  ".join(f"{v:.4f}" if np.issubdtype(arr.dtype, np.floating) else str(v) for v in shown)
     return f"[{vals}]{suffix}  dtype={dtype_name}  shape={arr.shape}"
+
+
+def _fmt_surprisal(arr: np.ndarray, head_tokens: int) -> list[str]:
+    """
+    arr: (n_tokens, 4) float16, columns = _SURPRISAL_COLS.
+    Excluded tokens are stored as 0.0 — marked as '--'.
+    """
+    header = f"  {'idx':>6}  " + "  ".join(f"{c:>10}" for c in _SURPRISAL_COLS)
+    lines  = [header, "  " + "-" * (len(header) - 2)]
+    for i, row in enumerate(arr[:head_tokens]):
+        excluded = not np.any(row)
+        if excluded:
+            vals = "  ".join(f"{'--':>10}" for _ in _SURPRISAL_COLS)
+        else:
+            vals = "  ".join(f"{v:>10.4f}" for v in row)
+        lines.append(f"  {i:>6}  {vals}")
+    if len(arr) > head_tokens:
+        lines.append(f"  ... (+{len(arr) - head_tokens} more tokens)")
+    return lines
 
 
 def _fmt_scores_2d(
@@ -139,15 +173,17 @@ def _print_sentence_scores(
     head_tokens: int,
     head_labels: int,
 ) -> None:
-    """Dispatch score display based on index type."""
-    id2label = _id2label(attrs)
-    if _is_logits(f):
-        click.echo("scores (logits):")
-        for line in _fmt_scores_2d(arr, id2label, head_tokens, head_labels):
+    if _is_surprisal(f):
+        click.echo("scores (surprisal — mean / max / dm_sigma / dm_mad):")
+        for line in _fmt_surprisal(arr, head_tokens):
             click.echo(line)
-    elif _is_ner(attrs):
+    elif _is_logits(f):
+        click.echo("scores (logits):")
+        for line in _fmt_scores_2d(arr, _id2label(attrs), head_tokens, head_labels):
+            click.echo(line)
+    elif attrs.get("type") == "ner":
         click.echo("scores (NER labels):")
-        for line in _fmt_scores_labels(arr, id2label, head_tokens):
+        for line in _fmt_scores_labels(arr, _id2label(attrs), head_tokens):
             click.echo(line)
     else:
         click.echo(
@@ -346,12 +382,19 @@ def cmd_validate(
     with _open_h5(path) as f:
         cpos_ds   = f["index"]["cpos"]
         count_ds  = f["index"]["count"]
-        scores_ds = f["scores"]["data"]
         n_sents   = cpos_ds.shape[0]
         has_spos  = "spos" in f["index"]
 
         click.echo(f"Sentences : {n_sents:,}")
-        click.echo(f"Tokens    : {scores_ds.shape[0]:,}")
+        click.echo(
+            f"Tokens    : "
+            + (
+                str(f["scores"]["mean"].shape[0])
+                if _is_surprisal(f)
+                else str(f["scores"]["data"].shape[0])
+            )
+            + ","
+        )
         click.echo(f"spos      : {'stored' if has_spos else 'NOT stored'}")
         click.echo("Checking structure...")
 
@@ -368,9 +411,21 @@ def cmd_validate(
                 )
 
         total  = int(count.sum())
-        actual = scores_ds.shape[0]
-        if total != actual:
-            _err(f"sum(count)={total:,} != scores/data.shape[0]={actual:,}")
+        if _is_surprisal(f):
+            for col in _SURPRISAL_COLS:
+                actual = f["scores"][col].shape[0]
+                if total != actual:
+                    _err(
+                        f"sum(count)={total:,} != "
+                        f"scores/{col}.shape[0]={actual:,}"
+                    )
+            shapes = {col: f["scores"][col].shape[0] for col in _SURPRISAL_COLS}
+            if len(set(shapes.values())) > 1:
+                _err(f"scores column lengths disagree: {shapes}")
+        else:
+            actual = f["scores"]["data"].shape[0]
+            if total != actual:
+                _err(f"sum(count)={total:,} != scores/data.shape[0]={actual:,}")
 
         if spos is not None:
             bad = np.where(np.diff(spos.astype(np.int64)) != 1)[0]
@@ -554,21 +609,31 @@ def cmd_sample(
 @click.argument("path")
 @click.option("--bins", default=20, show_default=True)
 @click.option(
+    "--col",
+    type=click.Choice([*_SURPRISAL_COLS, "auto"]),
+    default="auto",
+    show_default=True,
+    help="Surprisal column to histogram (ignored for NER/unknown files).",
+)
+@click.option(
     "--max-sentences", default=50_000, show_default=True,
     help="Cap sentences sampled for histogram (0 = all).",
 )
-def cmd_hist(path: str, bins: int, max_sentences: int) -> None:
+def cmd_hist(path: str, bins: int, col: str, max_sentences: int) -> None:
     """
     Print ASCII histogram of score values.
 
-    Surprisal        : histogram of raw float scores.
+    Surprisal        : histogram of one reduction column (--col, default=mean).
     NER labels       : frequency count per label ID.
     NER logits       : frequency count of per-token argmax label.
     """
     with _open_h5(path) as f:
         attrs     = _attrs(f)
-        scores_ds = f["scores"]["data"]
-        n_tokens  = scores_ds.shape[0]
+        n_tokens  = (
+            f["scores"]["mean"].shape[0]
+            if _is_surprisal(f)
+            else f["scores"]["data"].shape[0]
+        )
         logits    = _is_logits(f)
         ner       = _is_ner(attrs)
         id2label  = _id2label(attrs)
@@ -578,12 +643,36 @@ def cmd_hist(path: str, bins: int, max_sentences: int) -> None:
             count_ds = f["index"]["count"][:]
             n_cap    = min(cap, len(count_ds))
             n_tok    = int(count_ds[:n_cap].sum())
-            data_raw = scores_ds[:n_tok]
             click.echo(
                 f"Sampling first {n_cap:,} sentences ({n_tok:,} / {n_tokens:,} tokens)"
             )
         else:
-            data_raw = scores_ds[:]
+            n_cap = f["index"]["count"].shape[0]
+            n_tok = n_tokens
+            click.echo(
+                f"Sampling first {n_cap:,} sentences ({n_tok:,} / {n_tokens:,} tokens)"
+            )
+
+        if _is_surprisal(f):
+            chosen   = "mean" if col == "auto" else col
+            data_raw = f["scores"][chosen][:n_tok].astype(np.float32)
+            data     = data_raw[data_raw != 0.0]
+            n_excl   = n_tok - len(data)
+            click.echo(
+                f"Mode: surprisal/{chosen}  "
+                f"({n_excl:,} excluded-token zeros dropped)\n"
+            )
+            counts, edges = np.histogram(data, bins=bins)
+            click.echo(f"mean={data.mean():.4f}  std={data.std():.4f}\n")
+            max_count = counts.max()
+            bar_width = 50
+            for i, c in enumerate(counts):
+                bar  = "█" * int(c / max_count * bar_width)
+                lo, hi = edges[i], edges[i + 1]
+                click.echo(f"  {lo:>8.4f} – {hi:<8.4f}  {bar:<{bar_width}}  {c:>8,}")
+            return
+
+        data_raw = f["scores"]["data"][:n_tok]
 
         if logits:
             data = np.argmax(data_raw, axis=1).astype(np.int32)
