@@ -362,6 +362,7 @@ def _scan_runs_vectorized(
     counts: np.ndarray,    # int32, one per sentence
     threshold: float,
     min_consecutive: int,
+    max_consecutive: int | None = None,
     allowed: set[int] | None = None,
 ) -> list[tuple[int, list[int], list[float]]]:
     """
@@ -392,6 +393,8 @@ def _scan_runs_vectorized(
 
     # 4. Length gate
     valid = run_lengths >= min_consecutive
+    if max_consecutive is not None:
+        valid &= (run_lengths <= max_consecutive)
     if not valid.any():
         return []
     run_starts  = run_starts[valid]
@@ -1086,6 +1089,7 @@ def scan_anomaly_candidates(
     index_records: list[IndexRecord],
     threshold: float,
     min_consecutive: int,
+    max_consecutive: int | None = None,
     lookup: int | None = None,
     allowed=None,
     desc: str = "Scanning",
@@ -1117,7 +1121,7 @@ def scan_anomaly_candidates(
                 else {i - chunk_start for i in allowed if chunk_start <= i < chunk_end}
             )
             chunk_hits = _scan_runs_vectorized(
-                flat, offsets, counts, threshold, min_consecutive,
+                flat, offsets, counts, threshold, min_consecutive, max_consecutive,
                 allowed=chunk_allowed,
             )
             candidates.extend(
@@ -1186,6 +1190,7 @@ def find_code_switch_sequences(
     index_records: list[IndexRecord],
     threshold: float,
     min_consecutive: int,
+    max_consecutive: int,
     corpus: str,
     cfg: ScoringConfig,
     cqp_bin: str = DEFAULT_CQP_BIN,
@@ -1456,6 +1461,7 @@ def _render_candidates(records: list[CandidateRecord]) -> None:
 @click.argument("corpus_name")
 @click.option("--threshold", type=float, required=True)
 @click.option("--min-consecutive", type=int, default=2, show_default=True)
+@click.option("--max-consecutive", type=int, default=None, help="Max length of code-switch span.")
 @mask_source_options
 @click.option(
     "--lookup",
@@ -1502,6 +1508,7 @@ def query_code_switch(
     surprisal_threshold,
     threshold,
     min_consecutive,
+    max_consecutive,
     ner_h5,
     loanword_file,
     ner_ignore_labels,
@@ -1553,6 +1560,7 @@ def query_code_switch(
         index_records=index_records,
         threshold=threshold,
         min_consecutive=min_consecutive,
+        max_consecutive=max_consecutive,
         corpus=corpus_name,
         cfg=cfg,
         cqp_bin=cqp_bin,
