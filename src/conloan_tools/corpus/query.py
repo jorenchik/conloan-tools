@@ -262,6 +262,7 @@ class MaskSources:
     surprisal_cpos: Optional[np.ndarray] = None
     surprisal_reduction: str = "mean"
     surprisal_threshold: float = 0.0
+    lingua_threshold: float = 0.0
     ner_labels: Optional[np.ndarray] = None
     ner_records: Optional[list[IndexRecord]] = None
     ner_cpos: Optional[np.ndarray] = None
@@ -620,6 +621,7 @@ def load_mask_sources(
     ner_confidence_thresholds: dict[str, float] = {},
     loanword_file: Optional[Path] = None,
     ner_ignore_labels: set[str] = frozenset(),
+    lingua_threshold: float = 0.0,
 ) -> MaskSources:
     """Load all optional index files into a MaskSources bundle."""
     src = MaskSources(
@@ -627,6 +629,7 @@ def load_mask_sources(
         surprisal_reduction=surprisal_reduction,
         ner_confidence_thresholds=ner_confidence_thresholds,
         ner_ignore_labels=set(ner_ignore_labels),
+        lingua_threshold=lingua_threshold,
     )
 
     if surprisal_h5 is not None:
@@ -967,6 +970,7 @@ def _detect_langs(
     detector,
     parsed: CQPResult,
     span_mask: list[int],
+    threshold: float = 0.0,
 ) -> tuple[str | None, str | None]:
     """
     Returns (context_lang, span_lang) using Lingua.
@@ -984,8 +988,13 @@ def _detect_langs(
     def _detect(text: str) -> str | None:
         if not text.strip():
             return None
-        lang = detector.detect_language_of(text)
-        return lang.iso_code_639_1.name.lower() if lang else None
+        confidences = detector.compute_language_confidence_values(text)
+        if not confidences:
+            return None
+        top = confidences[0]
+        if top.value < threshold:
+            return None
+        return top.language.iso_code_639_1.name.lower()
 
     return _detect(context_text), _detect(span_text)
 
@@ -1056,7 +1065,9 @@ def query_by_lemmas(
             parsed, sent_idx, mask_src, lw_lemma_set=lemma_set
         )
 
-        detected_lang, span_lang = _detect_langs(detector, parsed, lw_mask)
+        detected_lang, span_lang = _detect_langs(
+            detector, parsed, lw_mask, threshold=mask_src.lingua_threshold
+        )
 
         result = score_sentence(
             parsed,
@@ -1258,7 +1269,9 @@ def find_code_switch_sequences(
             span_set = set(valid_indices)
             ne_mask = [v if i in span_set else 0 for i, v in enumerate(ne_mask)]
 
-        detected_lang, span_lang = _detect_langs(detector, parsed, cs_mask)
+        detected_lang, span_lang = _detect_langs(
+            detector, parsed, cs_mask, threshold=mask_src.lingua_threshold
+        )
 
         metrics = score_sentence(
             parsed,
@@ -1343,6 +1356,12 @@ def mask_source_options(f):
         default="mean",
         show_default=True,
         help="Which surprisal score column to use as the code-switch signal.",
+    )(f)
+    f = click.option(
+        "--lingua-threshold",
+        type=float,
+        default=0.0,
+        help="Confidence threshold for Lingua (0.0-1.0).",
     )(f)
     return f
 
@@ -1514,6 +1533,7 @@ def query_code_switch(
     ner_ignore_labels,
     ner_confidence_thresholds,
     lingua_lang,
+    lingua_threshold,
     surprisal_reduction,
     lookup,
     results,
@@ -1541,6 +1561,7 @@ def query_code_switch(
         ner_confidence_thresholds=_parse_label_thresholds(ner_confidence_thresholds),
         loanword_file=loanword_file,
         ner_ignore_labels=set(ner_ignore_labels),
+        lingua_threshold=lingua_threshold,
     )
 
     if mask_src.surprisal_scores is None:
@@ -1664,6 +1685,7 @@ def query_lemmas_command(
     ner_ignore_labels,
     surprisal_reduction,
     lingua_lang,
+    lingua_threshold,
     output,
 ):
     """Query corpus by lemma(s) and emit JSONL records."""
@@ -1675,6 +1697,7 @@ def query_lemmas_command(
         ner_confidence_thresholds=_parse_label_thresholds(ner_confidence_thresholds),
         loanword_file=loanword_file,
         ner_ignore_labels=ner_ignore_labels,
+        lingua_threshold=lingua_threshold,
     )
 
     if lemmas_file is not None:
@@ -1793,7 +1816,7 @@ def query_ner_entities(
     corpus_name, ner_h5, labels, excl_labels,
     lookup, results, cqp_bin, registry_dir, seed, scoring_config,
     surprisal_h5, surprisal_threshold, ner_ignore_labels, loanword_file,
-    ner_confidence_thresholds, lingua_lang, surprisal_reduction, output, sequential,
+    ner_confidence_thresholds, lingua_lang, lingua_threshold, surprisal_reduction, output, sequential,
 ):
     """Find named entity sentences and emit JSONL records."""
     cfg = load_scoring_config(scoring_config, profile=QueryProfile.NER)
@@ -1811,6 +1834,7 @@ def query_ner_entities(
         loanword_file=loanword_file,
         ner_confidence_thresholds=_parse_label_thresholds(ner_confidence_thresholds),
         ner_ignore_labels=ner_ignore_labels,
+        lingua_threshold=lingua_threshold,
     )
 
     click.echo("[*] Loading NER index...", err=True)
@@ -1915,7 +1939,9 @@ def query_ner_entities(
     for sent_idx in tqdm(matching, desc="Scoring", unit="sent"):
         parsed = sentence_map[sent_idx]
         lw_mask, cs_mask, ne_mask = build_masks(parsed, sent_idx, mask_src)
-        detected_lang, span_lang = _detect_langs(detector, parsed, ne_mask)
+        detected_lang, span_lang = _detect_langs(
+            detector, parsed, ne_mask, threshold=lingua_threshold
+        )
 
         scored = score_sentence(
             parsed,
