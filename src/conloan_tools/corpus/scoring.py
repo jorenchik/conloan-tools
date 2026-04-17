@@ -121,8 +121,11 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "weight_alpha":                    0.4,
         "weight_loanword":                 0.2,
 
-        "length_mu":                       30, # real median
-        "length_sigma":                    10, # 15.6 real sigma -> 10
+        "length_mu":                       30, # real median was 21.
+        "length_sigma":                    10, # 15.6 real sigma -> a bit tighter -> 10
+
+        "loanword_mu":                     0.30,
+        "loanword_sigma":                  0.15,
     },
     QueryProfile.CODE_SWITCH: {
         "min_tokens":                      5,
@@ -150,9 +153,9 @@ _PROFILE_DEFAULTS: dict[QueryProfile, dict] = {
         "min_alpha_ratio":                 0.5,
         "filter_require_named_entity":     True,
 
-        "weight_named_entity":             0.33,
-        "weight_length":                   0.33,
-        "weight_alpha":                    0.33,
+        "weight_length":                   0.4,
+        "weight_alpha":                    0.4,
+        "weight_named_entity":             0.2,
 
         "length_mu":                       30,
         "length_sigma":                    10,
