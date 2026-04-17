@@ -111,35 +111,79 @@ def select_greedy(
     max_sentences_per_lemma: int = 1,
     verbose: bool = False,
 ) -> list[CandidateRecord]:
-    """Greedy coverage selection over a pre-fetched pool."""
-    # Pre-compute candidate counts per lemma from pool
-    lemma_candidate_counts: dict[str, int] = defaultdict(int)
+    """Rarest-first greedy coverage selection with restarts."""
+    from heapq import heappush, heappop
+    
+    # Build lemma → sentences index
+    lemma_to_sents: dict[str, list[CandidateRecord]] = defaultdict(list)
     for rec in pool:
         for lemma in rec.matched_lemmas:
-            lemma_candidate_counts[lemma] += 1
+            lemma_to_sents[lemma].append(rec)
     
     lemma_usage_count: dict[str, int] = defaultdict(int)
+    sent_used: set[int] = set()  # Track by cqp_id or object id
     final: list[CandidateRecord] = []
-    skipped = 0
-
-    for rec in tqdm(pool, desc="Greedy selection", unit="sent"):
-        matched = rec.matched_lemmas
-        if not matched:
-            skipped += 1
-            continue
-
-        can_use = all(
-            lemma_usage_count[l] < max_sentences_per_lemma for l in matched
-        )
-        if can_use:
-            final.append(rec)
-            for l in matched:
+    
+    # Priority queue: (num_candidates, lemma)
+    # Lower count = higher priority
+    def rebuild_queue():
+        queue = []
+        for lemma, sents in lemma_to_sents.items():
+            if lemma_usage_count[lemma] >= max_sentences_per_lemma:
+                continue
+            # Count available (unused) sentences for this lemma
+            available = sum(1 for s in sents if id(s) not in sent_used)
+            if available > 0:
+                heappush(queue, (available, lemma))
+        return queue
+    
+    pq = rebuild_queue()
+    iterations = 0
+    
+    with tqdm(desc="Rarest-first greedy", unit="lem") as pbar:
+        while pq:
+            iterations += 1
+            available_count, lemma = heappop(pq)
+            
+            # Skip if already satisfied
+            if lemma_usage_count[lemma] >= max_sentences_per_lemma:
+                continue
+            
+            # Find best available sentence for this lemma
+            candidates = lemma_to_sents[lemma]
+            best_sent = None
+            best_score = -1
+            
+            for sent in candidates:
+                if id(sent) in sent_used:
+                    continue
+                # Check if all lemmas in this sentence can accept more
+                can_use = all(
+                    lemma_usage_count[l] < max_sentences_per_lemma 
+                    for l in sent.matched_lemmas
+                )
+                if can_use and sent.score_total > best_score:
+                    best_score = sent.score_total
+                    best_sent = sent
+            
+            if best_sent is None:
+                # No usable sentence for this lemma, skip
+                pbar.update(1)
+                continue
+            
+            # Select the sentence
+            final.append(best_sent)
+            sent_used.add(id(best_sent))
+            for l in best_sent.matched_lemmas:
                 lemma_usage_count[l] += 1
-        else:
-            skipped += 1
+            
+            # Rebuild queue to reflect new priorities
+            pq = rebuild_queue()
+            pbar.update(1)
+            pbar.set_postfix(selected=len(final), lemmas_covered=sum(1 for v in lemma_usage_count.values() if v > 0))
 
+    all_lemmas = set(lemma_to_sents.keys())
     covered = sum(1 for v in lemma_usage_count.values() if v > 0)
-    all_lemmas = set(lemma_candidate_counts.keys())
     saturated = sum(1 for v in lemma_usage_count.values() if v >= max_sentences_per_lemma)
     density_counts = [len(r.matched_lemmas) for r in final]
     avg_density = sum(density_counts) / len(density_counts) if density_counts else 0
@@ -147,10 +191,10 @@ def select_greedy(
     uncovered_lemmas = sorted(all_lemmas - {l for r in final for l in r.matched_lemmas})
 
     click.echo(
-        f"\nGreedy selection summary"
+        f"\nRarest-first greedy summary"
         f"\n  Pool size      : {len(pool)}"
-        f"\n  Kept           : {len(final)}  ({100 * len(final) / len(pool):.1f}%)"
-        f"\n  Skipped        : {skipped}"
+        f"\n  Selected       : {len(final)}"
+        f"\n  Iterations     : {iterations}"
         f"\n  Unique lemmas  : {len(all_lemmas)}"
         f"\n  Covered        : {covered}  ({100 * covered / len(all_lemmas):.1f}%)"
         f"\n  Saturated      : {saturated}  (hit {max_sentences_per_lemma}-sentence cap)"
@@ -161,7 +205,7 @@ def select_greedy(
     if verbose and uncovered_lemmas:
         click.echo("  Uncovered lemmas:")
         for lemma in uncovered_lemmas:
-            count = lemma_candidate_counts.get(lemma, 0)
+            count = len(lemma_to_sents.get(lemma, []))
             click.echo(f"    - {lemma} ({count} candidates in pool)")
 
     return final
