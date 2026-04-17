@@ -622,6 +622,155 @@ def _render_code_switch_results(
 
     click.echo(f"({len(results)} sequences shown)")
 
+def _scan_lemma_candidates(
+    lemma_labels: np.ndarray,
+    records: list[IndexRecord],
+    want: set[int],
+    mode: Literal["or", "xor"],
+    vocab_to_lemma: Optional[dict[int, str]] = None,
+    unmapped_lemmas: Optional[set[str]] = None,
+    allowed: set[int] | None = None,
+    desc: str = "Scanning lemmas",
+) -> list[int]:
+    """
+    Vectorized: return sorted sentence indices that contain lemmas in `want`.
+    
+    mode='or': sentence contains ANY of the lemmas in `want`
+    mode='xor': sentence contains EXACTLY ONE of the lemmas in `want`
+    
+    `want` should be the actual vocab indices (1-based, matching the index data).
+    `vocab_to_lemma` maps vocab index -> lemma string for XOR counting.
+    `unmapped_lemmas` are lemmas not found in vocab (excluded from XOR).
+    """
+    if not records:
+        return []
+
+    CHUNK = 50_000
+    want_arr = np.array(sorted(want), dtype=lemma_labels.dtype)
+    hit_sents:  set[int] = set()
+    multi_sents: set[int] = set()  # sentences with >1 match (for xor)
+    n = len(records)
+    with tqdm(total=n, desc=desc, unit="sent") as pbar:
+        for chunk_start in range(0, n, CHUNK):
+            chunk_end = min(chunk_start + CHUNK, n)
+            chunk_records = records[chunk_start:chunk_end]
+            offsets  = np.array([r.offset for r in chunk_records], dtype=np.int64)
+            counts   = np.array([r.count  for r in chunk_records], dtype=np.int32)
+            chunk_flat_start = int(offsets[0])
+            end_idx  = int(offsets[-1]) + int(counts[-1])
+            flat     = lemma_labels[chunk_flat_start:end_idx]
+            sent_ids = np.repeat(
+                np.arange(chunk_start, chunk_end, dtype=np.int32), counts
+            )
+            
+            # Find positions with any of the wanted lemmas
+            token_hits = np.isin(flat, want_arr)
+            
+            if token_hits.any():
+                hit_sent_ids = np.unique(sent_ids[token_hits])
+                hit_sents |= set(hit_sent_ids.tolist())
+                
+                if mode == "xor" and vocab_to_lemma is not None:
+                    # For each hit sentence, count unique LEMMAS (not vocab indices)
+                    for sid in hit_sent_ids:
+                        rec = chunk_records[sid - chunk_start]
+                        start = int(offsets[sid - chunk_start]) - chunk_flat_start
+                        end = start + rec.count
+                        sent_slice = flat[start:end]
+                        matched_vocab = np.unique(sent_slice[np.isin(sent_slice, want_arr)])
+                        # Map vocab indices back to lemma strings
+                        matched_lemmas = set(
+                            vocab_to_lemma[int(v)]
+                            for v in matched_vocab
+                            if int(v) in vocab_to_lemma
+                        )
+                        if unmapped_lemmas:
+                            # Exclude sentences where ALL matched lemmas are unmapped
+                            if matched_lemmas and matched_lemmas.issubset(unmapped_lemmas):
+                                multi_sents.add(int(sid))
+                                continue
+                        if len(matched_lemmas) > 1:
+                            multi_sents.add(int(sid))
+            
+            pbar.update(chunk_end - chunk_start)
+
+    if mode == "xor":
+        hit_sents -= multi_sents
+    
+    if allowed is not None:
+        hit_sents &= allowed
+    return sorted(hit_sents)
+
+
+def _load_lemma_index(
+    h5_path: Path,
+) -> tuple[np.ndarray, list[IndexRecord], np.ndarray, list[str]]:
+    """Load lemma index: returns (lemma_labels, records, cpos, vocab_list)."""
+    with h5py.File(h5_path, "r") as f:
+        cpos  = f["index"]["cpos"][:]
+        count = f["index"]["count"][:]
+        ds = f["scores"]["data"]
+        click.echo(f"[*] Lemma index: shape={ds.shape} dtype={ds.dtype}", err=True)
+        
+        labels = np.empty(ds.shape[0], dtype=ds.dtype)
+        n = ds.shape[0]
+        chunk = ds.chunks[0] if ds.chunks else 1024 * 1024
+        with tqdm(total=n, unit="tok", desc=f"Loading lemma index {h5_path.name}", leave=False) as pbar:
+            for start in range(0, n, chunk):
+                end = min(start + chunk, n)
+                labels[start:end] = ds[start:end]
+                pbar.update(end - start)
+        
+        # Load vocab - h5py returns bytes for variable-length strings
+        raw_vocab = list(f["vocab"][:])
+        vocab_list = []
+        for v in raw_vocab:
+            if isinstance(v, bytes):
+                vocab_list.append(v.decode("utf-8"))
+            elif isinstance(v, str):
+                vocab_list.append(v)
+            else:
+                vocab_list.append(str(v))
+        
+    records = _build_records(count)
+    click.echo(
+        f"[*] Lemma index loaded: {len(records):,} sentences  "
+        f"{labels.nbytes / 1024**2:.1f} MB  "
+        f"vocab_size={len(vocab_list)}",
+        err=True,
+    )
+    return labels, records, cpos, vocab_list
+
+
+def _build_vocab_index_map(
+    lemmas: List[str],
+    vocab_list: list[str],
+) -> tuple[dict[str, int], set[int], dict[int, str], set[str]]:
+    """
+    Build mapping from lemma string to vocab indices.
+    Returns (lemma_to_idx, vocab_indices, vocab_to_lemma, unmapped_lemmas).
+    vocab_indices are 1-based. vocab_to_lemma maps vocab index -> lemma string.
+    """
+    lemma_to_idx: dict[str, int] = {}
+    vocab_indices: set[int] = set()
+    vocab_to_lemma: dict[int, str] = {}  # vocab index -> lemma string
+    unmapped_lemmas: set[str] = set()
+    
+    for lemma in lemmas:
+        found = False
+        for i, v in enumerate(vocab_list):
+            if v.lower() == lemma.lower():
+                idx = i + 1  # 1-based
+                if lemma not in lemma_to_idx:
+                    lemma_to_idx[lemma] = idx
+                vocab_indices.add(idx)
+                vocab_to_lemma[idx] = lemma
+                found = True
+        if not found:
+            unmapped_lemmas.add(lemma)
+    
+    return lemma_to_idx, vocab_indices, vocab_to_lemma, unmapped_lemmas
+
 # ------ Public -------
 
 def load_mask_sources(
@@ -1688,6 +1837,19 @@ def query_code_switch(
     help="Newline-separated file of lemmas. Alternative to LEMMAS argument.",
 )
 @click.option(
+    "--lemma-h5",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Pre-built lemma HDF5 index. Uses CQP query if omitted.",
+)
+@click.option(
+    "--lemma-mode",
+    type=click.Choice(["or", "xor"]),
+    default="or",
+    show_default=True,
+    help="XOR: exactly one match. OR: at least one match.",
+)
+@click.option(
     "--lookup",
     type=int,
     default=DEFAULT_LOOKUP,
@@ -1712,10 +1874,18 @@ def query_code_switch(
     default=None,
     help="Write JSONL to file. Omit to write to stdout.",
 )
+@click.option(
+    "--sequential",
+    is_flag=True,
+    default=False,
+    help="Scan in index order when using --lemma-h5. Default: random by seed.",
+)
 def query_lemmas_command(
     corpus_name,
     lemmas,
     lemmas_file,
+    lemma_h5,
+    lemma_mode,
     lookup,
     results,
     cqp_bin,
@@ -1733,8 +1903,13 @@ def query_lemmas_command(
     lingua_context_threshold,
     lingua_span_threshold,
     output,
+    sequential,
 ):
-    """Query corpus by lemma(s) and emit JSONL records."""
+    """Query corpus by lemma(s) and emit JSONL records.
+    
+    Use --lemma-h5 to scan a pre-built lemma index with XOR/OR mode.
+    Without --lemma-h5, uses CQP querying.
+    """
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
         surprisal_threshold=surprisal_threshold,
@@ -1756,17 +1931,36 @@ def query_lemmas_command(
         raise click.UsageError("Provide either LEMMAS argument or --lemmas-file.")
     lemma_set_lower = {l.lower(): l for l in lemma_list}
 
-    found = query_by_lemmas(
-        corpus_name=corpus_name,
-        lemmas=lemma_list,
-        lookup=lookup,
-        cqp_bin=cqp_bin,
-        registry_dir=registry_dir,
-        scoring_config=scoring_config,
-        verbose=True,
-        mask_src=mask_src,
-        lingua_lang=lingua_lang,
-    )
+    if lemma_h5 is not None:
+        # Use index-based scanning
+        found = _query_lemmas_by_index(
+            corpus_name=corpus_name,
+            lemma_list=lemma_list,
+            lemma_h5=lemma_h5,
+            mode=lemma_mode,
+            mask_src=mask_src,
+            cqp_bin=cqp_bin,
+            registry_dir=registry_dir,
+            seed=seed,
+            scoring_config=scoring_config,
+            lingua_lang=lingua_lang,
+            sequential=sequential,
+            lookup=lookup,
+            verbose=True,
+        )
+    else:
+        # Fall back to CQP querying
+        found = query_by_lemmas(
+            corpus_name=corpus_name,
+            lemmas=lemma_list,
+            lookup=lookup,
+            cqp_bin=cqp_bin,
+            registry_dir=registry_dir,
+            scoring_config=scoring_config,
+            verbose=True,
+            mask_src=mask_src,
+            lingua_lang=lingua_lang,
+        )
 
     shown = found[:results] if results > 0 else found
 
@@ -1796,6 +1990,143 @@ def query_lemmas_command(
 
     if output:
         click.echo(f"[✓] Wrote {len(shown)} records to {output}", err=True)
+
+
+def _query_lemmas_by_index(
+    corpus_name: str,
+    lemma_list: List[str],
+    lemma_h5: Path,
+    mode: Literal["or", "xor"],
+    mask_src: MaskSources,
+    cqp_bin: str,
+    registry_dir: Optional[str],
+    seed: int,
+    scoring_config: Optional[str],
+    lingua_lang: Optional[str],
+    sequential: bool,
+    lookup: Optional[int],
+    verbose: bool,
+) -> List[ScoredResult]:
+    """Query lemmas using a pre-built lemma index with XOR/OR scanning."""
+    cfg = load_scoring_config(scoring_config, profile=QueryProfile.LEMMAS)
+    if (cfg.filter_require_context_lang or cfg.filter_require_span_lang) and not lingua_lang:
+        raise click.UsageError(
+            "This scoring profile requires --lingua-lang "
+            "(filter_require_context_lang or filter_require_span_lang is set)."
+        )
+
+    detector = _make_lingua_detector() if lingua_lang else None
+
+    if lingua_lang:
+        lang = _get_lingua_language(lingua_lang)
+        if lang is None:
+            raise click.UsageError(
+                f"Unrecognized language code: {lingua_lang!r}. "
+                f"Provide a valid ISO 639-1 code (e.g., 'lv', 'en', 'de')."
+            )
+
+    click.echo(f"[*] Loading lemma index: {lemma_h5}", err=True)
+    lemma_labels, lemma_records, lemma_cpos, vocab_list = _load_lemma_index(lemma_h5)
+    
+    # Build mapping from requested lemmas to vocab indices
+    lemma_to_idx, vocab_indices, vocab_to_lemma, unmapped_lemmas = _build_vocab_index_map(
+        lemma_list, vocab_list
+    )
+    
+    if not vocab_indices:
+        click.echo(f"[!] No lemmas found in vocab. Available: {vocab_list[:20]}...", err=True)
+        return []
+    
+    found_lemmas = [k for k in lemma_to_idx.keys()]
+    click.echo(f"[*] Lemma mode={mode}, matched {len(found_lemmas)}/{len(lemma_list)} lemmas: {found_lemmas}", err=True)
+    if unmapped_lemmas:
+        click.echo(f"[*] Unmapped lemmas (not in vocab): {sorted(unmapped_lemmas)}", err=True)
+
+    # Build sentence index set for sequential/random sampling
+    allowed = _sentence_index_set(len(lemma_records), sequential, seed, lookup)
+    
+    if mask_src.surprisal_records and mask_src.ner_records:
+        _assert_index_alignment(mask_src.surprisal_records, mask_src.ner_records)
+
+    ref_records = mask_src.surprisal_records or mask_src.ner_records
+    ref_cpos_arr = (
+        mask_src.surprisal_cpos if mask_src.surprisal_records else mask_src.ner_cpos
+    )
+
+    click.echo(
+        f"[*] Scanning in {'sequential' if sequential else f'random (seed={seed})'} order"
+        + (f", {lookup} sentences" if lookup else ""),
+        err=True,
+    )
+    
+    matching_sents = _scan_lemma_candidates(
+        lemma_labels=lemma_labels,
+        records=lemma_records,
+        want=vocab_indices,
+        mode=mode,
+        vocab_to_lemma=vocab_to_lemma,
+        unmapped_lemmas=unmapped_lemmas if mode == "xor" else None,
+        allowed=allowed,
+    )
+    
+    if not matching_sents:
+        click.echo("[*] No matching sentences found", err=True)
+        return []
+    
+    click.echo(f"[*] Found {len(matching_sents)} matching sentence(s)", err=True)
+    
+    # Fetch sentences from corpus
+    click.echo("[*] Fetching sentences from corpus...", err=True)
+    raw_output = fetch_corpus_sentences(
+        corpus=corpus_name,
+        indices=matching_sents,
+        mode="spos",
+        cqp_bin=cqp_bin,
+        registry_dir=registry_dir,
+    )
+
+    sentence_map: dict[int, CQPResult] = {}
+    for parsed, sent_idx in zip(parse_cwb_output(raw_output), matching_sents):
+        sentence_map[sent_idx] = parsed
+
+    scored_results: list[ScoredResult] = []
+    for sent_idx in tqdm(matching_sents, desc="Scoring", unit="sent", disable=not verbose):
+        parsed = sentence_map[sent_idx]
+        lw_mask, cs_mask, ne_mask = build_masks(
+            parsed, sent_idx, mask_src, lw_lemma_set=set(lemma_list)
+        )
+        
+        # Build lemma mask for this sentence
+        rec = lemma_records[sent_idx]
+        sent_lemma_labels = lemma_labels[rec.offset : rec.offset + rec.count]
+        n = len(parsed.tokens)
+        
+        # Tag tokens that match our lemmas
+        lemma_mask = [0] * n
+        for i in range(min(n, len(sent_lemma_labels))):
+            if sent_lemma_labels[i] in vocab_indices:
+                lemma_mask[i] = 1
+        
+        detected_lang, span_lang = _detect_langs(
+            detector, parsed, lemma_mask,
+            context_threshold=mask_src.lingua_context_threshold,
+            span_threshold=mask_src.lingua_span_threshold,
+        )
+
+        scored = score_sentence(
+            parsed,
+            loanword_mask=lw_mask,
+            code_switch_mask=cs_mask,
+            named_entity_mask=ne_mask,
+            detected_lang=detected_lang,
+            lingua_lang=lingua_lang,
+            span_lang=span_lang,
+            cfg=cfg,
+        )
+        scored_results.append(scored)
+
+    scored_results.sort(key=lambda r: r.score_total, reverse=True)
+    return scored_results
 
 
 @query_group.command("position")

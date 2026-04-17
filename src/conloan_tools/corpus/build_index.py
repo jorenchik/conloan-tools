@@ -265,7 +265,7 @@ def iter_vert_sentences(
                     if yield_lemmas:
                         parts = stripped.split("\t")
                         tokens.append(parts[0])
-                        lemmas.append(parts[1] if len(parts) > 1 else parts[0])
+                        lemmas.append(parts[2] if len(parts) > 2 else parts[0])
                     else:
                         parts = stripped.split("\t", 1)
                         tokens.append(parts[0])
