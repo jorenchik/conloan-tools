@@ -354,6 +354,8 @@ def _apply_hard_gates(
             raise click.UsageError(
                 "filter_require_span_lang is set but --lingua-lang was not provided."
             )
+        if span_lang is None:
+            return "span_lang_undetected"
         if span_lang == lingua_lang:
             return "span_not_foreign"
 

@@ -1260,6 +1260,7 @@ def find_code_switch_sequences(
         index_records=index_records,
         threshold=threshold,
         min_consecutive=min_consecutive,
+        max_consecutive=max_consecutive,
         lookup=lookup,
         allowed=allowed,
     )
