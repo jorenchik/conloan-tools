@@ -255,6 +255,15 @@ def _make_lingua_detector():
     return LanguageDetectorBuilder.from_all_languages().with_low_accuracy_mode().build()
 
 
+def _get_lingua_language(lang_code: str):
+    """Get Lingua Language enum from ISO 639-1 code, or None if invalid."""
+    from lingua import Language
+    try:
+        return Language.from_iso_code_639_1(lang_code.lower())
+    except (ValueError, AttributeError):
+        return None
+
+
 @dataclass
 class MaskSources:
     surprisal_scores: Optional[np.ndarray] = None
@@ -1018,6 +1027,14 @@ def query_by_lemmas(
 
     detector = _make_lingua_detector() if lingua_lang else None
 
+    if lingua_lang:
+        lang = _get_lingua_language(lingua_lang)
+        if lang is None:
+            raise click.UsageError(
+                f"Unrecognized language code: {lingua_lang!r}. "
+                f"Provide a valid ISO 639-1 code (e.g., 'lv', 'en', 'de')."
+            )
+
     click.echo("[*] Querying CQP...", err=True)
     raw_output = query_cqp_batch(
         corpus_name,
@@ -1212,7 +1229,7 @@ def find_code_switch_sequences(
     cfg: ScoringConfig,
     cqp_bin: str = DEFAULT_CQP_BIN,
     registry_dir: Optional[str] = None,
-    lookup: int | None = None,        # renamed from limit_sentences
+    lookup: int | None = None,
     mask_src: Optional[MaskSources] = None,
     allowed = None,
     lingua_lang: str | None = None,
@@ -1221,6 +1238,14 @@ def find_code_switch_sequences(
     """Score all qualifying runs; caller is responsible for capping display."""
 
     detector = _make_lingua_detector() if lingua_lang else None
+
+    if lingua_lang:
+        lang = _get_lingua_language(lingua_lang)
+        if lang is None:
+           raise click.UsageError(
+               f"Unrecognized language code: {lingua_lang!r}. "
+               f"Provide a valid ISO 639-1 code (e.g., 'lv', 'en', 'de')."
+           )
 
     if mask_src is None:
         mask_src = MaskSources()
@@ -1847,6 +1872,14 @@ def query_ner_entities(
             "(filter_require_context_lang or filter_require_span_lang is set)."
         )
     detector = _make_lingua_detector() if lingua_lang else None
+
+    if lingua_lang:
+        lang = _get_lingua_language(lingua_lang)
+        if lang is None:
+            raise click.UsageError(
+                f"Unrecognized language code: {lingua_lang!r}. "
+                f"Provide a valid ISO 639-1 code (e.g., 'lv', 'en', 'de')."
+            )
 
     mask_src = load_mask_sources(
         surprisal_h5=surprisal_h5,
