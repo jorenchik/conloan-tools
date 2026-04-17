@@ -630,6 +630,81 @@ def build_ner_index_command(
     click.echo(f"    {h5_path} ({h5_path.stat().st_size:,} B)", err=True)
 
 
+@click.command("convert-ner-logits")
+@click.argument("input_h5", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--output", "-o", type=click.Path(dir_okay=False, path_type=Path), required=True)
+@click.option("--chunk-tokens", default=500_000, show_default=True)
+@click.option("--confidence", is_flag=True, help="Also store confidence scores (float16).")
+def convert_ner_logits(input_h5: Path, output: Path, chunk_tokens: int, confidence: bool):
+    """Convert NER logits HDF5 to labels (uint8) + optional confidence."""
+    import h5py
+    from scipy.special import softmax
+    import datetime
+
+    with h5py.File(input_h5, "r") as src:
+        # Validate input
+        if src.attrs.get("ner_output") != "logits":
+            raise click.UsageError(
+                f"Input must have ner_output='logits', got {src.attrs.get('ner_output')!r}"
+            )
+        
+        src_dtype = src["scores"]["data"].dtype
+        n_tokens, n_labels = src["scores"]["data"].shape
+        
+        with h5py.File(output, "w") as dst:
+            # Copy metadata
+            for k, v in src.attrs.items():
+                dst.attrs[k] = v
+            dst.attrs["ner_output"] = "labels"
+            dst.attrs["converted_from"] = str(input_h5)
+            dst.attrs["date"] = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            
+            # Copy index datasets
+            src.copy("index", dst)
+            
+            # Create output datasets
+            scores_grp = dst.create_group("scores")
+            labels_ds = scores_grp.create_dataset(
+                "data", shape=(n_tokens,), dtype=np.uint8,
+                compression="gzip", compression_opts=4,
+                chunks=(8192,),
+            )
+            conf_ds = None
+            if confidence:
+                conf_ds = scores_grp.create_dataset(
+                    "confidence", shape=(n_tokens,), dtype=np.float16,
+                    compression="gzip", compression_opts=4,
+                    chunks=(8192,),
+                )
+            
+            # Process in chunks, respecting dtype
+            ds = src["scores"]["data"]
+            
+            for start in tqdm(range(0, n_tokens, chunk_tokens), desc="Converting"):
+                end = min(start + chunk_tokens, n_tokens)
+                logits = ds[start:end]  # h5py returns native dtype
+                
+                # Promote to float32 for stable softmax
+                if logits.dtype == np.float16:
+                    logits_f = logits.astype(np.float32)
+                elif logits.dtype == np.float32:
+                    logits_f = logits
+                elif src.attrs.get("bf16_promoted"):
+                    # bf16 was stored as fp32
+                    logits_f = logits
+                else:
+                    # Unknown dtype - force conversion
+                    logits_f = logits.astype(np.float32)
+                
+                probs = softmax(logits_f, axis=-1)
+                labels = np.argmax(probs, axis=-1).astype(np.uint8)
+                labels_ds[start:end] = labels
+                if conf_ds is not None:
+                    conf_ds[start:end] = probs.max(axis=-1).astype(np.float16)
+
+    click.echo(f"[✓] Wrote {output} ({output.stat().st_size:,} B)", err=True)
+
+
 def _iter_length_scores(
     input_path: str,
     filter_clean: bool,
