@@ -112,6 +112,12 @@ def select_greedy(
     verbose: bool = False,
 ) -> list[CandidateRecord]:
     """Greedy coverage selection over a pre-fetched pool."""
+    # Pre-compute candidate counts per lemma from pool
+    lemma_candidate_counts: dict[str, int] = defaultdict(int)
+    for rec in pool:
+        for lemma in rec.matched_lemmas:
+            lemma_candidate_counts[lemma] += 1
+    
     lemma_usage_count: dict[str, int] = defaultdict(int)
     final: list[CandidateRecord] = []
     skipped = 0
@@ -133,7 +139,7 @@ def select_greedy(
             skipped += 1
 
     covered = sum(1 for v in lemma_usage_count.values() if v > 0)
-    all_lemmas = set(lemma_usage_count.keys())
+    all_lemmas = set(lemma_candidate_counts.keys())
     saturated = sum(1 for v in lemma_usage_count.values() if v >= max_sentences_per_lemma)
     density_counts = [len(r.matched_lemmas) for r in final]
     avg_density = sum(density_counts) / len(density_counts) if density_counts else 0
@@ -155,7 +161,8 @@ def select_greedy(
     if verbose and uncovered_lemmas:
         click.echo("  Uncovered lemmas:")
         for lemma in uncovered_lemmas:
-            click.echo(f"    - {lemma}")
+            count = lemma_candidate_counts.get(lemma, 0)
+            click.echo(f"    - {lemma} ({count} candidates in pool)")
 
     return final
 
@@ -200,7 +207,13 @@ def make_sheet(candidates, output, strategy, max_per_lemma, results, missing_pla
         pool = [r for r in pool if r.score_total != 0.0]
         click.echo(f"Filtered {before - len(pool)} zero-score candidates. Remaining: {len(pool)}.")
     click.echo(f"Loaded {len(pool)} candidates from {candidates}.")
-
+    
+    # Diagnostic: per-lemma candidate counts
+    lemma_candidate_counts: dict[str, int] = defaultdict(int)
+    for rec in pool:
+        for lemma in rec.matched_lemmas:
+            lemma_candidate_counts[lemma] += 1
+    
     if strategy == "greedy":
         selected = select_greedy(pool, max_sentences_per_lemma=max_per_lemma, verbose=verbose_stats)
     else:
