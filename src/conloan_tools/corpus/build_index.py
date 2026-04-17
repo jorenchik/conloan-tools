@@ -173,12 +173,20 @@ def iter_vert_sentences(
     limit_lines: int | None = None,
     limit_sentences: int | None = None,
     limit_mb: float | None = None,
+    yield_lemmas: bool = False,  # NEW PARAMETER
 ):
+    """
+    Iterate over sentences in a VERT file.
+    
+    Default: yields (sent_id, tokens, cpos)
+    With yield_lemmas=True: yields (sent_id, tokens, lemmas, cpos)
+    """
     auto_id = 0
     current_id: str | None = None
     tokens: list[str] = []
+    lemmas: list[str] | None = [] if yield_lemmas else None
     sentence_start_cpos = 0
-    cpos_counter = 0  # global, advances for every token line
+    cpos_counter = 0
 
     processed_count = 0
     sentences_count = 0
@@ -212,7 +220,10 @@ def iter_vert_sentences(
                 len(stripped) == 2 or stripped[2] in (" ", ">")
             ):
                 if current_id is not None:
-                    yield current_id, tokens, sentence_start_cpos
+                    if yield_lemmas:
+                        yield current_id, tokens, lemmas, sentence_start_cpos
+                    else:
+                        yield current_id, tokens, sentence_start_cpos
                     sentences_count += 1
                     if limit_sentences is not None and sentences_count >= limit_sentences:
                         return
@@ -221,16 +232,23 @@ def iter_vert_sentences(
                 current_id = m.group(1) if m else str(auto_id)
                 auto_id += 1
                 tokens = []
-                sentence_start_cpos = cpos_counter  # record here
+                if lemmas is not None:
+                    lemmas.clear()
+                sentence_start_cpos = cpos_counter
 
             elif stripped.startswith("</s") and (
                 len(stripped) == 3 or stripped[3] in (" ", ">")
             ):
                 if current_id is not None:
-                    yield current_id, tokens, sentence_start_cpos
+                    if yield_lemmas:
+                        yield current_id, tokens, lemmas, sentence_start_cpos
+                    else:
+                        yield current_id, tokens, sentence_start_cpos
                     sentences_count += 1
                     current_id = None
                     tokens = []
+                    if lemmas is not None:
+                        lemmas.clear()
                     if limit_sentences is not None and sentences_count >= limit_sentences:
                         return
 
@@ -241,11 +259,16 @@ def iter_vert_sentences(
                 if not stripped:
                     continue
                 if current_id is not None and not tokens:
-                    sentence_start_cpos = cpos_counter  # first token of sentence
-                cpos_counter += 1  # always advance, even outside <s>
+                    sentence_start_cpos = cpos_counter
+                cpos_counter += 1
                 if current_id is not None:
-                    parts = stripped.split("\t", 1)
-                    tokens.append(parts[0])
+                    if yield_lemmas:
+                        parts = stripped.split("\t")
+                        tokens.append(parts[0])
+                        lemmas.append(parts[1] if len(parts) > 1 else parts[0])
+                    else:
+                        parts = stripped.split("\t", 1)
+                        tokens.append(parts[0])
 
 
 # HDF5 layout (both surprisal and NER):
@@ -925,6 +948,233 @@ def build_lengths_index_command(
         output_dir=output_dir,
         name=name,
         filter_clean=not no_filter,
+        store_spos=not no_spos,
+        limit_lines=limit_lines,
+        limit_sentences=limit_sentences,
+        limit_mb=limit_mb,
+    )
+    click.echo("[✓] Finished", err=True)
+    click.echo(f"    {h5_path} ({h5_path.stat().st_size:,} B)", err=True)
+
+
+def _load_lemma_vocab(path: str) -> tuple[list[str], dict[str, int]]:
+    """
+    Load newline-separated lemmas. Returns (vocab_list, vocab_dict).
+    vocab_list[0] = "<unk>" or first lemma? Per spec: 0 = no match, 1+ = index.
+    So vocab_list[0] is the first actual lemma (index 0 in list = 1 in data).
+    Actually: data contains 0 if no match, else vocab index+1.
+    So vocab_list[i] corresponds to data value i+1.
+    """
+    vocab = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            lemma = line.rstrip("\n")
+            if lemma:
+                vocab.append(lemma)
+    # Dedup while preserving order
+    seen = set()
+    deduped = []
+    for lemma in vocab:
+        if lemma not in seen:
+            seen.add(lemma)
+            deduped.append(lemma)
+    
+    vocab_dict = {lemma: i + 1 for i, lemma in enumerate(deduped)}  # 1-based for data
+    return deduped, vocab_dict
+
+
+def _iter_lemma_scores(
+    vocab: dict[str, int],
+    input_path: str,
+    limit_lines: int | None,
+    limit_sentences: int | None,
+    limit_mb: float | None,
+):
+    """
+    Yields (cpos, lemma_idx_arr) per sentence.
+    
+    lemma_idx_arr is uint16: 0 = no match (OOV), 1+ = vocab index+1.
+    """
+    for _, tokens, lemmas, cpos in iter_vert_sentences(
+        input_path,
+        limit_lines=limit_lines,
+        limit_sentences=limit_sentences,
+        limit_mb=limit_mb,
+        yield_lemmas=True,
+    ):
+        n = len(lemmas)
+        idx_arr = np.zeros(n, dtype=np.uint16)
+        
+        for i, lemma in enumerate(lemmas):
+            idx = vocab.get(lemma)
+            if idx is not None:
+                idx_arr[i] = idx  # already 1-based from vocab dict
+        
+        yield cpos, idx_arr
+
+
+def _create_lemma_hdf5(
+    path: Path,
+    meta: dict,
+    vocab: list[str],
+    store_spos: bool,
+) -> h5py.File:
+    """
+    Create HDF5 for lemma indices.
+    
+    Layout:
+      /attrs              metadata
+      /vocab              variable-length UTF-8 strings (vocab array)
+      /index/cpos         uint64  (sentence start token offset)
+      /index/count        uint32  (token count per sentence)
+      /index/spos         uint64  (optional sentence ordinal)
+      /scores/data        uint16  (flat: 0=OOV, 1+=vocab index+1)
+    """
+    f = h5py.File(path, "w")
+    for k, v in meta.items():
+        f.attrs[k] = json.dumps(v) if isinstance(v, (dict, list)) else v
+
+    # Store vocab as fixed-length or variable-length strings
+    # Variable-length is safer for arbitrary lemma lengths
+    vocab_arr = np.array(vocab, dtype=object)
+    f.create_dataset("vocab", data=vocab_arr, dtype=h5py.string_dtype(encoding="utf-8"))
+
+    so = _ds_opts((_CHUNK_SENTS,))
+    idx = f.create_group("index")
+    idx.create_dataset("cpos",  shape=(0,), maxshape=(None,), dtype=np.uint64, **so)
+    idx.create_dataset("count", shape=(0,), maxshape=(None,), dtype=np.uint32, **so)
+    if store_spos:
+        idx.create_dataset("spos", shape=(0,), maxshape=(None,), dtype=np.uint64, **so)
+
+    scores = f.create_group("scores")
+    scores.create_dataset(
+        "data",
+        shape=(0,),
+        maxshape=(None,),
+        dtype=np.uint16,
+        **_ds_opts((_CHUNK_TOKENS,)),
+    )
+
+    return f
+
+
+def _lemma_flush(
+    f: h5py.File,
+    cpos_buf: list[int],
+    count_buf: list[int],
+    spos_buf: list[int] | None,
+    scores_buf: list[np.ndarray],
+    store_spos: bool,
+) -> None:
+    if not cpos_buf:
+        return
+
+    def _append(ds: h5py.Dataset, arr: np.ndarray) -> None:
+        old = ds.shape[0]
+        ds.resize(old + arr.shape[0], axis=0)
+        ds[old:] = arr
+
+    idx = f["index"]
+    _append(idx["cpos"],  np.array(cpos_buf,  dtype=np.uint64))
+    _append(idx["count"], np.array(count_buf, dtype=np.uint32))
+    if store_spos and spos_buf is not None:
+        _append(idx["spos"], np.array(spos_buf, dtype=np.uint64))
+    
+    _append(f["scores"]["data"], np.concatenate(scores_buf).astype(np.uint16))
+
+    cpos_buf.clear()
+    count_buf.clear()
+    if spos_buf is not None:
+        spos_buf.clear()
+    scores_buf.clear()
+
+
+def _build_lemma_index_from_iter(
+    score_iter,
+    f: h5py.File,
+    store_spos: bool,
+    flush_every: int,
+) -> None:
+    cpos_buf:   list[int]        = []
+    count_buf:  list[int]        = []
+    spos_buf:   list[int] | None = [] if store_spos else None
+    scores_buf: list[np.ndarray] = []
+    spos = 0
+
+    for cpos, arr in score_iter:
+        cpos_buf.append(cpos)
+        count_buf.append(arr.shape[0])
+        if spos_buf is not None:
+            spos_buf.append(spos)
+        scores_buf.append(arr)
+        spos += 1
+
+        if len(cpos_buf) >= flush_every:
+            _lemma_flush(f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos)
+
+    _lemma_flush(f, cpos_buf, count_buf, spos_buf, scores_buf, store_spos)
+
+
+def build_lemma_index(
+    vocab_path: str,
+    input_path: str,
+    output_dir: str,
+    name: str,
+    store_spos: bool = True,
+    flush_every: int = IDX_FLUSH_EVERY,
+    limit_lines: int | None = None,
+    limit_sentences: int | None = None,
+    limit_mb: float | None = None,
+) -> Path:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    h5_path = out / f"{name}.lemmas.h5"
+
+    vocab_list, vocab_dict = _load_lemma_vocab(vocab_path)
+
+    meta = {
+        "type":              "lemmas",
+        "input":             str(input_path),
+        "vocab_source":      str(vocab_path),
+        "vocab_size":        len(vocab_list),
+        "date":              datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "dtype":             "uint16",
+        "store_spos":        store_spos,
+    }
+
+    f = _create_lemma_hdf5(h5_path, meta, vocab_list, store_spos)
+    try:
+        _build_lemma_index_from_iter(
+            _iter_lemma_scores(
+                vocab_dict, input_path, limit_lines, limit_sentences, limit_mb,
+            ),
+            f, store_spos, flush_every,
+        )
+    finally:
+        f.close()
+
+    return h5_path
+
+
+@build_index.command("lemmas")
+@click.option("--vocab",           "vocab_path", required=True, help="Newline-separated lemma file")
+@click.option("--input",           "input_path", required=True, help=".vert corpus")
+@click.option("--output-dir",      required=True, help="Output directory")
+@click.option("--name",            required=True, help="Base name for output file")
+@click.option("--no-spos",         is_flag=True, default=False, help="Omit spos dataset")
+@click.option("--limit-lines",     type=int)
+@click.option("--limit-sentences", type=int)
+@click.option("--limit-mb",        type=float)
+def build_lemma_index_command(
+    vocab_path, input_path, output_dir, name,
+    no_spos, limit_lines, limit_sentences, limit_mb,
+) -> None:
+    """Build lemma index: map each token to vocab index (0=OOV, 1+=match)."""
+    h5_path = build_lemma_index(
+        vocab_path=vocab_path,
+        input_path=input_path,
+        output_dir=output_dir,
+        name=name,
         store_spos=not no_spos,
         limit_lines=limit_lines,
         limit_sentences=limit_sentences,
