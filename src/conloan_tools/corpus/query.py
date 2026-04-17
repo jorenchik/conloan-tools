@@ -257,9 +257,10 @@ def _make_lingua_detector():
 
 def _get_lingua_language(lang_code: str):
     """Get Lingua Language enum from ISO 639-1 code, or None if invalid."""
-    from lingua import Language
+    from lingua import Language, IsoCode639_1
     try:
-        return Language.from_iso_code_639_1(lang_code.lower())
+        iso = IsoCode639_1.from_str(lang_code.lower())
+        return Language.from_iso_code_639_1(iso)
     except (ValueError, AttributeError):
         return None
 
