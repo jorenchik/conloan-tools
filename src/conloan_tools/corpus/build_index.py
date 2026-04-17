@@ -554,6 +554,10 @@ def build_ner_index(
 def build_index():
     """Build validate HDF5 corpus index files."""
 
+@click.group("convert-index")
+def convert_index():
+    """Conversion tools for existing indices."""
+
 @build_index.command("surprisal")
 @click.option("--wb-pkl",          required=True, help="Witten-Bell model (.pkl)")
 @click.option("--input",           "input_path", required=True, help=".vert corpus")
@@ -630,7 +634,7 @@ def build_ner_index_command(
     click.echo(f"    {h5_path} ({h5_path.stat().st_size:,} B)", err=True)
 
 
-@click.command("convert-ner-logits")
+@convert_index.command("ner-logits")
 @click.argument("input_h5", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--output", "-o", type=click.Path(dir_okay=False, path_type=Path), required=True)
 @click.option("--chunk-tokens", default=500_000, show_default=True)
