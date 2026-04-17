@@ -191,9 +191,14 @@ def _record_to_row(rec: CandidateRecord) -> dict:
 @click.option("--verbose-stats", is_flag=True, default=False, help="List uncovered lemmas.")
 @click.option("--results", type=int, default=0, show_default=True, help="0 = all")
 @click.option("--missing-placeholder", is_flag=True, default=False)
-def make_sheet(candidates, output, strategy, max_per_lemma, results, missing_placeholder, verbose_stats):
+@click.option("--ignore-zero-score", is_flag=True, default=False, help="Skip candidates with score_total == 0.0")
+def make_sheet(candidates, output, strategy, max_per_lemma, results, missing_placeholder, verbose_stats, ignore_zero_score):
     """Generate annotation sheet from a JSONL candidates file."""
     pool = _load_candidates(candidates)
+    if ignore_zero_score:
+        before = len(pool)
+        pool = [r for r in pool if r.score_total != 0.0]
+        click.echo(f"Filtered {before - len(pool)} zero-score candidates. Remaining: {len(pool)}.")
     click.echo(f"Loaded {len(pool)} candidates from {candidates}.")
 
     if strategy == "greedy":
