@@ -2528,11 +2528,11 @@ def query_ner_entities(
             record = ner_records[sent_idx]
             chunk = mask_src.ner_labels[record.offset : record.offset + record.count]
             matched = [
-                id2label[int(chunk[i])]
+                (t.word, id2label[int(chunk[i])])
                 for i, t in enumerate(sentence_map[sent_idx].tokens)
                 if i < len(chunk) and int(chunk[i]) in want
             ]
-            tag_map = {f"NE{i+1}": v for i, v in enumerate(matched)}
+            tag_map = {f"NE{i+1}:{label}": word for i, (word, label) in enumerate(matched)}
             rec = _result_to_record(
                 mode="ner",
                 sentence=sentence,
