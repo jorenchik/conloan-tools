@@ -63,6 +63,11 @@ def strip_tags(sentence):
     return re.sub(r"</?[LN]\d+>", "", sentence)
 
 
+def normalize_slashes(sentence: str) -> str:
+    """Replace '//zx' with '/' in sentence strings."""
+    return sentence.replace("//zx", "/") if sentence else sentence
+
+
 def create_native_template(sentence_with_loan_tags):
     """Replace <L𝑛>word</L𝑛> with <N𝑛>word</N𝑛>."""
 
@@ -92,7 +97,8 @@ def build_row(
     else:
         found = True
 
-    sentence_native = create_native_template(sentence_loan)
+    sentence_loan = normalize_slashes(sentence_loan)
+    sentence_native = normalize_slashes(create_native_template(sentence_loan))
     tagged_lemmas = get_tagged_lemmas(
         parsed_result, lemma_set_lower, rec_word
     )
