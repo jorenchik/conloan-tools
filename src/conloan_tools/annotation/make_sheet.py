@@ -273,8 +273,22 @@ def _record_to_row(rec: CandidateRecord) -> dict:
 @click.option("--results", type=int, default=0, show_default=True, help="0 = all")
 @click.option("--missing-placeholder", is_flag=True, default=False)
 @click.option("--ignore-zero-score", is_flag=True, default=False, help="Skip candidates with score_total == 0.0")
-@click.option("--sort-by-score", is_flag=True, default=False, help="Sort output by score descending.")
-def make_sheet(candidates, output, strategy, stream_type, greedy_strategy, max_per_lemma, results, missing_placeholder, verbose_stats, ignore_zero_score, sort_by_score):
+@click.option("--sort-input", is_flag=True, default=False, help="Sort pool by score before selection.")
+@click.option("--sort-output", is_flag=True, default=False, help="Sort output by score descending.")
+def make_sheet(
+    candidates,
+    output,
+    strategy,
+    stream_type,
+    greedy_strategy,
+    max_per_lemma,
+    results,
+    missing_placeholder,
+    verbose_stats,
+    ignore_zero_score,
+    sort_input,
+    sort_output,
+):
     """Generate annotation sheet from a JSONL candidates file."""
     pool = _load_candidates(candidates)
     if ignore_zero_score:
@@ -282,6 +296,10 @@ def make_sheet(candidates, output, strategy, stream_type, greedy_strategy, max_p
         pool = [r for r in pool if r.score_total != 0.0]
         click.echo(f"Filtered {before - len(pool)} zero-score candidates. Remaining: {len(pool)}.")
     click.echo(f"Loaded {len(pool)} candidates from {candidates}.")
+    
+    if sort_input:
+        pool = sorted(pool, key=lambda r: r.score_total, reverse=True)
+        click.echo("Pool sorted by score descending.")
     
     # Diagnostic: per-lemma candidate counts
     lemma_candidate_counts: dict[str, int] = defaultdict(int)
@@ -299,7 +317,7 @@ def make_sheet(candidates, output, strategy, stream_type, greedy_strategy, max_p
     else:
         selected = select_top(pool, results=results)
 
-    if sort_by_score:
+    if sort_output:
         selected = sorted(selected, key=lambda r: r.score_total, reverse=True)
 
     rows = [_record_to_row(r) for r in selected]
