@@ -126,7 +126,17 @@ def select_stratified(
         tags = getattr(rec, 'tag_map', None)
         if not tags:
             continue
-        types_in_record = set(tags.values())
+        # For NE mode, keys are NE#:TYPE, extract type from key
+        # For lemmas/CS mode, keys are L# or CS# and values are lemmas
+        types_in_record = set()
+        for k, v in tags.items():
+            if k.startswith("NE"):
+                # Format: NE#:TYPE
+                if ":" in k:
+                    ne_type = k.split(":")[1]
+                    types_in_record.add(ne_type)
+            else:
+                types_in_record.add(v)
         for t in types_in_record:
             type_to_sents[t].append(rec)
     
@@ -161,7 +171,14 @@ def select_stratified(
                     picked += 1
                     pbar.update(1)
     
-    covered_types = {t for r in final for t in getattr(r, 'tag_map', {}).values()}
+    covered_types: set[str] = set()
+    for r in final:
+        tags = getattr(r, 'tag_map', {})
+        for k, v in tags.items():
+            if k.startswith("NE") and ":" in k:
+                covered_types.add(k.split(":")[1])
+            else:
+                covered_types.add(v)
     click.echo(
         f"\nStratified summary"
         f"\n  Pool size      : {len(pool)}"
@@ -173,7 +190,17 @@ def select_stratified(
     if verbose:
         click.echo("  Per-type counts (records may appear in multiple types):")
         for t in sorted(type_to_sents.keys()):
-            count = sum(1 for r in final if t in getattr(r, 'tag_map', {}).values())
+            count = 0
+            for r in final:
+                tags = getattr(r, 'tag_map', {})
+                for k, v in tags.items():
+                    if k.startswith("NE") and ":" in k:
+                        if t == k.split(":")[1]:
+                            count += 1
+                            break
+                    elif t == v:
+                        count += 1
+                        break
             click.echo(f"    - {t}: {count}")
     
     return final
