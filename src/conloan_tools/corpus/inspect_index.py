@@ -98,6 +98,15 @@ def _get_sentence_scores(f: h5py.File, row: int) -> np.ndarray:
         ]
         return np.stack(cols, axis=1)  # (n_tokens, 4)
 
+    if attrs := f.attrs:
+        if attrs.get("type") == "ner" and attrs.get("ner_output") == "logits":
+            dtype_str = str(attrs.get("dtype", "float32"))
+            dtype_name = dtype_str.replace("<class 'numpy.", "").replace("'>", "")
+            dtype = np.dtype(dtype_name)
+            return f["scores"]["data"][offset : offset + count].astype(dtype)
+        if attrs.get("type") == "ner":
+            return f["scores"]["data"][offset : offset + count].astype(np.uint8)
+
     if "data" not in f["scores"]:
         raise KeyError(
             f"scores/data not found and file is not surprisal type "
@@ -152,8 +161,8 @@ def _fmt_scores_2d(
         # Use same width as data values (8) for alignment; truncate labels to 8 chars
         header_parts = []
         for j in range(min(head_labels, len(arr[0]))):
-            lbl = id2label.get(j, str(j))[:6]
-            header_parts.append(f"{lbl:>6}")
+            lbl = id2label.get(j, str(j))[:8]
+            header_parts.append(f"{lbl:>8}")
         suffix = f"  ... (+{len(arr[0]) - head_labels} more)" if len(arr[0]) > head_labels else ""
         label_vals = "  ".join(f"{v}" for v in header_parts)
         lines.append(f"                             {key}=[{label_vals}]{suffix}")
@@ -163,9 +172,9 @@ def _fmt_scores_2d(
         label  = id2label[argmax] if id2label else str(argmax)
         top    = row[:head_labels]
         if softmax:
-            vals = "  ".join(f"{v:.4f}" for v in top)
+            vals = "  ".join(f"{v:>8.4f}" for v in top)
         else:
-            vals = "  ".join(f"{v:+.4f}" for v in top)
+            vals = "  ".join(f"{v:>+8.4f}" for v in top)
         suffix = f"  ... (+{len(row) - head_labels} more)" if len(row) > head_labels else ""
         lines.append(f"  token[{i:>4}]  argmax={label:<6} {key}=[{vals}]{suffix}")
     if len(arr) > head_tokens:
