@@ -71,7 +71,8 @@ class CodeSwitchRun:
     token_indices: list[int]
     token_scores: list[float]
     tokens: list[Token]
-    metrics: ScoredResult 
+    metrics: ScoredResult
+    ne_mask: list[int] = field(default_factory=list)
 
 # ------ Internal -------
 
@@ -161,6 +162,86 @@ def _tag_code_switch_sentence(run: CodeSwitchRun) -> str:
     index_set = set(run.token_indices)
     tokens = [(t.word, i in index_set) for i, t in enumerate(run.tokens)]
     return _collapse_spans(tokens, "CS")
+
+
+def _tag_code_switch_and_ner(
+    run: CodeSwitchRun,
+    ner_labels: np.ndarray,
+    ner_records: list[IndexRecord],
+    id2label: dict[int, str],
+    o_id: int,
+) -> str:
+    """
+    Tag CS spans and NEs outside those spans.
+    NEs are collapsed into globally-numbered NE1, NE2, ... spans.
+    CS tokens never get NE tags (CS takes precedence).
+    """
+    sent_idx = run.sent_idx
+    span_set = set(run.token_indices)
+    n = len(run.tokens)
+
+    # Get NE labels for this sentence
+    rec = ner_records[sent_idx]
+    chunk = ner_labels[rec.offset : rec.offset + rec.count]
+
+    # Build token info: (word, cs_tag, ne_label)
+    token_info: list[tuple[str, str | None, str | None]] = []
+    for i, t in enumerate(run.tokens):
+        cs_tag: str | None = None
+        ne_label: str | None = None
+
+        if i in span_set:
+            cs_idx = run.token_indices.index(i)
+            cs_tag = f"CS{cs_idx + 1}"
+        elif i < len(chunk):
+            label_id = int(chunk[i])
+            if label_id != o_id:
+                ne_label = id2label.get(label_id)
+
+        token_info.append((t.word, cs_tag, ne_label))
+
+    # Build output: CS spans collapse, NE spans collapse, rest is plain
+    parts: list[str] = []
+    cs_span: list[str] = []
+    ne_span: list[str] = []
+    ne_counter = 1
+    pending_cs_tag: str | None = None
+
+    def flush_cs():
+        nonlocal pending_cs_tag
+        if cs_span:
+            if pending_cs_tag:
+                parts.append(f"<{pending_cs_tag}>{' '.join(cs_span)}</{pending_cs_tag}>")
+            else:
+                parts.append(" ".join(cs_span))
+            cs_span.clear()
+            pending_cs_tag = None
+
+    def flush_ne():
+        nonlocal ne_counter
+        if ne_span:
+            parts.append(f"<NE{ne_counter}>{' '.join(ne_span)}</NE{ne_counter}>")
+            ne_span.clear()
+            ne_counter += 1
+
+    for word, cs_tag, ne_label in token_info:
+        if cs_tag is not None:
+            flush_ne()
+            flush_cs()
+            cs_span.append(word)
+            pending_cs_tag = cs_tag
+        elif ne_label is not None:
+            flush_cs()
+            ne_span.append(word)
+        else:
+            flush_cs()
+            flush_ne()
+            parts.append(word)
+
+    flush_cs()
+    flush_ne()
+
+    return " ".join(parts)
 
 
 def tag_all_loanwords(parsed_result, lemma_set_lower, primary_lemma):
@@ -858,6 +939,7 @@ def build_masks(
     else:
         cs_mask = [0] * n
 
+    ne_mask_out: list[int]
     if (
         src.ner_labels is not None
         and src.ner_records is not None
@@ -876,11 +958,11 @@ def build_masks(
                 return False
             return True
 
-        ne_mask = [int(_is_ne(int(l))) for l in sent_labels[:n]]
+        ne_mask_out = [int(_is_ne(int(l))) for l in sent_labels[:n]]
     else:
-        ne_mask = build_named_entity_mask(parsed)
+        ne_mask_out = build_named_entity_mask(parsed)
 
-    return lw_mask, cs_mask, ne_mask
+    return lw_mask, cs_mask, ne_mask_out
 
 
 def is_clean_word_old(w: str) -> bool:
@@ -1403,6 +1485,10 @@ def find_code_switch_sequences(
     if mask_src.ner_records is not None:
         _assert_index_alignment(index_records, mask_src.ner_records)
 
+    # Build lookup for O label id for NE filtering
+    o_id = None
+    if mask_src.ner_id2label:
+        o_id = next((k for k, v in mask_src.ner_id2label.items() if v == "O"), None)
 
     candidates = scan_anomaly_candidates(
         scores=scores,
@@ -1415,6 +1501,11 @@ def find_code_switch_sequences(
     )
     if not candidates:
         return []
+
+    # Get O label id for NE filtering in tagging
+    o_id = None
+    if mask_src is not None and mask_src.ner_id2label:
+        o_id = next((k for k, v in mask_src.ner_id2label.items() if v == "O"), None)
 
     unique_sent_indices = sorted({sent_idx for sent_idx, _, _ in candidates})
     raw_output = fetch_corpus_sentences(
@@ -1474,6 +1565,7 @@ def find_code_switch_sequences(
                 token_scores=valid_scores,
                 tokens=parsed.tokens,
                 metrics=metrics,
+                ne_mask=ne_mask,
             )
         )
 
@@ -1792,17 +1884,50 @@ def query_code_switch(
 
     with _output_context(output) as fh:
         for run in shown:
-            sentence = _tag_code_switch_sentence(run)
+            # Get NE labels for context tagging
+            o_id_local = None
+            if mask_src.ner_id2label:
+                o_id_local = next((k for k, v in mask_src.ner_id2label.items() if v == "O"), None)
+
+            sentence = _tag_code_switch_and_ner(
+                run,
+                mask_src.ner_labels,
+                mask_src.ner_records,
+                mask_src.ner_id2label,
+                o_id_local,
+            )
+
+            # Build tag_map for both CS and NE labels
+            tag_map: dict[str, str] = {}
+
+            # CS tags
+            for i, idx in enumerate(run.token_indices):
+                if idx < len(run.tokens):
+                    tag_map[f"CS{i+1}"] = run.tokens[idx].lemma
+
+            # NE tags - scan non-CS tokens for NE labels
+            if mask_src.ner_labels is not None and mask_src.ner_records is not None:
+                rec = mask_src.ner_records[run.sent_idx]
+                chunk = mask_src.ner_labels[rec.offset : rec.offset + rec.count]
+                span_set = set(run.token_indices)
+                ne_counter = 1
+
+                for i, t in enumerate(run.tokens):
+                    if i in span_set:
+                        continue
+                    if i < len(chunk):
+                        label_id = int(chunk[i])
+                        if o_id_local is None or label_id != o_id_local:
+                            label = mask_src.ner_id2label.get(label_id, "")
+                            if label and label != "O":
+                                tag_map[f"NE{ne_counter}"] = label
+                                ne_counter += 1
+
             matched = [
                 run.tokens[i].lemma
                 for i in run.token_indices
                 if i < len(run.tokens)
             ]
-            tag_map = {
-                f"CS{i+1}": run.tokens[idx].lemma
-                for i, idx in enumerate(run.token_indices)
-                if idx < len(run.tokens)
-            }
             token_surprisals = {
                 f"CS{i+1}": s
                 for i, (idx, s) in enumerate(
