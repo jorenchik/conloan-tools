@@ -141,16 +141,33 @@ def _fmt_scores_2d(
     id2label: dict[int, str] | None,
     head_tokens: int,
     head_labels: int,
+    softmax: bool = False,
 ) -> list[str]:
     """Return one line per token (up to head_tokens)."""
+    key = "softmax" if softmax else "logits"
     lines = []
+
+    # Header row with label names (only when id2label is available)
+    if id2label:
+        # Use same width as data values (8) for alignment; truncate labels to 8 chars
+        header_parts = []
+        for j in range(min(head_labels, len(arr[0]))):
+            lbl = id2label.get(j, str(j))[:6]
+            header_parts.append(f"{lbl:>6}")
+        suffix = f"  ... (+{len(arr[0]) - head_labels} more)" if len(arr[0]) > head_labels else ""
+        label_vals = "  ".join(f"{v}" for v in header_parts)
+        lines.append(f"                             {key}=[{label_vals}]{suffix}")
+
     for i, row in enumerate(arr[:head_tokens]):
         argmax = int(np.argmax(row))
         label  = id2label[argmax] if id2label else str(argmax)
         top    = row[:head_labels]
-        vals   = "  ".join(f"{v:+.4f}" for v in top)
+        if softmax:
+            vals = "  ".join(f"{v:.4f}" for v in top)
+        else:
+            vals = "  ".join(f"{v:+.4f}" for v in top)
         suffix = f"  ... (+{len(row) - head_labels} more)" if len(row) > head_labels else ""
-        lines.append(f"  token[{i:>4}]  argmax={label:<12} logits=[{vals}]{suffix}")
+        lines.append(f"  token[{i:>4}]  argmax={label:<6} {key}=[{vals}]{suffix}")
     if len(arr) > head_tokens:
         lines.append(f"  ... (+{len(arr) - head_tokens} more tokens)")
     return lines
@@ -171,20 +188,29 @@ def _fmt_scores_labels(
     return lines
 
 
+def _softmax(x: np.ndarray) -> np.ndarray:
+    """Row-wise softmax."""
+    e = np.exp(x - x.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
+
+
 def _print_sentence_scores(
     arr: np.ndarray,
     attrs: dict,
     f: h5py.File,
     head_tokens: int,
     head_labels: int,
+    softmax: bool = False,
 ) -> None:
     if _is_surprisal(f):
         click.echo("scores (surprisal — mean / dm_mad):")
         for line in _fmt_surprisal(arr, head_tokens):
             click.echo(line)
     elif _is_logits(f):
-        click.echo("scores (logits):")
-        for line in _fmt_scores_2d(arr, _id2label(attrs), head_tokens, head_labels):
+        label = "softmax" if softmax else "logits"
+        click.echo(f"scores ({label}):")
+        data = _softmax(arr) if softmax else arr
+        for line in _fmt_scores_2d(data, _id2label(attrs), head_tokens, head_labels, softmax):
             click.echo(line)
     elif attrs.get("type") == "ner":
         click.echo("scores (NER labels):")
@@ -260,12 +286,17 @@ def cmd_info(path: str) -> None:
     "--head-labels", default=5, show_default=True,
     help="Max logit columns to display per token (logits mode only).",
 )
+@click.option(
+    "--softmax", is_flag=True, default=False,
+    help="Apply softmax to logits before displaying (logits mode only).",
+)
 def cmd_sent(
     path: str,
     lookup_spos: int | None,
     lookup_cpos: int | None,
     head_tokens: int,
     head_labels: int,
+    softmax: bool,
 ) -> None:
     """Look up one sentence by --spos or --cpos and show its scores."""
     if (lookup_spos is None) == (lookup_cpos is None):
@@ -316,7 +347,7 @@ def cmd_sent(
         click.echo(f"count  : {count} tokens")
 
         arr = _get_sentence_scores(f, row)
-        _print_sentence_scores(arr, attrs, f, head_tokens, head_labels)
+        _print_sentence_scores(arr, attrs, f, head_tokens, head_labels, softmax)
 
 
 # ---------------------------------------------------------------------------
