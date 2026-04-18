@@ -109,9 +109,10 @@ def build_row(
 def select_greedy(
     pool: list[CandidateRecord],
     max_sentences_per_lemma: int = 1,
+    strategy: str = "rarest",
     verbose: bool = False,
 ) -> list[CandidateRecord]:
-    """Rarest-first greedy coverage selection with restarts."""
+    """Greedy coverage selection with configurable lemma ordering."""
     from heapq import heappush, heappop
     
     # Build lemma → sentences index
@@ -121,33 +122,47 @@ def select_greedy(
             lemma_to_sents[lemma].append(rec)
     
     lemma_usage_count: dict[str, int] = defaultdict(int)
-    sent_used: set[int] = set()  # Track by cqp_id or object id
+    sent_used: set[int] = set()
     final: list[CandidateRecord] = []
     
-    # Priority queue: (num_candidates, lemma)
-    # Lower count = higher priority
-    def rebuild_queue():
-        queue = []
-        for lemma, sents in lemma_to_sents.items():
-            if lemma_usage_count[lemma] >= max_sentences_per_lemma:
-                continue
-            # Count available (unused) sentences for this lemma
-            available = sum(1 for s in sents if id(s) not in sent_used)
-            if available > 0:
-                heappush(queue, (available, lemma))
-        return queue
+    if strategy == "rarest":
+        def rebuild_queue():
+            queue = []
+            for lemma, sents in lemma_to_sents.items():
+                if lemma_usage_count[lemma] >= max_sentences_per_lemma:
+                    continue
+                available = sum(1 for s in sents if id(s) not in sent_used)
+                if available > 0:
+                    heappush(queue, (available, lemma))
+            return queue
+        
+        pq = rebuild_queue()
+        
+        def lemmas_to_try():
+            while pq:
+                available_count, lemma = heappop(pq)
+                if lemma_usage_count[lemma] < max_sentences_per_lemma:
+                    yield lemma
     
-    pq = rebuild_queue()
+    else:  # sequential
+        seen = []
+        for rec in pool:
+            for lemma in rec.matched_lemmas:
+                if lemma not in seen:
+                    seen.append(lemma)
+        
+        def lemmas_to_try():
+            for lemma in seen:
+                if lemma_usage_count[lemma] < max_sentences_per_lemma:
+                    available = sum(1 for s in lemma_to_sents[lemma] if id(s) not in sent_used)
+                    if available > 0:
+                        yield lemma
+    
     iterations = 0
     
-    with tqdm(desc="Rarest-first greedy", unit="lem") as pbar:
-        while pq:
+    with tqdm(desc=f"Greedy ({strategy})", unit="lem") as pbar:
+        for lemma in lemmas_to_try():
             iterations += 1
-            available_count, lemma = heappop(pq)
-            
-            # Skip if already satisfied
-            if lemma_usage_count[lemma] >= max_sentences_per_lemma:
-                continue
             
             # Find best available sentence for this lemma
             candidates = lemma_to_sents[lemma]
@@ -157,7 +172,6 @@ def select_greedy(
             for sent in candidates:
                 if id(sent) in sent_used:
                     continue
-                # Check if all lemmas in this sentence can accept more
                 can_use = all(
                     lemma_usage_count[l] < max_sentences_per_lemma 
                     for l in sent.matched_lemmas
@@ -167,18 +181,14 @@ def select_greedy(
                     best_sent = sent
             
             if best_sent is None:
-                # No usable sentence for this lemma, skip
                 pbar.update(1)
                 continue
             
-            # Select the sentence
             final.append(best_sent)
             sent_used.add(id(best_sent))
             for l in best_sent.matched_lemmas:
                 lemma_usage_count[l] += 1
             
-            # Rebuild queue to reflect new priorities
-            pq = rebuild_queue()
             pbar.update(1)
             pbar.set_postfix(selected=len(final), lemmas_covered=sum(1 for v in lemma_usage_count.values() if v > 0))
 
@@ -191,7 +201,7 @@ def select_greedy(
     uncovered_lemmas = sorted(all_lemmas - {l for r in final for l in r.matched_lemmas})
 
     click.echo(
-        f"\nRarest-first greedy summary"
+        f"\nGreedy ({strategy}) summary"
         f"\n  Pool size      : {len(pool)}"
         f"\n  Selected       : {len(final)}"
         f"\n  Iterations     : {iterations}"
@@ -238,12 +248,27 @@ def _record_to_row(rec: CandidateRecord) -> dict:
     default="greedy",
     show_default=True,
 )
+@click.option(
+    "--stream-type",
+    type=click.Choice(["lw", "cs", "ne"], case_sensitive=False),
+    default="lw",
+    show_default=True,
+    help="lw=lemma-counting mode, cs/ne=top-by-score mode",
+)
+@click.option(
+    "--greedy-strategy",
+    type=click.Choice(["rarest", "sequential"], case_sensitive=False),
+    default="rarest",
+    show_default=True,
+    help="rarest=lemma with fewest candidates first, sequential=in pool order",
+)
 @click.option("--max-per-lemma", type=int, default=1, show_default=True)
 @click.option("--verbose-stats", is_flag=True, default=False, help="List uncovered lemmas.")
 @click.option("--results", type=int, default=0, show_default=True, help="0 = all")
 @click.option("--missing-placeholder", is_flag=True, default=False)
 @click.option("--ignore-zero-score", is_flag=True, default=False, help="Skip candidates with score_total == 0.0")
-def make_sheet(candidates, output, strategy, max_per_lemma, results, missing_placeholder, verbose_stats, ignore_zero_score):
+@click.option("--sort-by-score", is_flag=True, default=False, help="Sort output by score descending.")
+def make_sheet(candidates, output, strategy, stream_type, greedy_strategy, max_per_lemma, results, missing_placeholder, verbose_stats, ignore_zero_score, sort_by_score):
     """Generate annotation sheet from a JSONL candidates file."""
     pool = _load_candidates(candidates)
     if ignore_zero_score:
@@ -259,9 +284,17 @@ def make_sheet(candidates, output, strategy, max_per_lemma, results, missing_pla
             lemma_candidate_counts[lemma] += 1
     
     if strategy == "greedy":
-        selected = select_greedy(pool, max_sentences_per_lemma=max_per_lemma, verbose=verbose_stats)
+        selected = select_greedy(
+            pool,
+            max_sentences_per_lemma=max_per_lemma,
+            strategy=greedy_strategy,
+            verbose=verbose_stats,
+        )
     else:
         selected = select_top(pool, results=results)
+
+    if sort_by_score:
+        selected = sorted(selected, key=lambda r: r.score_total, reverse=True)
 
     rows = [_record_to_row(r) for r in selected]
 
