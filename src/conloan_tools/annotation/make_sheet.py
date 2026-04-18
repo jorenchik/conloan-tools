@@ -131,9 +131,12 @@ def select_stratified(
         types_in_record = set()
         for k, v in tags.items():
             if k.startswith("NE"):
-                # Format: NE#:TYPE
+                # Format: NE#:TYPE or NE#:B-TYPE or NE#:I-TYPE
                 if ":" in k:
                     ne_type = k.split(":")[1]
+                    # Strip BIO prefix if present
+                    if ne_type.startswith(("B-", "I-")):
+                        ne_type = ne_type[2:]
                     types_in_record.add(ne_type)
             else:
                 types_in_record.add(v)
@@ -145,23 +148,25 @@ def select_stratified(
         type_to_sents[t].sort(key=lambda r: r.score_total, reverse=True)
     
     num_strata = len(type_to_sents)
-    max_results = results if results > 0 else float('inf')
-    
-    # Equal count per stratum
-    per_stratum = max_results // num_strata if num_strata else 0
-    remainder = max_results % num_strata if num_strata else 0
-    
+    per_stratum = results // num_strata if num_strata else 0
+    remainder = results % num_strata if num_strata else 0
+    if results == 0:
+        per_stratum = float('inf')
+        remainder = 0
+
     final: list[CandidateRecord] = []
     sent_used: set[int] = set()
-    
+    stratum_picked: dict[str, int] = {}
+
     with tqdm(desc="Stratified round-robin", unit="sent") as pbar:
         for t in sorted(type_to_sents.keys()):
             stratum = type_to_sents[t]
             picked = 0
             extra = 1 if remainder > 0 else 0
-            remainder -= 1 if extra else 0
+            if remainder > 0:
+                remainder -= 1
             limit = per_stratum + extra
-            
+
             for sent in stratum:
                 if picked >= limit:
                     break
@@ -170,7 +175,8 @@ def select_stratified(
                     sent_used.add(id(sent))
                     picked += 1
                     pbar.update(1)
-    
+            stratum_picked[t] = picked
+
     covered_types: set[str] = set()
     for r in final:
         tags = getattr(r, 'tag_map', {})
@@ -184,25 +190,17 @@ def select_stratified(
         f"\n  Pool size      : {len(pool)}"
         f"\n  Selected       : {len(final)}"
         f"\n  Strata types   : {num_strata} ({sorted(type_to_sents.keys())})"
-        f"\n  Per stratum    : {per_stratum} (+ remainder {max_results % num_strata})"
+        f"\n  Per stratum    : {per_stratum if per_stratum != float('inf') else 'all'}"
         f"\n  Types covered  : {len(covered_types)}"
     )
+    click.echo("  Sentences selected per stratum:")
+    for t in sorted(stratum_picked.keys()):
+        click.echo(f"    - {t}: {stratum_picked[t]}")
     if verbose:
-        click.echo("  Per-type counts (records may appear in multiple types):")
+        click.echo("  Sentences in pool per type (may overlap across types):")
         for t in sorted(type_to_sents.keys()):
-            count = 0
-            for r in final:
-                tags = getattr(r, 'tag_map', {})
-                for k, v in tags.items():
-                    if k.startswith("NE") and ":" in k:
-                        if t == k.split(":")[1]:
-                            count += 1
-                            break
-                    elif t == v:
-                        count += 1
-                        break
-            click.echo(f"    - {t}: {count}")
-    
+            click.echo(f"    - {t}: {len(type_to_sents[t])}")
+
     return final
 
 

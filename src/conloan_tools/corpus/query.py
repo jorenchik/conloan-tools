@@ -2552,7 +2552,7 @@ def query_ner_entities(
                 mode="ner",
                 sentence=sentence,
                 scored=scored,
-                matched_lemmas=matched,
+                matched_lemmas=[word for word, _ in matched],
                 tag_map=tag_map,
                 token_surprisals={},
                 cpos=scored.cqp_id,
