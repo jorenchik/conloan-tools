@@ -308,6 +308,10 @@ def make_sheet(
             lemma_candidate_counts[lemma] += 1
     
     if strategy == "greedy":
+        if stream_type in ("cs", "ne"):
+            raise click.BadParameter(
+                "--strategy=greedy is only valid with --stream-type=lw"
+            )
         selected = select_greedy(
             pool,
             max_sentences_per_lemma=max_per_lemma,
