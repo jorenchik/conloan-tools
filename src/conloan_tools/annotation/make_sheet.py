@@ -114,16 +114,16 @@ def build_row(
 
 def select_stratified(
     pool: list[CandidateRecord],
-    limit: int = 0,
+    results: int = 0,
     verbose: bool = False,
 ) -> list[CandidateRecord]:
-    """Round-robin selection across NE type strata."""
+    """Round-robin selection across NE type strata with equal per-stratum counts."""
     from collections import defaultdict
     
     # Group sentences by their NE type (ORG, LOC, MISC, etc.)
     type_to_sents: dict[str, list[CandidateRecord]] = defaultdict(list)
     for rec in pool:
-        tags = getattr(rec, 'tags', None)
+        tags = getattr(rec, 'tag_map', None)
         if not tags:
             continue
         types_in_record = set(tags.values())
@@ -134,48 +134,46 @@ def select_stratified(
     for t in type_to_sents:
         type_to_sents[t].sort(key=lambda r: r.score_total, reverse=True)
     
-    # Round-robin indices per type
-    type_indices: dict[str, int] = {t: 0 for t in type_to_sents}
+    num_strata = len(type_to_sents)
+    max_results = results if results > 0 else float('inf')
+    
+    # Equal count per stratum
+    per_stratum = max_results // num_strata if num_strata else 0
+    remainder = max_results % num_strata if num_strata else 0
+    
     final: list[CandidateRecord] = []
     sent_used: set[int] = set()
-    max_limit = limit if limit > 0 else float('inf')
     
     with tqdm(desc="Stratified round-robin", unit="sent") as pbar:
-        while len(final) < max_limit:
-            made_pick = False
-            for t in sorted(type_to_sents.keys()):
-                if len(final) >= max_limit:
+        for t in sorted(type_to_sents.keys()):
+            stratum = type_to_sents[t]
+            picked = 0
+            extra = 1 if remainder > 0 else 0
+            remainder -= 1 if extra else 0
+            limit = per_stratum + extra
+            
+            for sent in stratum:
+                if picked >= limit:
                     break
-                idx = type_indices[t]
-                stratum = type_to_sents[t]
-                # Find next unused sentence in this stratum
-                while idx < len(stratum):
-                    sent = stratum[idx]
-                    if id(sent) not in sent_used:
-                        final.append(sent)
-                        sent_used.add(id(sent))
-                        type_indices[t] = idx + 1
-                        made_pick = True
-                        pbar.update(1)
-                        break
-                    idx += 1
-                else:
-                    type_indices[t] = idx  # exhausted this stratum
-            if not made_pick:
-                break  # All strata exhausted
+                if id(sent) not in sent_used:
+                    final.append(sent)
+                    sent_used.add(id(sent))
+                    picked += 1
+                    pbar.update(1)
     
-    covered_types = {t for r in final for t in getattr(r, 'tags', {}).values()}
+    covered_types = {t for r in final for t in getattr(r, 'tag_map', {}).values()}
     click.echo(
         f"\nStratified summary"
         f"\n  Pool size      : {len(pool)}"
         f"\n  Selected       : {len(final)}"
-        f"\n  Strata types   : {len(type_to_sents)} ({sorted(type_to_sents.keys())})"
+        f"\n  Strata types   : {num_strata} ({sorted(type_to_sents.keys())})"
+        f"\n  Per stratum    : {per_stratum} (+ remainder {max_results % num_strata})"
         f"\n  Types covered  : {len(covered_types)}"
     )
     if verbose:
-        click.echo("  Per-type counts:")
+        click.echo("  Per-type counts (records may appear in multiple types):")
         for t in sorted(type_to_sents.keys()):
-            count = sum(1 for r in final if t in getattr(r, 'tags', {}).values())
+            count = sum(1 for r in final if t in getattr(r, 'tag_map', {}).values())
             click.echo(f"    - {t}: {count}")
     
     return final
@@ -369,7 +367,7 @@ def make_sheet(
             raise click.BadParameter(
                 "--strategy=stratified is only valid with --stream-type=ne"
             )
-        selected = select_stratified(pool, limit=limit if limit > 0 else 0, verbose=verbose_stats)
+        selected = select_stratified(pool, results=results if results > 0 else 0, verbose=verbose_stats)
     else:
         selected = select_top(pool, results=results)
 
