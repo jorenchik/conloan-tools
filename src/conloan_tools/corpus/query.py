@@ -164,6 +164,32 @@ def _tag_code_switch_sentence(run: CodeSwitchRun) -> str:
     return _collapse_spans(tokens, "CS")
 
 
+def _build_cs_span_map(token_indices: list[int]) -> dict[int, int]:
+    """
+    Map each token index to its CS group number.
+    Consecutive token indices share the same CS group.
+    Example: [5, 6, 10, 11, 12] -> {5: 1, 6: 1, 10: 2, 11: 2, 12: 2}
+    """
+    if not token_indices:
+        return {}
+
+    span_map: dict[int, int] = {}
+    group_num = 1
+    prev_idx = token_indices[0]
+
+    for idx in token_indices:
+        if idx == prev_idx + 1:
+            # consecutive, same group
+            pass
+        else:
+            # not consecutive, new group
+            group_num += 1
+        span_map[idx] = group_num
+        prev_idx = idx
+
+    return span_map
+
+
 def _tag_code_switch_and_ner(
     run: CodeSwitchRun,
     ner_labels: np.ndarray,
@@ -173,66 +199,79 @@ def _tag_code_switch_and_ner(
 ) -> str:
     """
     Tag CS spans and NEs outside those spans.
-    NEs are collapsed into globally-numbered NE1, NE2, ... spans.
+    - CS: consecutive tokens in token_indices share one CS# tag
+    - NE: only same-type consecutive tokens are collapsed into one NE# tag
     CS tokens never get NE tags (CS takes precedence).
     """
     sent_idx = run.sent_idx
     span_set = set(run.token_indices)
     n = len(run.tokens)
 
+    # Build CS group map for consecutive collapsing
+    cs_span_map = _build_cs_span_map(run.token_indices)
+
     # Get NE labels for this sentence
     rec = ner_records[sent_idx]
     chunk = ner_labels[rec.offset : rec.offset + rec.count]
 
-    # Build token info: (word, cs_tag, ne_label)
-    token_info: list[tuple[str, str | None, str | None]] = []
+    # Build token info: (word, cs_group_or_None, ne_label_or_None)
+    token_info: list[tuple[str, int | None, str | None]] = []
     for i, t in enumerate(run.tokens):
-        cs_tag: str | None = None
+        cs_group: int | None = None
         ne_label: str | None = None
 
         if i in span_set:
-            cs_idx = run.token_indices.index(i)
-            cs_tag = f"CS{cs_idx + 1}"
+            cs_group = cs_span_map.get(i)
         elif i < len(chunk):
             label_id = int(chunk[i])
             if label_id != o_id:
                 ne_label = id2label.get(label_id)
 
-        token_info.append((t.word, cs_tag, ne_label))
+        token_info.append((t.word, cs_group, ne_label))
 
-    # Build output: CS spans collapse, NE spans collapse, rest is plain
+    # Build output: CS spans collapse, NE spans collapse (same type only), rest is plain
     parts: list[str] = []
     cs_span: list[str] = []
     ne_span: list[str] = []
     ne_counter = 1
-    pending_cs_tag: str | None = None
+    pending_cs_group: int | None = None
+    pending_ne_label: str | None = None
 
     def flush_cs():
-        nonlocal pending_cs_tag
+        nonlocal pending_cs_group
         if cs_span:
-            if pending_cs_tag:
-                parts.append(f"<{pending_cs_tag}>{' '.join(cs_span)}</{pending_cs_tag}>")
+            if pending_cs_group is not None:
+                parts.append(f"<CS{pending_cs_group}>{' '.join(cs_span)}</CS{pending_cs_group}>")
             else:
                 parts.append(" ".join(cs_span))
             cs_span.clear()
-            pending_cs_tag = None
+            pending_cs_group = None
 
     def flush_ne():
-        nonlocal ne_counter
+        nonlocal ne_counter, pending_ne_label
         if ne_span:
             parts.append(f"<NE{ne_counter}>{' '.join(ne_span)}</NE{ne_counter}>")
             ne_span.clear()
             ne_counter += 1
+            pending_ne_label = None
 
-    for word, cs_tag, ne_label in token_info:
-        if cs_tag is not None:
+    for word, cs_group, ne_label in token_info:
+        if cs_group is not None:
             flush_ne()
-            flush_cs()
-            cs_span.append(word)
-            pending_cs_tag = cs_tag
+            if cs_group == pending_cs_group:
+                cs_span.append(word)
+            else:
+                flush_cs()
+                cs_span.append(word)
+                pending_cs_group = cs_group
         elif ne_label is not None:
             flush_cs()
-            ne_span.append(word)
+            if ne_label == pending_ne_label:
+                ne_span.append(word)
+            else:
+                flush_ne()
+                ne_span.append(word)
+                pending_ne_label = ne_label
         else:
             flush_cs()
             flush_ne()
@@ -1900,12 +1939,18 @@ def query_code_switch(
             # Build tag_map for both CS and NE labels
             tag_map: dict[str, str] = {}
 
-            # CS tags
-            for i, idx in enumerate(run.token_indices):
-                if idx < len(run.tokens):
-                    tag_map[f"CS{i+1}"] = run.tokens[idx].lemma
+            # CS tags - use collapsed groups
+            cs_span_map = _build_cs_span_map(run.token_indices)
+            # Invert: group -> first token lemma
+            group_to_lemma: dict[int, str] = {}
+            for idx, group in cs_span_map.items():
+                if group not in group_to_lemma and idx < len(run.tokens):
+                    group_to_lemma[group] = run.tokens[idx].lemma
 
-            # NE tags - scan non-CS tokens for NE labels
+            for group, lemma in group_to_lemma.items():
+                tag_map[f"CS{group}"] = lemma
+
+            # NE tags - scan non-CS tokens for NE labels, grouped by type
             if mask_src.ner_labels is not None and mask_src.ner_records is not None:
                 rec = mask_src.ner_records[run.sent_idx]
                 chunk = mask_src.ner_labels[rec.offset : rec.offset + rec.count]
@@ -1920,7 +1965,7 @@ def query_code_switch(
                         if o_id_local is None or label_id != o_id_local:
                             label = mask_src.ner_id2label.get(label_id, "")
                             if label and label != "O":
-                                tag_map[f"NE{ne_counter}"] = label
+                                tag_map[f"NE{ne_counter}:{label}"] = t.word
                                 ne_counter += 1
 
             matched = [
