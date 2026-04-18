@@ -15,6 +15,8 @@ from conloan_tools.wb.wb import WittenBellCharLM
 from conloan_tools.ner.ner import NERModel, get_logits
 from tqdm import tqdm
 
+from .bio import _constrained_argmax
+
 IDX_FLUSH_EVERY = 10_000
 SENT_ID_RE = re.compile(r'id="([^"]+)"')
 
@@ -115,6 +117,8 @@ def _iter_ner_scores(
                 )
             else:
                 label_ids = t.argmax(dim=-1).cpu().numpy()
+                # Note: for labels mode we rely on the model's training for BIO consistency
+                # _constrained_argmax only applies when logits are available
                 arr = np.array(
                     [
                         int(lid) for w, lid in zip(words, label_ids)
@@ -722,10 +726,11 @@ def convert_ner_logits(input_h5: Path, output: Path, chunk_tokens: int, confiden
                 else:
                     # Unknown dtype - force conversion
                     logits_f = logits.astype(np.float32)
-                
+
                 probs = softmax(logits_f, axis=-1)
-                labels = np.argmax(probs, axis=-1).astype(np.uint8)
-                labels_ds[start:end] = labels
+                id2label = {int(k): v for k, v in json.loads(src.attrs["id2label"]).items()}
+                labels = _constrained_argmax(logits_f, id2label)
+                labels_ds[start:end] = labels.astype(np.uint8)
                 if conf_ds is not None:
                     conf_ds[start:end] = probs.max(axis=-1).astype(np.float16)
 

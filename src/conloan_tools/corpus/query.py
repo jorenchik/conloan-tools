@@ -27,6 +27,7 @@ from .scoring import (
     build_loanword_mask,
     build_named_entity_mask,
 )
+from .bio import _constrained_argmax
 
 
 DEFAULT_CQP_BIN = "cqp"
@@ -143,16 +144,22 @@ def _collapse_ne_spans(
             span.clear()
             counter += 1
 
+    def _norm(label: str) -> str:
+        """Strip B-/I- prefix for span comparison."""
+        return label[2:] if label.startswith(("B-", "I-")) else label
+
     for word, label in tokens:
-        if label is not None:
-            if label != current_label:
-                _flush()
-            span.append(word)
-            current_label = label
-        else:
+        if label is None:
             _flush()
             current_label = None
             parts.append(word)
+        else:
+            norm = _norm(label)
+            if norm != current_label:
+                _flush()
+                current_label = norm
+            span.append(word)
+
     _flush()
 
     return " ".join(parts)
@@ -255,6 +262,10 @@ def _tag_code_switch_and_ner(
             ne_counter += 1
             pending_ne_label = None
 
+    def _norm(label: str) -> str:
+        """Strip B-/I- prefix for span comparison."""
+        return label[2:] if label.startswith(("B-", "I-")) else label
+
     for word, cs_group, ne_label in token_info:
         if cs_group is not None:
             flush_ne()
@@ -266,12 +277,13 @@ def _tag_code_switch_and_ner(
                 pending_cs_group = cs_group
         elif ne_label is not None:
             flush_cs()
-            if ne_label == pending_ne_label:
+            norm = _norm(ne_label)
+            if norm == pending_ne_label:
                 ne_span.append(word)
             else:
                 flush_ne()
                 ne_span.append(word)
-                pending_ne_label = ne_label
+                pending_ne_label = norm
         else:
             flush_cs()
             flush_ne()
@@ -636,7 +648,8 @@ def _load_ner_labels(
                     end = min(start + chunk, n_tokens)
                     chunk_logits = ds[start:end]
                     probs = softmax(chunk_logits.astype(np.float32), axis=-1)
-                    labels[start:end]     = np.argmax(probs, axis=-1).astype(np.uint8)
+                    raw_labels = _constrained_argmax(chunk_logits.astype(np.float32), id2label)
+                    labels[start:end] = raw_labels
                     confidence[start:end] = probs.max(axis=-1)
                     pbar.update(end - start)
         elif ner_output == "labels":

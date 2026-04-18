@@ -45,12 +45,12 @@ def _stanza_tokenizer(lang: str = "lv", use_gpu: bool = False) -> stanza.Pipelin
 
 
 def _normalize_label(label: str) -> str:
-    return label[2:] if label.startswith(("B-", "I-")) else label
+    return label
 
 # ----- Public interface ------
 
 def get_id2label(model: NERModel) -> dict[int, str]:
-    """Return the normalized id→label mapping (B-/I- prefixes stripped)."""
+    """Return the id→label mapping."""
     return model.id2label
 
 
@@ -259,7 +259,7 @@ def build_ner_model(
         tokenizer=tokenizer,
         model=model,
         torch_dtype=torch_dtype,
-        id2label={k: _normalize_label(v) for k, v in model.config.id2label.items()},
+        id2label=dict(model.config.id2label),
         device=device,
     )
 
