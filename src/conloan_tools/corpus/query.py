@@ -634,6 +634,8 @@ def _load_ner_labels(
             err=True,
         )
 
+        id2label = {int(k): v for k, v in raw_id2label.items()}
+
         if ner_output == "logits":
             if ds.ndim != 2:
                 raise click.UsageError(
