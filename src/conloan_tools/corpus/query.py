@@ -203,6 +203,7 @@ def _tag_code_switch_and_ner(
     ner_records: list[IndexRecord],
     id2label: dict[int, str],
     o_id: int,
+    ignore_labels: set[str] | None = None,
 ) -> str:
     """
     Tag CS spans and NEs outside those spans.
@@ -213,6 +214,7 @@ def _tag_code_switch_and_ner(
     sent_idx = run.sent_idx
     span_set = set(run.token_indices)
     n = len(run.tokens)
+    ignore_set = ignore_labels or set()
 
     # Build CS group map for consecutive collapsing
     cs_span_map = _build_cs_span_map(run.token_indices)
@@ -231,8 +233,9 @@ def _tag_code_switch_and_ner(
             cs_group = cs_span_map.get(i)
         elif i < len(chunk):
             label_id = int(chunk[i])
-            if label_id != o_id:
-                ne_label = id2label.get(label_id)
+            label_str = id2label.get(label_id, "O")
+            if label_id != o_id and label_str not in ignore_set:
+                ne_label = label_str
 
         token_info.append((t.word, cs_group, ne_label))
 
@@ -334,6 +337,7 @@ def _tag_ner_sentence(
     ner_records: list[IndexRecord],
     id2label: dict[int, str],
     want: set[int],
+    ignore_labels: set[str] | None = None,
 ) -> str:
     record = ner_records[sent_idx]
     chunk = ner_labels[record.offset : record.offset + record.count]
@@ -342,6 +346,7 @@ def _tag_ner_sentence(
             t.word,
             id2label[int(chunk[i])]
             if i < len(chunk) and int(chunk[i]) in want
+               and id2label.get(int(chunk[i]), "O") not in (ignore_labels or set())
             else None,
         )
         for i, t in enumerate(parsed.tokens)
@@ -1949,6 +1954,7 @@ def query_code_switch(
                 mask_src.ner_records,
                 mask_src.ner_id2label,
                 o_id_local,
+                ignore_labels=mask_src.ner_ignore_labels,
             )
 
             # Build tag_map for both CS and NE labels
@@ -2529,7 +2535,8 @@ def query_ner_entities(
             cfg=cfg,
         )
         sentence = _tag_ner_sentence(
-            parsed, sent_idx, mask_src.ner_labels, ner_records, id2label, want
+            parsed, sent_idx, mask_src.ner_labels, ner_records, id2label, want,
+            ignore_labels=mask_src.ner_ignore_labels,
         )
         scored_results.append((scored, sentence, sent_idx))
 
