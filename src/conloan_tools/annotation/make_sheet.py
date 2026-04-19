@@ -112,10 +112,78 @@ def build_row(
     }, found
 
 
+def select_stratified(
+    pool: list[CandidateRecord],
+    limit: int = 0,
+    verbose: bool = False,
+) -> list[CandidateRecord]:
+    """Round-robin selection across NE type strata."""
+    from collections import defaultdict
+    
+    # Group sentences by their NE type (ORG, LOC, MISC, etc.)
+    type_to_sents: dict[str, list[CandidateRecord]] = defaultdict(list)
+    for rec in pool:
+        tags = getattr(rec, 'tags', None)
+        if not tags:
+            continue
+        types_in_record = set(tags.values())
+        for t in types_in_record:
+            type_to_sents[t].append(rec)
+    
+    # Sort each stratum by score descending
+    for t in type_to_sents:
+        type_to_sents[t].sort(key=lambda r: r.score_total, reverse=True)
+    
+    # Round-robin indices per type
+    type_indices: dict[str, int] = {t: 0 for t in type_to_sents}
+    final: list[CandidateRecord] = []
+    sent_used: set[int] = set()
+    max_limit = limit if limit > 0 else float('inf')
+    
+    with tqdm(desc="Stratified round-robin", unit="sent") as pbar:
+        while len(final) < max_limit:
+            made_pick = False
+            for t in sorted(type_to_sents.keys()):
+                if len(final) >= max_limit:
+                    break
+                idx = type_indices[t]
+                stratum = type_to_sents[t]
+                # Find next unused sentence in this stratum
+                while idx < len(stratum):
+                    sent = stratum[idx]
+                    if id(sent) not in sent_used:
+                        final.append(sent)
+                        sent_used.add(id(sent))
+                        type_indices[t] = idx + 1
+                        made_pick = True
+                        pbar.update(1)
+                        break
+                    idx += 1
+                else:
+                    type_indices[t] = idx  # exhausted this stratum
+            if not made_pick:
+                break  # All strata exhausted
+    
+    covered_types = {t for r in final for t in getattr(r, 'tags', {}).values()}
+    click.echo(
+        f"\nStratified summary"
+        f"\n  Pool size      : {len(pool)}"
+        f"\n  Selected       : {len(final)}"
+        f"\n  Strata types   : {len(type_to_sents)} ({sorted(type_to_sents.keys())})"
+        f"\n  Types covered  : {len(covered_types)}"
+    )
+    if verbose:
+        click.echo("  Per-type counts:")
+        for t in sorted(type_to_sents.keys()):
+            count = sum(1 for r in final if t in getattr(r, 'tags', {}).values())
+            click.echo(f"    - {t}: {count}")
+    
+    return final
+
+
 def select_greedy(
     pool: list[CandidateRecord],
     max_sentences_per_lemma: int = 1,
-    strategy: str = "rarest",
     verbose: bool = False,
 ) -> list[CandidateRecord]:
     """Greedy coverage selection with configurable lemma ordering."""
@@ -131,42 +199,28 @@ def select_greedy(
     sent_used: set[int] = set()
     final: list[CandidateRecord] = []
     
-    if strategy == "rarest":
-        def rebuild_queue():
-            queue = []
-            for lemma, sents in lemma_to_sents.items():
-                if lemma_usage_count[lemma] >= max_sentences_per_lemma:
-                    continue
-                available = sum(1 for s in sents if id(s) not in sent_used)
-                if available > 0:
-                    heappush(queue, (available, lemma))
-            return queue
-        
-        pq = rebuild_queue()
-        
-        def lemmas_to_try():
-            while pq:
-                available_count, lemma = heappop(pq)
-                if lemma_usage_count[lemma] < max_sentences_per_lemma:
-                    yield lemma
+    def rebuild_queue():
+        queue = []
+        for lemma, sents in lemma_to_sents.items():
+            if lemma_usage_count[lemma] >= max_sentences_per_lemma:
+                continue
+            available = sum(1 for s in sents if id(s) not in sent_used)
+            if available > 0:
+                heappush(queue, (available, lemma))
+        return queue
     
-    else:  # sequential
-        seen = []
-        for rec in pool:
-            for lemma in rec.matched_lemmas:
-                if lemma not in seen:
-                    seen.append(lemma)
-        
-        def lemmas_to_try():
-            for lemma in seen:
-                if lemma_usage_count[lemma] < max_sentences_per_lemma:
-                    available = sum(1 for s in lemma_to_sents[lemma] if id(s) not in sent_used)
-                    if available > 0:
-                        yield lemma
+    pq = rebuild_queue()
+    
+    def lemmas_to_try():
+        while pq:
+            available_count, lemma = heappop(pq)
+            if lemma_usage_count[lemma] < max_sentences_per_lemma:
+                yield lemma
+    
     
     iterations = 0
     
-    with tqdm(desc=f"Greedy ({strategy})", unit="lem") as pbar:
+    with tqdm(desc=f"Greedy selection", unit="lem") as pbar:
         for lemma in lemmas_to_try():
             iterations += 1
             
@@ -207,7 +261,7 @@ def select_greedy(
     uncovered_lemmas = sorted(all_lemmas - {l for r in final for l in r.matched_lemmas})
 
     click.echo(
-        f"\nGreedy ({strategy}) summary"
+        f"\nGreedy selection summary"
         f"\n  Pool size      : {len(pool)}"
         f"\n  Selected       : {len(final)}"
         f"\n  Iterations     : {iterations}"
@@ -250,9 +304,10 @@ def _record_to_row(rec: CandidateRecord) -> dict:
 @click.option("--output", default="conloan_annotation.xlsx", show_default=True)
 @click.option(
     "--strategy",
-    type=click.Choice(["greedy", "top"]),
-    default="greedy",
+    type=click.Choice(["rarest", "sequential", "stratified"], case_sensitive=False),
+    default="rarest",
     show_default=True,
+    help="rarest=lemma with fewest candidates first, sequential=in pool order, stratified=round-robin by NE type (ne only)",
 )
 @click.option(
     "--stream-type",
@@ -260,13 +315,6 @@ def _record_to_row(rec: CandidateRecord) -> dict:
     default="lw",
     show_default=True,
     help="lw=lemma-counting mode, cs/ne=top-by-score mode",
-)
-@click.option(
-    "--greedy-strategy",
-    type=click.Choice(["rarest", "sequential"], case_sensitive=False),
-    default="rarest",
-    show_default=True,
-    help="rarest=lemma with fewest candidates first, sequential=in pool order",
 )
 @click.option("--max-per-lemma", type=int, default=1, show_default=True)
 @click.option("--verbose-stats", is_flag=True, default=False, help="List uncovered lemmas.")
@@ -280,7 +328,6 @@ def make_sheet(
     output,
     strategy,
     stream_type,
-    greedy_strategy,
     max_per_lemma,
     results,
     missing_placeholder,
@@ -315,9 +362,14 @@ def make_sheet(
         selected = select_greedy(
             pool,
             max_sentences_per_lemma=max_per_lemma,
-            strategy=greedy_strategy,
             verbose=verbose_stats,
         )
+    elif strategy == "stratified":
+        if stream_type != "ne":
+            raise click.BadParameter(
+                "--strategy=stratified is only valid with --stream-type=ne"
+            )
+        selected = select_stratified(pool, limit=limit if limit > 0 else 0, verbose=verbose_stats)
     else:
         selected = select_top(pool, results=results)
 
