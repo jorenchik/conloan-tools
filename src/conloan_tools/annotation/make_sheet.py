@@ -77,8 +77,8 @@ def create_native_template(sentence_with_loan_tags):
         return f"<N{tag_num}>{word}</N{tag_num}>"
 
     return re.sub(
-        r"<L(\d+)>([^<]+)</L\d+>",
-        replace_tag,
+        r"<(L|CS)(\d+)>([^<]+)</\1\d+>",
+        lambda m: f"<{'CN' if m.group(1) == 'CS' else 'N'}{m.group(2)}>{m.group(3)}</{'CN' if m.group(1) == 'CS' else 'N'}{m.group(2)}>",
         sentence_with_loan_tags,
     )
 

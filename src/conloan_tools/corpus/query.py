@@ -224,13 +224,17 @@ def _tag_code_switch_and_ner(
     chunk = ner_labels[rec.offset : rec.offset + rec.count]
 
     # Build token info: (word, cs_group_or_None, ne_label_or_None)
+    # Renumber CS groups to be 1-based consecutive
+    sorted_groups = sorted(set(cs_span_map.values()))
+    group_renum = {old: new for new, old in enumerate(sorted_groups, start=1)}
+
     token_info: list[tuple[str, int | None, str | None]] = []
     for i, t in enumerate(run.tokens):
         cs_group: int | None = None
         ne_label: str | None = None
 
         if i in span_set:
-            cs_group = cs_span_map.get(i)
+            cs_group = group_renum.get(cs_span_map.get(i))
         elif i < len(chunk):
             label_id = int(chunk[i])
             label_str = id2label.get(label_id, "O")
@@ -1960,34 +1964,58 @@ def query_code_switch(
             # Build tag_map for both CS and NE labels
             tag_map: dict[str, str] = {}
 
-            # CS tags - use collapsed groups
+            # CS tags - use collapsed groups, always renumber starting from 1
             cs_span_map = _build_cs_span_map(run.token_indices)
-            # Invert: group -> first token lemma
-            group_to_lemma: dict[int, str] = {}
-            for idx, group in cs_span_map.items():
-                if group not in group_to_lemma and idx < len(run.tokens):
-                    group_to_lemma[group] = run.tokens[idx].lemma
+            # group -> list of lemmas in that span
+            group_to_lemmas: dict[int, list[str]] = {}
+            for idx, group in sorted(cs_span_map.items()):
+                if idx < len(run.tokens):
+                    group_to_lemmas.setdefault(group, []).append(run.tokens[idx].lemma)
 
-            for group, lemma in group_to_lemma.items():
-                tag_map[f"CS{group}"] = lemma
+            # Renumber groups to be 1-based consecutive, store full span
+            for new_idx, (old_group, lemmas) in enumerate(sorted(group_to_lemmas.items()), start=1):
+                tag_map[f"CS{new_idx}"] = " ".join(lemmas)
 
-            # NE tags - scan non-CS tokens for NE labels, grouped by type
+            # NE tags - scan non-CS tokens for NE labels, collapsed by consecutive type
             if mask_src.ner_labels is not None and mask_src.ner_records is not None:
                 rec = mask_src.ner_records[run.sent_idx]
                 chunk = mask_src.ner_labels[rec.offset : rec.offset + rec.count]
                 span_set = set(run.token_indices)
                 ne_counter = 1
+                ne_span: list[str] = []
+                pending_ne_label: str | None = None
+
+                def _norm(label: str) -> str:
+                    return label[2:] if label.startswith(("B-", "I-")) else label
+
+                def flush_ne():
+                    nonlocal ne_counter, pending_ne_label
+                    if ne_span:
+                        tag_map[f"NE{ne_counter}"] = " ".join(ne_span)
+                        ne_span.clear()
+                        ne_counter += 1
+                        pending_ne_label = None
 
                 for i, t in enumerate(run.tokens):
                     if i in span_set:
+                        flush_ne()
                         continue
                     if i < len(chunk):
                         label_id = int(chunk[i])
                         if o_id_local is None or label_id != o_id_local:
                             label = mask_src.ner_id2label.get(label_id, "")
-                            if label and label != "O":
-                                tag_map[f"NE{ne_counter}:{label}"] = t.word
-                                ne_counter += 1
+                            if label and label != "O" and label not in mask_src.ner_ignore_labels:
+                                norm = _norm(label)
+                                if norm == pending_ne_label:
+                                    ne_span.append(t.word)
+                                else:
+                                    flush_ne()
+                                    ne_span.append(t.word)
+                                    pending_ne_label = norm
+                                continue
+                    flush_ne()
+
+                flush_ne()
 
             matched = [
                 run.tokens[i].lemma
@@ -2554,7 +2582,11 @@ def query_ner_entities(
                 for i, t in enumerate(sentence_map[sent_idx].tokens)
                 if i < len(chunk) and int(chunk[i]) in want
             ]
-            tag_map = {f"NE{i+1}:{label}": word for i, (word, label) in enumerate(matched)}
+            tag_map = {
+                f"NE{i+1}:{label}": word
+                for i, (word, label) in enumerate(matched)
+                if label not in mask_src.ner_ignore_labels
+            }
             rec = _result_to_record(
                 mode="ner",
                 sentence=sentence,
