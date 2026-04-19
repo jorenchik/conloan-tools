@@ -327,10 +327,10 @@ def _record_to_row(rec: CandidateRecord) -> dict:
 @click.option("--output", default="conloan_annotation.xlsx", show_default=True)
 @click.option(
     "--strategy",
-    type=click.Choice(["rarest", "sequential", "stratified"], case_sensitive=False),
-    default="rarest",
+    type=click.Choice(["greedy", "sequential", "stratified"], case_sensitive=False),
+    default="greedy",
     show_default=True,
-    help="rarest=lemma with fewest candidates first, sequential=in pool order, stratified=round-robin by NE type (ne only)",
+    help="greedy=lemma with fewest candidates first, sequential=in pool order, stratified=round-robin by NE type (ne only)",
 )
 @click.option(
     "--stream-type",
