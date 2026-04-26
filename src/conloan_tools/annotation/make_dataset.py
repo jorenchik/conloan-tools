@@ -18,7 +18,7 @@ def extract_tags(text: str, prefix: str) -> dict[str, str]:
     pattern = rf"<{prefix}(\d+)>([^<]+)</{prefix}\1>"
     return {m[0]: m[1] for m in re.findall(pattern, text)}
 
-@click.command("make-dataset")
+@click.command("make")
 @click.argument("lang_name")
 @click.argument("input_xlsx", type=click.Path(exists=True))
 @click.option(

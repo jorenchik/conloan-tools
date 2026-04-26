@@ -1,7 +1,7 @@
 import click
 
 from .make_sheet import make_sheet 
-from .translate import translate_target 
+from .translate import translate_sheet
 from .validate_sheet import validate
 from .make_dataset import make_dataset 
 
@@ -15,7 +15,7 @@ def sheet():
 
 sheet.add_command(make_sheet)
 sheet.add_command(validate)
-sheet.add_command(translate_target)
+sheet.add_command(translate_sheet)
 
 @annotation.group()
 def json():

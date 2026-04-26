@@ -319,7 +319,7 @@ def _record_to_row(rec: CandidateRecord) -> dict:
     return row
 
 
-@click.command("make-sheet")
+@click.command("make")
 @click.argument(
     "candidates",
     type=click.Path(exists=True, dir_okay=False),

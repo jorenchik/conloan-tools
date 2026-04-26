@@ -25,7 +25,7 @@ def strip_tags(sentence: str) -> str:
 # ── CLI ──────────────────────────────────────────────────────────────
 
 
-@click.command("translate-target")
+@click.command("translate")
 @click.argument("input_file", type=click.Path(exists=True))
 @click.option(
     "--src-lang",
@@ -113,7 +113,7 @@ def strip_tags(sentence: str) -> str:
     show_default=True,
     help="Keep / strip <L#> and <N#> tags before translation",
 )
-def translate_target(
+def translate_sheet(
     input_file,
     src_lang,
     tgt_lang,
