@@ -145,6 +145,38 @@ def build_corpus_index(
     return index
 
 
+def _build_char_label_map(
+    sentence: str,
+) -> Dict[int, Tuple[str, str]]:
+    """Map each plain-text character index to (prefix, tag_id).
+
+    Iterates the tagged sentence once, tracking the current open tag so
+    that every character that belongs to a span — including characters
+    inside multi-word spans — is labelled correctly.
+    """
+    result: Dict[int, Tuple[str, str]] = {}
+    tag_re = re.compile(r"<(/?)([A-Z]+)(\d+)>")
+    plain_pos = 0
+    i = 0
+    current_label: Optional[Tuple[str, str]] = None  # (prefix, tag_id)
+
+    while i < len(sentence):
+        m = tag_re.match(sentence, i)
+        if m:
+            is_close = m.group(1) == "/"
+            prefix = m.group(2)
+            tag_id = f"{prefix}{m.group(3)}"
+            current_label = None if is_close else (prefix, tag_id)
+            i = m.end()
+        else:
+            if current_label is not None:
+                result[plain_pos] = current_label
+            plain_pos += 1
+            i += 1
+
+    return result
+
+
 def _process_sentence(
     index: CorpusIndex,
     file_name: str,
@@ -152,69 +184,49 @@ def _process_sentence(
     sentence: str,
     other_sentence: str,
     lemmatizer: Lemmatizer,
-    is_label: bool
+    is_label: bool,
 ) -> None:
     """Process a sentence to extract tokens and spans."""
-    # Get tag spans
-    spans = get_tag_spans(sentence)
-    
-    # Build span content lookup - use set to avoid duplicate surfaces in span_map
-    span_map = {}  # content -> (prefix, tag_id)
-    for prefix, content, start, end in spans:
-        num_match = re.search(r'(\d+)', sentence[start:])
-        if num_match:
-            tag_id = f"{prefix}{num_match.group(1)}"
-            # Only set if not already present (first occurrence wins)
-            if content not in span_map:
-                span_map[content] = (prefix, tag_id)
-    
-    # Get plain text and lemmatize
+    # Build a plain-text-position → (prefix, tag_id) map so that every
+    # character inside a span — including multi-word spans — is labelled.
+    char_label_map = _build_char_label_map(sentence)
+
     plain_text = strip_tags(sentence)
-    
+
     # Tokenize using Stanza
     doc = lemmatizer._nlp(plain_text)
     for sent in doc.sentences:
         for word in sent.words:
             surface = word.text
             lemma = word.lemma.lower()
-            
-            # Check if this token is inside a tag span by exact content match
-            # Only match if the entire span content equals the surface (single-word spans)
-            # For multi-word spans, only the first word of the span gets the label
-            labeled = False
-            tag_id = None
-            prefix = None
-            
-            # Check exact match first (single-word spans)
-            if surface in span_map:
-                sp_prefix, sp_tag_id = span_map[surface]
-                labeled = True
-                tag_id = sp_tag_id
-                prefix = sp_prefix
-            
-            if labeled:
+
+            # A token is labelled if *any* of its characters map to a span.
+            # Using the first character is sufficient because tags never
+            # split a token mid-word.
+            label = char_label_map.get(word.start_char)
+
+            if label is not None:
+                prefix, tag_id = label
                 token_entry = TokenEntry(
                     file=file_name,
                     row_index=row_index,
                     prefix=prefix,
                     tag_id=tag_id,
                     surface=surface,
-                    lemma_key=lemma
+                    lemma_key=lemma,
                 )
                 index.tokens.append(token_entry)
             else:
-                # Unlabeled token
                 token_entry = TokenEntry(
                     file=file_name,
                     row_index=row_index,
                     prefix="o",
                     tag_id=None,
                     surface=surface,
-                    lemma_key=lemma
+                    lemma_key=lemma,
                 )
                 index.tokens.append(token_entry)
-                
-                # Store in unlabeled token store
+
                 key = (file_name, row_index)
                 if key not in index.unlabeled_tokens:
                     index.unlabeled_tokens[key] = []
@@ -338,69 +350,51 @@ def _reload_file(session: AssistantSession, file_name: str) -> None:
         # Get old hashes
         old_hashes = session.row_hashes.get(file_name, {})
         
-        # Compute deltas
-        added_hashes = set(new_hashes.keys()) - set(old_hashes.keys())
-        removed_hashes = set(old_hashes.keys()) - set(new_hashes.keys())
-        # Changed = same hash but different row_index (content changed under same hash)
-        changed_hashes = {}
-        for h in set(new_hashes.keys()) & set(old_hashes.keys()):
-            if new_hashes[h] != old_hashes[h]:
-                changed_hashes[h] = (old_hashes[h], new_hashes[h])
-        
-        # Update DataFrame
+        old_hash_set = set(old_hashes.keys())
+        new_hash_set = set(new_hashes.keys())
+        added_count = len(new_hash_set - old_hash_set)
+        removed_count = len(old_hash_set - new_hash_set)
+
+        # Update DataFrame and hashes
         session.files[file_name] = new_df
         session.row_hashes[file_name] = new_hashes
-        
-        # Incremental update: remove only evicted rows
-        old_row_indices = set(old_hashes.values())
-        new_row_indices = set(new_hashes.values())
-        
-        removed_row_indices = old_row_indices - new_row_indices
-        added_or_changed_rows = new_row_indices - old_row_indices
-        
-        # Remove entries for evicted rows
+
+        # Full re-index for this file: drop all existing entries/tokens then
+        # rebuild from scratch, identical to what build_corpus_index does.
         session.index.entries = [
-            e for e in session.index.entries 
-            if not (e.file == file_name and e.row_index in removed_row_indices)
+            e for e in session.index.entries if e.file != file_name
         ]
         session.index.tokens = [
-            t for t in session.index.tokens 
-            if not (t.file == file_name and t.row_index in removed_row_indices)
+            t for t in session.index.tokens if t.file != file_name
         ]
         session.index.unlabeled_tokens = {
-            k: v for k, v in session.index.unlabeled_tokens.items()
-            if not (k[0] == file_name and k[1] in removed_row_indices)
+            k: v
+            for k, v in session.index.unlabeled_tokens.items()
+            if k[0] != file_name
         }
-        
-        # Add/update only new or changed rows
+
         for idx, row in new_df.iterrows():
             row_index = idx + 2
-            if row_index not in added_or_changed_rows:
-                continue
-            
             row_valid = str(row.get("Valid", "")).strip().lower()
             if not session.validate_all and row_valid != "+":
                 continue
-            
+
             label_sent = str(row.get("Label sentence", ""))
             replacement_sent = str(row.get("Replacement sentence", ""))
-            
+
             _process_sentence(
                 session.index, file_name, row_index, label_sent,
                 replacement_sent, session.lemmatizer, is_label=True
             )
-            
             _process_paired_sentence(
                 session.index, file_name, row_index, replacement_sent,
                 label_sent, session.lemmatizer
             )
-        
-        # Build change summary
-        added_count = len(added_hashes)
-        changed_count = len(changed_hashes)
-        removed_count = len(removed_hashes)
-        
-        summary = f"[watch] {file_name}.xlsx: +{added_count} added, ~{changed_count} changed, -{removed_count} removed rows."
+
+        summary = (
+            f"[reload] {file_name}.xlsx: "
+            f"+{added_count} added, -{removed_count} removed rows."
+        )
         session.watch_queue.append(summary)
         
     except Exception as e:
@@ -684,11 +678,10 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> str:
     lemma_counts = defaultdict(int)
     for file_name, df in session.files.items():
         for idx, row in df.iterrows():
-            row_index = idx + 2
             label_sent = str(row.get("Label sentence", ""))
             spans = get_tag_spans(label_sent)
             for prefix, content, start, end in spans:
-                lemmas = lemmatizer.lemmatize(content)
+                lemmas = session.lemmatizer.lemmatize(content)
                 lemma_key = " ".join(lemmas).lower()
                 lemma_counts[lemma_key] += 1
     duplicate_lemma_variants = sum(1 for c in lemma_counts.values() if c > 1)
@@ -744,11 +737,12 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> str:
         f_NE_lemma = len(set(t.lemma_key for t in f_tokens if t.prefix == "NE"))
         
         f_sentences = len(set(e.row_index for e in f_entries))
+        f_df = session.files[file_name]
         f_validated = 0
         for row_idx in set(e.row_index for e in f_entries):
             idx = row_idx - 2
-            if idx >= 0 and idx < len(df):
-                row_valid = str(df.iloc[idx].get("Valid", "")).strip().lower()
+            if 0 <= idx < len(f_df):
+                row_valid = str(f_df.iloc[idx].get("Valid", "")).strip().lower()
                 if row_valid == "+":
                     f_validated += 1
         
