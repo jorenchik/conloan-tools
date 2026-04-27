@@ -29,8 +29,8 @@ def extract_tags(text: str, prefix: str) -> dict[str, str]:
 )
 @click.option(
     "--mode",
-    type=click.Choice(["base", "code_switch"]),
-    default="base",
+    type=click.Choice(["baseline", "extended"]),
+    default="baseline",
     show_default=True
 )
 @click.option(
@@ -52,7 +52,7 @@ def make_dataset(lang_name, input_xlsx, output_dir, mode, all_rows):
     # Filter for rows marked 'x' unless --all-rows is specified
     if not all_rows and "Valid" in df.columns:
         initial_len = len(df)
-        df = df[df["Valid"].astype(str).str.lower() == "x"]
+        df = df[df["Valid"].astype(str).str.lower() == "+"]
         click.echo(f"Filtered {len(df)}/{initial_len} valid rows.")
 
     dataset = []
@@ -66,8 +66,8 @@ def make_dataset(lang_name, input_xlsx, output_dir, mode, all_rows):
             click.secho(f"Row {idx+2} invalid: {' | '.join(errors)}", fg="red")
             continue
 
-        l_sent = str(row.get("Loanword sentence", ""))
-        n_sent = str(row.get("Native sentence", ""))
+        l_sent = str(row.get("Label sentence", ""))
+        n_sent = str(row.get("Replacement sentence", ""))
         target = str(row.get("Target", ""))
 
         l_tags = extract_tags(l_sent, "L")

@@ -250,7 +250,7 @@ def train_cmd(
     "--inputs", "-i",
     required=True, multiple=True,
     type=click.Path(exists=True, dir_okay=False),
-    help="Raw JSON dataset files.",
+    help="JSON dataset files (repeatable).",
 )
 @click.option(
     "--output-dir",
@@ -262,6 +262,7 @@ def train_cmd(
     help="Number of folds.",
 )
 def kfold_cmd(
+    inputs: tuple[str, ...],
     model: str,
     schema: str,
     run_name: str | None,
@@ -277,7 +278,6 @@ def kfold_cmd(
     max_length: int,
     precision: str,
     token_level: bool,
-    inputs: tuple[str, ...],
     output_dir: str,
     k_folds: int,
 ) -> None:
