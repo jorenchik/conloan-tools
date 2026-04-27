@@ -1,174 +1,338 @@
 import re
 import click
 import pandas as pd
-from typing import List, Set, Counter
+from dataclasses import dataclass, field
+from typing import List, Set, Counter, Optional, Dict, Tuple
 from collections import defaultdict
 
-def get_tag_stats(text: str, label: str) -> tuple[List[str], List[str]]:
-    """Returns list of opening tags and list of errors regarding malformed tags."""
-    if not isinstance(text, str) or pd.isna(text):
-        return [], []
+@dataclass
+class ValidationError:
+    rule_id: str
+    field: str
+    message: str
+    severity: str = "error"
 
-    if "\n" in text or "\r" in text:
-        return [], [f"{label}: Sentence contains forbidden line breaks."]
-    
+@dataclass
+class RowResult:
+    row_index: int
+    errors: List[ValidationError] = field(default_factory=list)
+
+# Mode configurations
+MODE_CONFIG = {
+    "baseline": {"allowed_prefixes": {"L", "N"}, "pairs": [("L", "N")]},
+    "extended": {"allowed_prefixes": {"L", "N", "CS", "CN", "NE"}, "pairs": [("L", "N"), ("CS", "CN"), ("NE", "NE")]},
+}
+
+REQUIRED_COLUMNS = {"Label sentence", "Replacement sentence", "Target", "Valid", "Reason"}
+
+def get_tag_spans(text: str) -> List[Tuple[str, str, int, int]]:
+    """Extract all tag spans: (prefix, content, start_pos, end_pos)."""
+    spans = []
+    for tag_match in re.finditer(r"<([A-Z]+)(\d+)>", text):
+        prefix = tag_match.group(1)
+        num = int(tag_match.group(2))
+        start = tag_match.start()
+        # Find closing tag
+        close_match = re.search(rf"</{prefix}{num}>", text)
+        if close_match:
+            end = close_match.end()
+            content = text[start + len(f"<{prefix}{num}>"):end - len(f"</{prefix}{num}>")]
+            spans.append((prefix, content, start, end))
+    return spans
+
+def get_tag_stats(text: str, field_name: str, allowed_prefixes: Set[str]) -> Tuple[List[str], List[ValidationError]]:
+    """Returns list of opening tags and list of ValidationErrors."""
     errors = []
-    open_tags = re.findall(r"<([A-Z]+\d+)>", text)
-    
-    # Find all tags including illegal ones (e.g., <UNK>) to detect malformed structures
-    stack = []  # Stores (tag_id, full_match_string)
-    for tag_match in re.finditer(r"<(/?)([A-Z]+\d*)>", text):
-        full_tag = tag_match.group(0)
+    if not isinstance(text, str) or pd.isna(text):
+        return [], errors
+
+    # V1.1: Check for line breaks
+    if "\n" in text or "\r" in text:
+        errors.append(ValidationError("V1.1", field_name, "Sentence contains forbidden line breaks."))
+        return [], errors
+
+    open_tags = []
+
+    # V1.2: Check for illegal digit-free tags (<L>, <UNK> etc)
+    # and collect all found tags
+    all_tags = re.findall(r"<([A-Z]+)(\d*)>", text)
+    for prefix, digits in all_tags:
+        full_tag = f"<{prefix}{digits}>" if digits else f"<{prefix}>"
+        if not digits:
+            errors.append(ValidationError("V1.2", field_name, f"Illegal digit-free tag: {full_tag}"))
+        elif prefix not in allowed_prefixes:
+            errors.append(ValidationError("V1.3", field_name, f"Illegal tag prefix: {full_tag}"))
+        else:
+            open_tags.append(f"{prefix}{digits}")
+
+    # V1.4/V1.5/V1.6/V1.7: Tag balance, nesting, exact correspondence, orphans
+    stack = []  # Stores (tag_id, full_match_string, start_pos)
+    for tag_match in re.finditer(r"<(/)?([A-Z]+)(\d+)>", text):
         is_closing = tag_match.group(1) == "/"
-        tag_id = tag_match.group(2)
-        # full_tag = tag_match.group(0)
-        # full_content = tag_match.group(1)
-        # is_closing = tag_match.group(1) == "/"
-        # is_closing = full_content.startswith("/")
-        # tag_id = full_content.lstrip("/")
+        prefix = tag_match.group(2)
+        num = tag_match.group(3)
+        full_tag = f"<{prefix}{num}>"
+        start_pos = tag_match.start()
 
         if not is_closing:
             if stack:
-                errors.append(f"{label}: Nested tags are forbidden (<{tag_id}> inside <{stack[-1]}>)")
-            stack.append((tag_id, tag_match.group(0)))
+                prev_full = stack[-1][2]
+                prev_match = re.match(r"<([A-Z]+)(\d+)>", prev_full)
+                if prev_match:
+                    prev_prefix, prev_num = prev_match.group(1, 2)
+                    errors.append(ValidationError("V1.5", field_name,
+                        f"Nested tags are forbidden (<{prefix}{num}> inside <{prev_prefix}{prev_num}>)"))
+            stack.append((prefix, num, full_tag, start_pos))
         else:
             if not stack:
-                errors.append(f"{label}: Closing tag </{tag_id}> has no opening tag.")
+                errors.append(ValidationError("V1.7", field_name, f"Closing tag </{prefix}{num}> has no opening tag."))
             else:
-                last_open_id, last_open_full = stack.pop()
-                if last_open_id != tag_id:
-                    errors.append(
-                        f"{label}: Tag {last_open_full} closed by incorrect tag </{tag_id}>."
-                    )
+                top_prefix, top_num, top_full, _ = stack[-1]
+                if top_prefix != prefix or top_num != num:
+                    errors.append(ValidationError("V1.6", field_name,
+                        f"Tag {top_full} closed by incorrect tag </{prefix}{num}>."))
+                else:
+                    stack.pop()
 
-    # Remaining items in stack are unclosed tags
-    for unclosed_id, unclosed_full in stack:
-        errors.append(f"{label}: Tag {unclosed_full} is never closed.")
+    # Unclosed tags
+    for prefix, num, full_tag, _ in stack:
+        errors.append(ValidationError("V1.4", field_name, f"Tag {full_tag} is never closed."))
 
-    # 3. Punctuation inside tags: <L1>word.</L1>
-    bad_internal_punct = re.findall(r"<([A-Z]+\d+)>.*?[,.!?;]</\1>", text)
-    if bad_internal_punct:
-        errors.append(f"{label}: Punctuation caught inside tags: {bad_internal_punct}")
+    # V4.2: Punctuation inside tags - only for L and N prefixes
+    # V4.4: Empty tag spans
+    # V4.5: Whitespace-only tag spans
+    for prefix, content, start, end in get_tag_spans(text):
+        num_match = re.search(r'(\d+)', text[start:])
+        if not num_match:
+            continue
+        num = num_match.group(1)
+        close_tag = f"</{prefix}{num}>"
+        close_pos = text.find(close_tag, start)
+        if close_pos == -1:
+            continue
+        inner = text[start + len(f"<{prefix}{num}>"):close_pos]
 
-    # 4. Fused tags: </L1>word instead of </L1> word
-    fused_tags = re.findall(r"</[A-Z]+\d+>[^\s,.!?;\"')\]}]", text)
-    if fused_tags:
-        errors.append(f"{label}: Missing space/punctuation after closing tag: {fused_tags}")
+        # V4.4: Empty span
+        if not inner:
+            errors.append(ValidationError("V4.4", field_name, f"Empty tag span: <{prefix}{num}></{prefix}{num}>"))
+            continue
+
+        # V4.5: Whitespace-only span
+        if inner.isspace():
+            errors.append(ValidationError("V4.5", field_name, f"Whitespace-only tag span: <{prefix}{num}></{prefix}{num}>"))
+            continue
+
+        # V4.2: Punctuation inside tags (only for L, N)
+        if prefix in ("L", "N"):
+            punct_match = re.search(r'[.?!,;]', inner)
+            if punct_match:
+                errors.append(ValidationError("V4.2", field_name,
+                    f"Punctuation '{punct_match.group()}' inside tag <{prefix}{num}>"))
+
+    # V4.3: Fused tags - closing tag followed by non-whitespace/punct
+    fused_matches = re.finditer(r'</([A-Z]+)(\d+)>([^\s,.!?;:"\')\]}]+)', text)
+    for match in fused_matches:
+        errors.append(ValidationError("V4.3", field_name,
+            f"Missing space/punctuation after closing tag: {match.group(0)}"))
 
     return open_tags, errors
 
-def validate_row(row: pd.Series, mode: str) -> List[str]:
+def extract_tag_indices(text: str) -> Dict[str, Set[int]]:
+    """Extract prefix -> set of indices from text."""
+    result = defaultdict(set)
+    for prefix, digits in re.findall(r"<([A-Z]+)(\d+)>", text):
+        result[prefix].add(int(digits))
+    return result
+
+def validate_row(row: pd.Series, mode: str, warn_undecided: bool = True) -> List[ValidationError]:
+    """Validate a single row according to spec rules."""
     errors = []
-    loan_sent = str(row.get("Loanword sentence", ""))
-    native_sent = str(row.get("Native sentence", ""))
+
+    # Get field values
+    valid_raw = row.get("Valid", "")
+    reason_raw = row.get("Reason", "")
+
+    # Handle Valid field - distinguish blank from whitespace-only
+    if pd.isna(valid_raw):
+        valid = ""
+        is_whitespace_only = False
+    elif isinstance(valid_raw, str):
+        stripped = valid_raw.strip()
+        is_whitespace_only = (stripped == "" and valid_raw != "")
+        valid = stripped
+    else:
+        valid = str(valid_raw).strip()
+        is_whitespace_only = False
+
+    # S9: Whitespace-only Valid is a warning (distinct from blank V0.4)
+    if is_whitespace_only and warn_undecided:
+        errors.append(ValidationError("S9", "Valid", "Valid contains only whitespace.", severity="warning"))
+
+    reason = "" if pd.isna(reason_raw) else str(reason_raw).strip()
     target = str(row.get("Target", ""))
+    loan_sent = str(row.get("Label sentence", ""))
+    native_sent = str(row.get("Replacement sentence", ""))
+    label_sent = str(row.get("Label", ""))
+    replacement_sent = str(row.get("Replacement", ""))
 
-    # 1. Target purity
+    config = MODE_CONFIG[mode]
+    allowed_prefixes = config["allowed_prefixes"]
+
+    # V0: Metadata Integrity
+    if valid not in ("", "+", "-"):
+        errors.append(ValidationError("V0.1", "Valid", f"Invalid value '{valid}' for Valid. Must be blank, '+', or '-'."))
+
+    if valid == "-":
+        if reason not in ("NL", "CS", "NE", "NF"):
+            errors.append(ValidationError("V0.2", "Reason", f"Reason must be one of: NL, CS, NE, NF. Got: '{reason}'"))
+    elif valid in ("+", ""):
+        if reason:
+            errors.append(ValidationError("V0.3", "Reason", f"Reason must be empty when Valid is '+' or blank. Got: '{reason}'"))
+
+    # V0.4: Truly blank Valid (not whitespace-only - that's S9)
+    if valid == "" and not is_whitespace_only and warn_undecided:
+        errors.append(ValidationError("V0.4", "Valid", "Row is undecided (blank Valid).", severity="warning"))
+
+    # V4.1: Target must contain no tags
     if re.search(r"</?[A-Z]+\d+>", target):
-        errors.append("Target contains tags.")
+        errors.append(ValidationError("V4.1", "Target", "Target must not contain tags."))
 
-    # Extract tags and check balance
-    loan_tags, l_structural_errs = get_tag_stats(loan_sent, "Loanword")
-    native_tags, n_structural_errs = get_tag_stats(native_sent, "Native")
-    errors.extend(l_structural_errs + n_structural_errs)
+    # V1: Tag syntax and legality for sentences
+    loan_tags, l_errors = get_tag_stats(loan_sent, "Loanword sentence", allowed_prefixes)
+    native_tags, n_errors = get_tag_stats(native_sent, "Native sentence", allowed_prefixes)
+    errors.extend(l_errors)
+    errors.extend(n_errors)
 
-    # 3. Define schema
-    if mode == "base":
-        l_allowed, n_allowed = {"L"}, {"N"}
-    else:  # code_switch
-        l_allowed, n_allowed = {"L", "CS"}, {"N", "CN"}
-
-    # 4. Global illegal tag check (catches <UNK>, <FOO1>, etc.)
-    all_found_tags = re.findall(r"</?([A-Z]+\d*)>", loan_sent + native_sent)
-    all_allowed = {"L", "N", "CS", "CN"} if mode != "base" else {"L", "N"}
-    
-    for t in all_found_tags:
-        prefix = re.match(r"([A-Z]+)", t).group(1)
-        if prefix not in all_allowed:
-            errors.append(f"Illegal tag detected: <{t}>")
-
-    def check_tag_logic(tags: List[str], allowed: Set[str], label: str):
+    # V2: Within-sentence tag set integrity
+    for tags, field in [(loan_tags, "Loanword sentence"), (native_tags, "Native sentence")]:
         counts = Counter(tags)
-        prefix_map = defaultdict(list)
         for tag, count in counts.items():
-            match = re.match(r"([A-Z]+)(\d+)", tag)
-            if not match: continue
-            prefix, num = match.group(1), int(match.group(2))
-            prefix_map[prefix].append(num)
             if count > 1:
-                errors.append(f"{label} contains duplicate tag: {tag}")
+                errors.append(ValidationError("V2.1", field, f"Duplicate tag: {tag}"))
 
-        # 5. Incremental sequence check (must start at 1 and have no gaps)
+        prefix_map = extract_tag_indices("".join([f"<{t}>" for t in tags]))
         for pref, nums in prefix_map.items():
             sorted_nums = sorted(nums)
             expected = list(range(1, len(nums) + 1))
             if sorted_nums != expected:
-                errors.append(
-                    f"{label} {pref} tags must start at 1 and be incremental. "
-                    f"Found: {sorted_nums}"
-                )
+                errors.append(ValidationError("V2.2", field,
+                    f"{pref} tags must start at 1 and be incremental. Found: {sorted_nums}"))
 
-        return set(tags)
+    # V3: Cross-sentence parity
+    def get_prefix_indices(text: str) -> Dict[str, Set[int]]:
+        result = defaultdict(set)
+        for match in re.finditer(r"<([A-Z]+)(\d+)>", text):
+            result[match.group(1)].add(int(match.group(2)))
+        return result
 
-    l_set = check_tag_logic(loan_tags, l_allowed, "Loanword")
-    n_set = check_tag_logic(native_tags, n_allowed, "Native")
+    loan_indices = get_prefix_indices(loan_sent)
+    native_indices = get_prefix_indices(native_sent)
+    label_indices = get_prefix_indices(label_sent)
+    replacement_indices = get_prefix_indices(replacement_sent)
 
-    # 5. Structural Parity (L <-> N and CS <-> CN)
-    # Rules: For every <LX> there is <NX>. For every <CSX> there is <CNX>.
-    mapping = {"L": "N", "CS": "CN"}
-    
-    # 6. Parity Count Check (Simplified)
-    l_prefixes = Counter(re.match(r"([A-Z]+)", t).group(1) for t in l_set)
-    n_prefixes = Counter(re.match(r"([A-Z]+)", t).group(1) for t in n_set)
-
-    for l_pref, n_pref in mapping.items():
-        if l_prefixes[l_pref] != n_prefixes[n_pref]:
-            errors.append(
-                f"Count mismatch: {l_pref} tags ({l_prefixes[l_pref]}) vs "
-                f"{n_pref} tags ({n_prefixes[n_pref]})"
-            )
+    for l_pref, n_pref in config["pairs"]:
+        if l_pref == "NE":
+            # V3.3: NE indices in Label must equal NE in Replacement (extended only)
+            if label_indices.get("NE", set()) != replacement_indices.get("NE", set()):
+                l_set = sorted(label_indices.get("NE", []))
+                r_set = sorted(replacement_indices.get("NE", []))
+                errors.append(ValidationError("V3.3", "Label/Replacement",
+                    f"NE indices mismatch: Label has {l_set}, Replacement has {r_set}"))
+            # V3.4: Content inside matched NE index must be identical
+            ne_nums = label_indices.get("NE", set()) & replacement_indices.get("NE", set())
+            for ne_num in sorted(ne_nums):
+                # Extract content for this NE tag in Label
+                label_match = re.search(rf"<NE{ne_num}>(.*?)</NE{ne_num}>", label_sent)
+                repl_match = re.search(rf"<NE{ne_num}>(.*?)</NE{ne_num}>", replacement_sent)
+                if label_match and repl_match:
+                    if label_match.group(1) != repl_match.group(1):
+                        errors.append(ValidationError("V3.4", "Label/Replacement",
+                            f"NE{ne_num} content mismatch: Label='{label_match.group(1)}' vs Replacement='{repl_match.group(1)}'"))
+        else:
+            # L↔N and CS↔CN
+            l_indices = loan_indices.get(l_pref, set())
+            n_indices = native_indices.get(n_pref, set())
+            if l_indices != n_indices:
+                errors.append(ValidationError("V3.1" if l_pref == "L" else "V3.2", "Loanword/Native",
+                    f"{l_pref}↔{n_pref} indices mismatch: {l_pref} has {sorted(l_indices)}, {n_pref} has {sorted(n_indices)}"))
 
     return errors
+
+def validate_file(input_file: str, mode: str, validate_all: bool = False, warn_undecided: bool = True) -> List[RowResult]:
+    """Load Excel file and validate all rows. Returns list of RowResult."""
+    df = pd.read_excel(input_file)
+    results = []
+
+    # V0.0: Metadata integrity - check columns first
+    actual_columns = set(df.columns)
+    extra_columns = actual_columns - REQUIRED_COLUMNS
+    missing_columns = REQUIRED_COLUMNS - actual_columns
+
+    if extra_columns or missing_columns:
+        errors = []
+        if missing_columns:
+            errors.append(ValidationError("V0.0", "file",
+                f"Missing required columns: {sorted(missing_columns)}"))
+        if extra_columns:
+            errors.append(ValidationError("V0.0", "file",
+                f"Extra columns present: {sorted(extra_columns)}"))
+        # V0.0 gates all further validation
+        return [RowResult(row_index=1, errors=errors)]
+
+    for idx, row in df.iterrows():
+        row_valid = str(row.get("Valid", "")).strip().lower()
+
+        # If not validate_all, only process '+' rows
+        if not validate_all and row_valid != "+":
+            continue
+
+        errors = validate_row(row, mode, warn_undecided)
+        if errors:
+            results.append(RowResult(row_index=idx + 2, errors=errors))
+
+    return results
 
 @click.command("validate")
 @click.argument("input_file", type=click.Path(exists=True))
 @click.option(
     "--mode",
-    type=click.Choice(["base", "code_switch"]),
-    default="base",
+    type=click.Choice(["baseline", "extended"]),
+    default="baseline",
     show_default=True,
 )
 @click.option(
-    "--only-valid",
+    "--validate-all",
     is_flag=True,
-    help="Only validate rows where 'Valid' column is 'x'.",
+    help="Validate all rows, not just those marked with '+'.",
 )
-@click.option("--verbose", is_flag=True, help="Show error details.")
-def validate(input_file, mode, only_valid, verbose):
+@click.option(
+    "--warn-undecided/--no-warn-undecided",
+    default=True,
+    help="Warn about rows with blank Valid.",
+)
+@click.option("--verbose", is_flag=True, help="Show detailed error messages.")
+def validate(input_file, mode, validate_all, warn_undecided, verbose):
     """Validate ConLoan XLSX for tag consistency and numbering."""
-    df = pd.read_excel(input_file)
-    
-    if only_valid:
-        initial_count = len(df)
-        df = df[df["Valid"].astype(str).str.lower() == "x"]
-        click.echo(f"Filtering: {len(df)}/{initial_count} rows are marked 'x'.")
+    results = validate_file(input_file, mode, validate_all, warn_undecided)
 
-    error_log = []
-    for idx, row in df.iterrows():
-        row_errors = validate_row(row, mode)
-        if row_errors:
-            error_log.append((idx + 2, row_errors))
+    error_rows = [r for r in results if any(e.severity == "error" for e in r.errors)]
+    warn_rows = [r for r in results if all(e.severity == "warning" for e in r.errors)]
 
-    if not error_log:
+    if not error_rows:
         click.secho("Validation Passed.", fg="green")
+        if warn_rows:
+            click.echo(f"{len(warn_rows)} rows have warnings (use --verbose to see).")
     else:
-        click.secho(f"Validation Failed: {len(error_log)} rows have errors.", fg="red")
-        for line_num, errors in error_log:
-            msg = f"Row {line_num}: " + " | ".join(errors)
-            if verbose:
-                click.echo(msg)
-        if not verbose:
-            click.echo("Use --verbose to see error details.")
+        click.secho(f"Validation Failed: {len(error_rows)} rows have errors.", fg="red")
+
+    if verbose or error_rows:
+        for result in results:
+            for err in result.errors:
+                if err.severity == "error" or verbose:
+                    click.echo(f"Row {result.row_index} [{err.rule_id}] {err.field}: {err.message}")
+
+    if not verbose and error_rows:
+        click.echo("Use --verbose to see all error details.")
 
 if __name__ == "__main__":
     validate()

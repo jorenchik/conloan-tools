@@ -20,11 +20,11 @@ WIDTH_WIDE     = 12
 WIDTH_CHECKBOX = 2
 
 DEFAULT_ANNOTATION_COLUMNS: list[ColumnSpec] = [
-    ColumnSpec("Loanword sentence", WIDTH_WIDE),
-    ColumnSpec("Native sentence", WIDTH_WIDE),
-    ColumnSpec("Target", WIDTH_WIDE),
-    ColumnSpec("Valid", WIDTH_CHECKBOX),
-    ColumnSpec("Suggestions", WIDTH_WIDE),
+    ColumnSpec("Label sentence",       WIDTH_WIDE),
+    ColumnSpec("Replacement sentence", WIDTH_WIDE),
+    ColumnSpec("Target",               WIDTH_WIDE),
+    ColumnSpec("Valid",                WIDTH_CHECKBOX),
+    ColumnSpec("Reason",               WIDTH_CHECKBOX),
 ]
 
 CM_TO_EXCEL_WIDTH = 3.89

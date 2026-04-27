@@ -4,6 +4,8 @@ from .make_sheet import make_sheet
 from .translate import translate_sheet
 from .validate_sheet import validate
 from .make_dataset import make_dataset 
+from .refresh_replacement import refresh_replacement 
+from .assistant import assistant
 
 @click.group()
 def annotation():
@@ -16,6 +18,8 @@ def sheet():
 sheet.add_command(make_sheet)
 sheet.add_command(validate)
 sheet.add_command(translate_sheet)
+sheet.add_command(refresh_replacement)
+sheet.add_command(assistant)
 
 @annotation.group()
 def json():

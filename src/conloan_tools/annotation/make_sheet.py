@@ -104,11 +104,11 @@ def build_row(
     )
 
     return {
-        "Loanword sentence": sentence_loan,
-        "Native sentence": sentence_native,
+        "Label sentence": sentence_loan,
+        "Replacement sentence": sentence_native,
         "Target": "",
         "Valid": "",
-        "Suggestions": "",
+        "Reason": "",
     }, found
 
 
