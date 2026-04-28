@@ -435,32 +435,9 @@ def cmd_validate(session: AssistantSession, args: List[str]) -> str:
     file_name = session.active_target
     df = session.files[file_name]
     
-    # Parse row argument
-    row_range = None
-    if args:
-        row_arg = args[0]
-        if '-' in row_arg:
-            parts = row_arg.split('-')
-            try:
-                start = int(parts[0])
-                end = int(parts[1])
-                row_range = (start, end)
-            except ValueError:
-                return f"Invalid row range: {row_arg}"
-        else:
-            try:
-                row_num = int(row_arg)
-                row_range = (row_num, row_num)
-            except ValueError:
-                return f"Invalid row number: {row_arg}"
-    
     results = []
     for idx, row in df.iterrows():
         row_index = idx + 2
-        if row_range:
-            if row_index < row_range[0] or row_index > row_range[1]:
-                continue
-        
         if not session.validate_all:
             row_valid = str(row.get("Valid", "")).strip().lower()
             if row_valid != "+":
@@ -484,85 +461,44 @@ def cmd_validate(session: AssistantSession, args: List[str]) -> str:
 
 
 def cmd_contradict(session: AssistantSession, args: List[str]) -> str:
-    """Report labeling contradictions."""
-    if not session.active_target:
-        return "No target selected. Use 'target <name>' first."
-    
-    file_name = session.active_target
-    
-    # Parse row argument to determine starting point rows
-    target_rows = None
-    if args:
-        row_arg = args[0]
-        if '-' in row_arg:
-            parts = row_arg.split('-')
-            try:
-                start = int(parts[0])
-                end = int(parts[1])
-                target_rows = set(range(start, end + 1))
-            except ValueError:
-                return f"Invalid row range: {row_arg}"
-        else:
-            try:
-                row_num = int(row_arg)
-                target_rows = {row_num}
-            except ValueError:
-                return f"Invalid row number: {row_arg}"
-    
+    """Report labeling contradictions across all loaded files."""
     # Collect tokens with their lemma_key and label status
-    # lemma_key -> list of (prefix, surface, row_index)
-    token_occurrences = defaultdict(list)
-    starting_point_lemmas = set()
-    
+    # lemma_key -> list of (file, row_index, prefix, surface)
+    token_occurrences: Dict[str, List[Tuple[str, int, str, str]]] = defaultdict(list)
+
     for token in session.index.tokens:
-        if token.file != file_name:
-            continue
-        if target_rows and token.row_index not in target_rows:
-            continue
-        
         token_occurrences[token.lemma_key].append(
-            (token.prefix, token.surface, token.row_index)
+            (token.file, token.row_index, token.prefix, token.surface)
         )
-        if target_rows is None or token.row_index in target_rows:
-            starting_point_lemmas.add(token.lemma_key)
-    
-    # Find contradictions: same lemma appears with different labels (L/CR/o)
+
     contradictions = []
-    
-    for lemma_key in starting_point_lemmas:
-        occurrences = token_occurrences.get(lemma_key, [])
-        if not occurrences:
-            continue
-        
-        prefixes_in_use = set()
-        for prefix, surface, row_index in occurrences:
-            prefixes_in_use.add(prefix)
-        
-        # Contradiction: same lemma has both labeled (L/CR) and unlabeled (o) tokens
-        # OR same lemma has multiple different label prefixes
-        has_labeled = any(p not in ('o',) for p in prefixes_in_use)
+
+    for lemma_key, occurrences in token_occurrences.items():
+        prefixes_in_use = {prefix for _, _, prefix, _ in occurrences}
+
+        has_labeled = any(p != 'o' for p in prefixes_in_use)
         has_unlabeled = 'o' in prefixes_in_use
-        
+
         if (has_labeled and has_unlabeled) or len(prefixes_in_use) > 1:
-            contradiction = {
+            contradictions.append({
                 'lemma_key': lemma_key,
-                'labeling': []
-            }
-            for prefix, surface, row_index in occurrences:
-                tag_id = prefix if prefix == 'o' else f"{prefix}"
-                contradiction['labeling'].append((row_index, tag_id, surface))
-            contradictions.append(contradiction)
-    
+                'labeling': occurrences,
+            })
+
     if not contradictions:
         return "No contradictions found."
-    
+
     output_lines = []
     for c in sorted(contradictions, key=lambda x: x['lemma_key']):
         output_lines.append(f"{c['lemma_key']}:")
         output_lines.append("    [labeling]")
-        for row_index, tag_id, surface in sorted(c['labeling'], key=lambda x: x[0]):
-            output_lines.append(f"    - Row {row_index}: {tag_id}, {surface}")
-    
+        for file_name, row_index, prefix, surface in sorted(
+            c['labeling'], key=lambda x: (x[0], x[1])
+        ):
+            output_lines.append(
+                f"    - {file_name}:{row_index}: {prefix}, {surface}"
+            )
+
     return "\n".join(output_lines)
 
 
@@ -573,32 +509,11 @@ def cmd_replace(session: AssistantSession, args: List[str]) -> str:
     
     file_name = session.active_target
     
-    # Determine which rows to process
-    target_rows = None
-    if args:
-        row_arg = args[0]
-        if '-' in row_arg:
-            parts = row_arg.split('-')
-            try:
-                start = int(parts[0])
-                end = int(parts[1])
-                target_rows = set(range(start, end + 1))
-            except ValueError:
-                return f"Invalid row range: {row_arg}"
-        else:
-            try:
-                row_num = int(row_arg)
-                target_rows = {row_num}
-            except ValueError:
-                return f"Invalid row number: {row_arg}"
-    
     # Collect lemma keys and their replacements
     lemma_replacements = defaultdict(lambda: defaultdict(set))
     
     for entry in session.index.entries:
         if entry.file != file_name:
-            continue
-        if target_rows and entry.row_index not in target_rows:
             continue
         if entry.prefix != "L":
             continue
@@ -911,48 +826,20 @@ def cmd_validate_mode(session: AssistantSession, args: List[str]) -> str:
 
 
 def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> str:
-    """Report replacement contradictions."""
-    if not session.active_target:
-        return "No target selected. Use 'target <name>' first."
-
-    file_name = session.active_target
-
-    target_rows = None
-    if args:
-        row_arg = args[0]
-        if '-' in row_arg:
-            parts = row_arg.split('-')
-            try:
-                start = int(parts[0])
-                end = int(parts[1])
-                target_rows = set(range(start, end + 1))
-            except ValueError:
-                return f"Invalid row range: {row_arg}"
-        else:
-            try:
-                row_num = int(row_arg)
-                target_rows = {row_num}
-            except ValueError:
-                return f"Invalid row number: {row_arg}"
-
-    # Collect L-prefix entries for the target file/rows
-    # lemma_key -> {paired_lemma_key -> [row_index, ...]}
-    source_to_repls: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
-    # paired_lemma_key -> {lemma_key -> [row_index, ...]}
-    repl_to_sources: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+    """Report replacement contradictions across all loaded files."""
+    # lemma_key -> {paired_lemma_key -> [(file, row_index), ...]}
+    source_to_repls: Dict[str, Dict[str, List[Tuple[str, int]]]] = defaultdict(lambda: defaultdict(list))
+    # paired_lemma_key -> {lemma_key -> [(file, row_index), ...]}
+    repl_to_sources: Dict[str, Dict[str, List[Tuple[str, int]]]] = defaultdict(lambda: defaultdict(list))
 
     for entry in session.index.entries:
-        if entry.file != file_name:
-            continue
         if entry.prefix != "L":
-            continue
-        if target_rows and entry.row_index not in target_rows:
             continue
         if not entry.paired_lemma_key:
             continue
 
-        source_to_repls[entry.lemma_key][entry.paired_lemma_key].append(entry.row_index)
-        repl_to_sources[entry.paired_lemma_key][entry.lemma_key].append(entry.row_index)
+        source_to_repls[entry.lemma_key][entry.paired_lemma_key].append((entry.file, entry.row_index))
+        repl_to_sources[entry.paired_lemma_key][entry.lemma_key].append((entry.file, entry.row_index))
 
     output_lines = []
 
@@ -967,9 +854,9 @@ def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> str:
         for lemma_key in sorted(same_source_conflicts):
             output_lines.append(f"  {lemma_key}:")
             for paired_key in sorted(same_source_conflicts[lemma_key]):
-                rows = sorted(set(same_source_conflicts[lemma_key][paired_key]))
-                rows_str = ", ".join(str(r) for r in rows)
-                output_lines.append(f"    - {paired_key} (rows: {rows_str})")
+                locs = sorted(set(same_source_conflicts[lemma_key][paired_key]))
+                locs_str = ", ".join(f"{f}:{r}" for f, r in locs)
+                output_lines.append(f"    - {paired_key} ({locs_str})")
 
     # 2. Same replacement, different sources
     same_repl_conflicts = {
@@ -984,9 +871,9 @@ def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> str:
         for repl_key in sorted(same_repl_conflicts):
             output_lines.append(f"  {repl_key}:")
             for source_key in sorted(same_repl_conflicts[repl_key]):
-                rows = sorted(set(same_repl_conflicts[repl_key][source_key]))
-                rows_str = ", ".join(str(r) for r in rows)
-                output_lines.append(f"    - {source_key} (rows: {rows_str})")
+                locs = sorted(set(same_repl_conflicts[repl_key][source_key]))
+                locs_str = ", ".join(f"{f}:{r}" for f, r in locs)
+                output_lines.append(f"    - {source_key} ({locs_str})")
 
     if not output_lines:
         return "No replacement contradictions found."
@@ -1000,10 +887,10 @@ def cmd_help(session: AssistantSession, args: List[str]) -> str:
         ("target <name>", "Set active target file"),
         ("reload", "Reload target file from disk"),
         ("validate-mode <valid|all>", "Set search scope (valid=+ only, or all rows)"),
-        ("validate <row?>", "Validate rows in target file"),
-        ("contradict <row?>", "Report labeling contradictions"),
-        ("contradict-repl <row?>", "Report replacement contradictions"),
-        ("replace <row?>", "List available replacement lemma keys"),
+        ("validate", "Validate rows in target file"),
+        ("contradict", "Report labeling contradictions"),
+        ("contradict-repl", "Report replacement contradictions"),
+        ("replace", "List available replacement lemma keys"),
         ("stats", "Print aggregate and per-file statistics"),
         ("mode <baseline|extended>", "Change or show active mode"),
         ("output <stdout|path>", "Change output target"),
