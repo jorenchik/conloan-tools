@@ -600,43 +600,54 @@ def cmd_replace(session: AssistantSession, args: List[str]) -> str:
             continue
         if target_rows and entry.row_index not in target_rows:
             continue
-        if entry.prefix not in ("L", "CS", "NE"):
+        if entry.prefix != "L":
             continue
-        
-        # Sheet source
+
+        # Sheet source: span-level paired lemma key
         lemma_replacements[entry.lemma_key]['sheet'].add(entry.paired_lemma_key)
-    
-    # WordNet source (only for single-word lemma keys)
+
+    # WordNet source: per constituent word of the span lemma key
     if session.wordnet:
         for lemma_key in lemma_replacements:
-            if ' ' not in lemma_key:  # Single word
-                result = session.wordnet.get_synonym_groups(lemma_key)
-                if result.found:
-                    for entry_match in result.entries:
+            words = lemma_key.split()
+            for word in words:
+                wn_result = session.wordnet.get_synonym_groups(word)
+                if wn_result.found:
+                    for entry_match in wn_result.entries:
                         for sense in entry_match.senses:
                             for syn in sense.synonyms:
                                 syn_lemma = session.lemmatizer.lemmatize_word(syn)
-                                lemma_replacements[lemma_key]['wordnet'].add(syn_lemma.lower())
-    
+                                lemma_replacements[lemma_key].setdefault(
+                                    f'wordnet:{word}', set()
+                                ).add(syn_lemma.lower())
+
     if not lemma_replacements:
         return "No labeled spans found in specified rows."
-    
+
     output_lines = []
     for lemma_key in sorted(lemma_replacements.keys()):
         sources = lemma_replacements[lemma_key]
         output_lines.append(f"{lemma_key}:")
-        
+
         has_replacements = False
         for src_name, repl_keys in sources.items():
-            if repl_keys:
-                has_replacements = True
+            if not repl_keys:
+                continue
+            has_replacements = True
+            if src_name == 'sheet':
                 for repl_key in sorted(repl_keys):
-                    source_label = "wordnet" if src_name == "wordnet" else file_name
-                    output_lines.append(f"    - {repl_key} ({source_label})")
-        
+                    output_lines.append(f"    - {repl_key} ({file_name})")
+            else:
+                # src_name is 'wordnet:<word>'
+                constituent = src_name.split(':', 1)[1]
+                for repl_key in sorted(repl_keys):
+                    output_lines.append(
+                        f"    - [{constituent}] {repl_key} (wordnet)"
+                    )
+
         if not has_replacements:
             output_lines.append("    (no replacements found)")
-    
+
     return "\n".join(output_lines)
 
 
@@ -899,6 +910,90 @@ def cmd_validate_mode(session: AssistantSession, args: List[str]) -> str:
     return f"Validate-mode set to '{new_mode}'. Index rebuilt: {total_rows} rows."
 
 
+def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> str:
+    """Report replacement contradictions."""
+    if not session.active_target:
+        return "No target selected. Use 'target <name>' first."
+
+    file_name = session.active_target
+
+    target_rows = None
+    if args:
+        row_arg = args[0]
+        if '-' in row_arg:
+            parts = row_arg.split('-')
+            try:
+                start = int(parts[0])
+                end = int(parts[1])
+                target_rows = set(range(start, end + 1))
+            except ValueError:
+                return f"Invalid row range: {row_arg}"
+        else:
+            try:
+                row_num = int(row_arg)
+                target_rows = {row_num}
+            except ValueError:
+                return f"Invalid row number: {row_arg}"
+
+    # Collect L-prefix entries for the target file/rows
+    # lemma_key -> {paired_lemma_key -> [row_index, ...]}
+    source_to_repls: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+    # paired_lemma_key -> {lemma_key -> [row_index, ...]}
+    repl_to_sources: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+
+    for entry in session.index.entries:
+        if entry.file != file_name:
+            continue
+        if entry.prefix != "L":
+            continue
+        if target_rows and entry.row_index not in target_rows:
+            continue
+        if not entry.paired_lemma_key:
+            continue
+
+        source_to_repls[entry.lemma_key][entry.paired_lemma_key].append(entry.row_index)
+        repl_to_sources[entry.paired_lemma_key][entry.lemma_key].append(entry.row_index)
+
+    output_lines = []
+
+    # 1. Same loanword, different replacements
+    same_source_conflicts = {
+        lk: repls
+        for lk, repls in source_to_repls.items()
+        if len(repls) > 1
+    }
+    if same_source_conflicts:
+        output_lines.append("same loanword, different replacements:")
+        for lemma_key in sorted(same_source_conflicts):
+            output_lines.append(f"  {lemma_key}:")
+            for paired_key in sorted(same_source_conflicts[lemma_key]):
+                rows = sorted(set(same_source_conflicts[lemma_key][paired_key]))
+                rows_str = ", ".join(str(r) for r in rows)
+                output_lines.append(f"    - {paired_key} (rows: {rows_str})")
+
+    # 2. Same replacement, different sources
+    same_repl_conflicts = {
+        rk: sources
+        for rk, sources in repl_to_sources.items()
+        if len(sources) > 1
+    }
+    if same_repl_conflicts:
+        if output_lines:
+            output_lines.append("")
+        output_lines.append("same replacement, different sources:")
+        for repl_key in sorted(same_repl_conflicts):
+            output_lines.append(f"  {repl_key}:")
+            for source_key in sorted(same_repl_conflicts[repl_key]):
+                rows = sorted(set(same_repl_conflicts[repl_key][source_key]))
+                rows_str = ", ".join(str(r) for r in rows)
+                output_lines.append(f"    - {source_key} (rows: {rows_str})")
+
+    if not output_lines:
+        return "No replacement contradictions found."
+
+    return "\n".join(output_lines)
+
+
 def cmd_help(session: AssistantSession, args: List[str]) -> str:
     """List all available commands."""
     commands = [
@@ -906,7 +1001,8 @@ def cmd_help(session: AssistantSession, args: List[str]) -> str:
         ("reload", "Reload target file from disk"),
         ("validate-mode <valid|all>", "Set search scope (valid=+ only, or all rows)"),
         ("validate <row?>", "Validate rows in target file"),
-        ("contradict <row?>", "Report labeling and replacement contradictions"),
+        ("contradict <row?>", "Report labeling contradictions"),
+        ("contradict-repl <row?>", "Report replacement contradictions"),
         ("replace <row?>", "List available replacement lemma keys"),
         ("stats", "Print aggregate and per-file statistics"),
         ("mode <baseline|extended>", "Change or show active mode"),
@@ -1068,6 +1164,9 @@ def run_assistant(
                 output_lines.append(result)
             elif cmd == "contradict":
                 result = cmd_contradict(session, args)
+                output_lines.append(result)
+            elif cmd == "contradict-repl":
+                result = cmd_contradict_repl(session, args)
                 output_lines.append(result)
             elif cmd == "replace":
                 result = cmd_replace(session, args)
