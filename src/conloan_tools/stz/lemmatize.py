@@ -48,6 +48,7 @@ class Lemmatizer:
             processors="tokenize,lemma",
             verbose=self._verbose,
             logging_level="ERROR",
+            use_gpu=True,
         )
 
     def lemmatize(self, text: str) -> list[str]:
