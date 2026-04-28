@@ -31,6 +31,7 @@ class Lemmatizer:
         self.code = resolve_language_code(language)
         self._verbose = verbose
         self._nlp = None
+        self._lemma_cache: dict[str, list[str]] = {}
         self._ensure_pipeline()
 
     def _ensure_pipeline(self):
@@ -53,13 +54,17 @@ class Lemmatizer:
 
     def lemmatize(self, text: str) -> list[str]:
         """Return all lemmas for every word in *text*."""
+        if text in self._lemma_cache:
+            return self._lemma_cache[text]
         self._ensure_pipeline()
         doc = self._nlp(text)
-        return [
+        result = [
             word.lemma
             for sent in doc.sentences
             for word in sent.words
         ]
+        self._lemma_cache[text] = result
+        return result
 
     def lemmatize_word(self, word: str) -> str:
         """Return the lemma of a single word token."""

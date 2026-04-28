@@ -121,22 +121,27 @@ def build_corpus_index(
     index = CorpusIndex()
     
     for file_name, df in files.items():
-        for idx, row in df.iterrows():
-            row_valid = str(row.get("Valid", "")).strip().lower()
-            if not validate_all and row_valid != "+":
-                continue
-            
+        valid_rows = [
+            (idx, row) for idx, row in df.iterrows()
+            if validate_all
+            or str(row.get("Valid", "")).strip().lower() == "+"
+        ]
+
+        texts = [
+            strip_tags(str(row.get("Label sentence", "")))
+            for _, row in valid_rows
+        ]
+        docs = lemmatizer._nlp.bulk_process(texts) if texts else []
+
+        for (idx, row), doc in zip(valid_rows, docs):
             row_index = idx + 2  # 1-based Excel row number
             label_sent = str(row.get("Label sentence", ""))
             replacement_sent = str(row.get("Replacement sentence", ""))
-            
-            # Process Label sentence tokens
+
             _process_sentence(
                 index, file_name, row_index, label_sent,
-                replacement_sent, lemmatizer, is_label=True
+                replacement_sent, lemmatizer, is_label=True, doc=doc
             )
-            
-            # Process Replacement sentence for paired info
             _process_paired_sentence(
                 index, file_name, row_index, replacement_sent,
                 label_sent, lemmatizer
@@ -185,6 +190,7 @@ def _process_sentence(
     other_sentence: str,
     lemmatizer: Lemmatizer,
     is_label: bool,
+    doc=None,
 ) -> None:
     """Process a sentence to extract tokens and spans."""
     # Build a plain-text-position → (prefix, tag_id) map so that every
@@ -194,7 +200,8 @@ def _process_sentence(
     plain_text = strip_tags(sentence)
 
     # Tokenize using Stanza
-    doc = lemmatizer._nlp(plain_text)
+    if doc is None:
+        doc = lemmatizer._nlp(plain_text)
     for sent in doc.sentences:
         for word in sent.words:
             surface = word.text
@@ -373,18 +380,26 @@ def _reload_file(session: AssistantSession, file_name: str) -> None:
             if k[0] != file_name
         }
 
-        for idx, row in new_df.iterrows():
-            row_index = idx + 2
-            row_valid = str(row.get("Valid", "")).strip().lower()
-            if not session.validate_all and row_valid != "+":
-                continue
+        valid_rows = [
+            (idx, row) for idx, row in new_df.iterrows()
+            if session.validate_all
+            or str(row.get("Valid", "")).strip().lower() == "+"
+        ]
 
+        texts = [
+            strip_tags(str(row.get("Label sentence", "")))
+            for _, row in valid_rows
+        ]
+        docs = session.lemmatizer._nlp.bulk_process(texts) if texts else []
+
+        for (idx, row), doc in zip(valid_rows, docs):
+            row_index = idx + 2
             label_sent = str(row.get("Label sentence", ""))
             replacement_sent = str(row.get("Replacement sentence", ""))
 
             _process_sentence(
                 session.index, file_name, row_index, label_sent,
-                replacement_sent, session.lemmatizer, is_label=True
+                replacement_sent, session.lemmatizer, is_label=True, doc=doc
             )
             _process_paired_sentence(
                 session.index, file_name, row_index, replacement_sent,
