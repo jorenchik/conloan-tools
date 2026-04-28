@@ -14,7 +14,7 @@ class RowTransformResult:
     status: str  # transformed | skipped_precondition | skipped_nonempty | skipped_unselected
     warnings: List[str] = field(default_factory=list)
 
-REQUIRED_COLUMNS = {"Label sentence", "Replacement sentence", "Target", "Valid", "Reason"}
+REQUIRED_COLUMNS = {"Label sentence", "Replacement sentence", "Target", "Valid", "Reason", "Notes"}
 
 MODE_CONFIG = {
     "baseline": {"allowed_prefixes": {"L", "N"}, "pairs": [("L", "N")]},
