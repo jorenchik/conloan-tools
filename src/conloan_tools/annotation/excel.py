@@ -17,6 +17,7 @@ class ColumnSpec:
 
 
 WIDTH_WIDE     = 12
+WIDTH_MEDIUM   = 6
 WIDTH_CHECKBOX = 2
 
 DEFAULT_ANNOTATION_COLUMNS: list[ColumnSpec] = [
@@ -25,6 +26,7 @@ DEFAULT_ANNOTATION_COLUMNS: list[ColumnSpec] = [
     ColumnSpec("Target",               WIDTH_WIDE),
     ColumnSpec("Valid",                WIDTH_CHECKBOX),
     ColumnSpec("Reason",               WIDTH_CHECKBOX),
+    ColumnSpec("Notes",                WIDTH_MEDIUM),
 ]
 
 CM_TO_EXCEL_WIDTH = 3.89
