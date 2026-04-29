@@ -319,7 +319,7 @@ def _record_to_row(rec: CandidateRecord) -> dict:
     return row
 
 
-@click.command("make")
+@click.command("make-from-lemmas")
 @click.argument(
     "candidates",
     type=click.Path(exists=True, dir_okay=False),
@@ -346,7 +346,7 @@ def _record_to_row(rec: CandidateRecord) -> dict:
 @click.option("--ignore-zero-score", is_flag=True, default=False, help="Skip candidates with score_total == 0.0")
 @click.option("--sort-input", is_flag=True, default=False, help="Sort pool by score before selection.")
 @click.option("--sort-output", is_flag=True, default=False, help="Sort output by score descending.")
-def make_sheet(
+def make_from_lemmas(
     candidates,
     output,
     strategy,

@@ -185,7 +185,7 @@ def transform_file(input_path: str, output_path: str, mode: str,
     return results
 
 
-@click.command("refresh-replacement")
+@click.command("generate-repl-placeholders")
 @click.argument("input_file", type=click.Path(exists=True))
 @click.option("--output", "-o", "output_path", type=click.Path(), required=True,
               help="Path to output file (.xlsx or .csv)")
@@ -194,7 +194,7 @@ def transform_file(input_path: str, output_path: str, mode: str,
 @click.option("--process-all", is_flag=True, help="Process all rows, not just Valid='+'")
 @click.option("--overwrite", is_flag=True, help="Overwrite existing Replacement sentence")
 @click.option("--verbose", "-v", is_flag=True, help="Show per-row status")
-def refresh_replacement(input_file, output_path, mode, process_all, overwrite, verbose):
+def generate_repl_placeholders(input_file, output_path, mode, process_all, overwrite, verbose):
     """Derive Replacement sentence from Label sentence by tag prefix remapping."""
     results = transform_file(input_file, output_path, mode, process_all, overwrite)
 
@@ -217,4 +217,4 @@ def refresh_replacement(input_file, output_path, mode, process_all, overwrite, v
 
 
 if __name__ == "__main__":
-    refresh_replacement()
+    generate_repl_placeholders()

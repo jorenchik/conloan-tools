@@ -1,11 +1,11 @@
 import click
 
-from .make_sheet import make_sheet 
-from .translate import translate_sheet
-from .validate_sheet import validate
-from .make_dataset import make_dataset 
-from .refresh_replacement import refresh_replacement 
-from .assistant import assistant
+from conloan_tools.annotation.sheet.make_from_lemmas import make_from_lemmas 
+from conloan_tools.annotation.sheet.translate import translate_sheet
+from conloan_tools.annotation.sheet.validate_sheet import validate
+from conloan_tools.annotation.sheet.replacement import generate_repl_placeholders 
+from conloan_tools.annotation.sheet.assistant import assistant
+from conloan_tools.annotation.json.make_from_sheet import make_from_sheet 
 
 @click.group()
 def annotation():
@@ -15,14 +15,14 @@ def annotation():
 def sheet():
     """Conloan annotation sheet utilities."""
 
-sheet.add_command(make_sheet)
+sheet.add_command(make_from_lemmas)
 sheet.add_command(validate)
 sheet.add_command(translate_sheet)
-sheet.add_command(refresh_replacement)
+sheet.add_command(generate_repl_placeholders)
 sheet.add_command(assistant)
 
 @annotation.group()
 def json():
     """Conloan dataset json utilities."""
 
-json.add_command(make_dataset)
+json.add_command(make_from_sheet)

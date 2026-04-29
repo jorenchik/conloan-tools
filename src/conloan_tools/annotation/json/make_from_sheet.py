@@ -4,7 +4,7 @@ import os
 import click
 import pandas as pd
 from pathlib import Path
-from .validate_sheet import validate_row
+from conloan_tools.annotation.sheet.validate_sheet import validate_row
 from conloan_tools.annotation import annotation
 
 def strip_tags(text: str) -> str:
@@ -18,7 +18,7 @@ def extract_tags(text: str, prefix: str) -> dict[str, str]:
     pattern = rf"<{prefix}(\d+)>([^<]+)</{prefix}\1>"
     return {m[0]: m[1] for m in re.findall(pattern, text)}
 
-@click.command("make")
+@click.command("make-from-sheet")
 @click.argument("lang_name")
 @click.argument("input_xlsx", type=click.Path(exists=True))
 @click.option(
@@ -38,7 +38,7 @@ def extract_tags(text: str, prefix: str) -> dict[str, str]:
     is_flag=True,
     help="Process all rows regardless of the 'Valid' column status."
 )
-def make_dataset(lang_name, input_xlsx, output_dir, mode, all_rows):
+def make_from_sheet(lang_name, input_xlsx, output_dir, mode, all_rows):
     """Transform an annotated XLSX sheet into a validated JSON dataset."""
     output_path = Path(output_dir) / f"{lang_name}.json"
 
