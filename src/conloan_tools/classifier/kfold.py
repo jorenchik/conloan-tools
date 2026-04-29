@@ -76,11 +76,8 @@ def run_kfold(
 
     raw_data = load_conloan(input_files)
     if max_samples is not None:
-        raw_data = raw_data.shuffle(seed=seed).select(
-            range(min(max_samples, len(raw_data)))
-        )
-    else:
-        raw_data = raw_data.shuffle(seed=seed)
+        # Reshuffle to avoid head bias if sliced.
+        raw_data = raw_data.select(range(min(max_samples, len(raw_data))))
 
     tokenizer = _load_tokenizer(model_name)
     tokenized_full = raw_data.map(
