@@ -10,6 +10,7 @@ from collections import defaultdict
 from pathlib import Path
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from tqdm import tqdm
 
 from conloan_tools.stz.lemmatize import Lemmatizer
 from conloan_tools.wordnet.query import WordNet
@@ -135,7 +136,7 @@ def build_corpus_index(
 
     index = CorpusIndex()
 
-    for file_name, df in files.items():
+    for file_name, df in tqdm(files.items(), desc="files", unit="file"):
         valid_rows = [
             (idx, row) for idx, row in df.iterrows()
             if validate_all
@@ -150,8 +151,6 @@ def build_corpus_index(
         label_docs = lemmatizer._nlp.bulk_process(label_texts) if label_texts else []
 
         # Bulk-process replacement sentences for span-level lemmatisation.
-        # This pre-populates lemma_cache so _process_paired_sentence never
-        # calls the lemmatizer individually for a surface it has seen before.
         all_span_surfaces: List[str] = []
         for _, row in valid_rows:
             for sent_col in ("Label sentence", "Replacement sentence"):
@@ -160,7 +159,7 @@ def build_corpus_index(
                     if content not in lemma_cache:
                         all_span_surfaces.append(content)
 
-        unique_new = list(dict.fromkeys(all_span_surfaces))  # preserve order, dedupe
+        unique_new = list(dict.fromkeys(all_span_surfaces))
         if unique_new:
             span_docs = lemmatizer._nlp.bulk_process(unique_new)
             for surface, doc in zip(unique_new, span_docs):
@@ -172,8 +171,14 @@ def build_corpus_index(
                     ]
                     lemma_cache[surface] = " ".join(lemmas)
 
-        for (idx, row), doc in zip(valid_rows, label_docs):
-            row_index = idx + 2  # 1-based Excel row number
+        for (idx, row), doc in tqdm(
+            zip(valid_rows, label_docs),
+            desc=file_name,
+            total=len(valid_rows),
+            unit="row",
+            leave=False,
+        ):
+            row_index = idx + 2
             label_sent = str(row.get("Label sentence", ""))
             replacement_sent = str(row.get("Replacement sentence", ""))
 
@@ -419,7 +424,13 @@ def _reload_file(session: AssistantSession, file_name: str) -> None:
         ]
         docs = session.lemmatizer._nlp.bulk_process(texts) if texts else []
 
-        for (idx, row), doc in zip(valid_rows, docs):
+        for (idx, row), doc in tqdm(
+            zip(valid_rows, docs),
+            desc=file_name,
+            total=len(valid_rows),
+            unit="row",
+            leave=False,
+        ):
             row_index = idx + 2
             label_sent = str(row.get("Label sentence", ""))
             replacement_sent = str(row.get("Replacement sentence", ""))
