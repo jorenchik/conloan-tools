@@ -52,8 +52,8 @@ def _make_schema(
     report_labels: tuple[str, ...],
     primary_label: str,
 ) -> LabelSchema:
-    label_to_id = {m.label: m.value for m in members}
-    id_to_label = {m.value: m.label for m in members}
+    label_to_id = {m.label: i for i, m in enumerate(members)}
+    id_to_label = {i: m.label for i, m in enumerate(members)}
     return LabelSchema(
         name=name,
         label_to_id=label_to_id,
