@@ -19,7 +19,7 @@ dependencies = [
     "xlsxwriter",
     "lingua-language-detector",
     "compress-pickle[lz4]",
-    "watchdog",
+    "prompt_toolkit",
 ]
 
 [project.optional-dependencies]
