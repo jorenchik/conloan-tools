@@ -7,6 +7,7 @@ from conloan_tools.annotation.sheet.replacement import generate_repl_placeholder
 from conloan_tools.annotation.sheet.assistant import assistant
 from conloan_tools.annotation.sheet.extract_disqualified import extract_disqualified_cmd
 from conloan_tools.annotation.json.make_from_sheet import make_from_sheet 
+from conloan_tools.annotation.json.sheet_from_json import sheet_from_json 
 
 @click.group()
 def annotation():
@@ -28,3 +29,4 @@ def json():
     """Conloan dataset json utilities."""
 
 json.add_command(make_from_sheet)
+json.add_command(sheet_from_json)

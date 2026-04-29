@@ -5,7 +5,7 @@ import hashlib
 import click
 import pandas as pd
 from dataclasses import dataclass, field
-from typing import List, Set, Optional, Dict, Tuple
+from typing import List, Set, Dict, Tuple, Optional
 from collections import defaultdict
 from pathlib import Path
 from prompt_toolkit import PromptSession
@@ -13,8 +13,6 @@ from prompt_toolkit.history import InMemoryHistory
 from tqdm import tqdm
 
 from conloan_tools.stz.lemmatize import Lemmatizer
-from conloan_tools.wordnet.query import WordNet
-
 from .validate_sheet import (
     validate_row,
     validate_file,
@@ -69,7 +67,6 @@ class AssistantSession:
     files: Dict[str, pd.DataFrame]           # keyed by name-no-ext
     row_hashes: Dict[str, Dict[str, int]]    # name-no-ext -> hash -> row_index
     lemmatizer: Lemmatizer
-    wordnet: Optional[WordNet]
     mode: str
     validate_all: bool
     output_target: str                        # "stdout" or file path
@@ -578,21 +575,6 @@ def cmd_replace(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
         # Sheet source: span-level paired lemma key
         lemma_replacements[entry.lemma_key]['sheet'].add(entry.paired_lemma_key)
 
-    # WordNet source: per constituent word of the span lemma key
-    if session.wordnet:
-        for lemma_key in lemma_replacements:
-            words = lemma_key.split()
-            for word in words:
-                wn_result = session.wordnet.get_synonym_groups(word)
-                if wn_result.found:
-                    for entry_match in wn_result.entries:
-                        for sense in entry_match.senses:
-                            for syn in sense.synonyms:
-                                syn_lemma = session.lemmatizer.lemmatize_word(syn)
-                                lemma_replacements[lemma_key].setdefault(
-                                    f'wordnet:{word}', set()
-                                ).add(syn_lemma.lower())
-
     if not lemma_replacements:
         return ("No labeled spans found in specified rows.", False)
 
@@ -606,15 +588,8 @@ def cmd_replace(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
             if not repl_keys:
                 continue
             has_replacements = True
-            if src_name == 'sheet':
-                for repl_key in sorted(repl_keys):
-                    output_lines.append(f"    - {repl_key} ({file_name})")
-            else:
-                constituent = src_name.split(':', 1)[1]
-                for repl_key in sorted(repl_keys):
-                    output_lines.append(
-                        f"    - [{constituent}] {repl_key} (wordnet)"
-                    )
+            for repl_key in sorted(repl_keys):
+                output_lines.append(f"    - {repl_key} ({file_name})")
 
         if not has_replacements:
             output_lines.append("    (no replacements found)")
@@ -956,7 +931,6 @@ def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
 def run_assistant(
     files: List[str],
     language: str,
-    wordnet_path: Optional[str],
     mode: str,
     validate_all: bool,
     output: str,
@@ -975,15 +949,6 @@ def run_assistant(
     except ValueError as e:
         click.secho(f"Error: {e}", fg="red")
         return
-
-    # 3.3: Load WordNet if provided
-    wordnet = None
-    if wordnet_path:
-        try:
-            wordnet = WordNet(wordnet_path)
-        except Exception as e:
-            click.secho(f"Error loading WordNet: {e}", fg="red")
-            return
 
     # 3.4: Load and validate each Excel file
     session_files = {}
@@ -1029,7 +994,6 @@ def run_assistant(
         files=session_files,
         row_hashes=session_hashes,
         lemmatizer=lemmatizer,
-        wordnet=wordnet,
         mode=mode,
         validate_all=validate_all,
         output_target=output,
@@ -1106,7 +1070,6 @@ def run_assistant(
 @click.command("assistant")
 @click.argument("excel_files", nargs=-1, required=True, type=click.Path(exists=True))
 @click.option("--language", required=True, help="Canonical language name")
-@click.option("--wordnet", default=None, help="WordNet LMF XML file path")
 @click.option(
     "--mode",
     type=click.Choice(["baseline", "extended"]),
@@ -1122,7 +1085,6 @@ def run_assistant(
 def assistant(
     excel_files,
     language,
-    wordnet,
     mode,
     validate_all,
     output,
@@ -1131,7 +1093,6 @@ def assistant(
     run_assistant(
         list(excel_files),
         language,
-        wordnet,
         mode,
         validate_all,
         output,
