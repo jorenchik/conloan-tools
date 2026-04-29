@@ -899,6 +899,116 @@ def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> Tuple[str
     return ("\n".join(output_lines), False)
 
 
+def cmd_dupes(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
+    """Report clusters of near-duplicate sentences by token-level Jaccard similarity."""
+    if not args:
+        return ("Usage: dupes <threshold> (e.g. dupes 0.8)", True)
+
+    try:
+        threshold = float(args[0])
+    except ValueError:
+        return (f"Invalid threshold '{args[0]}': must be a float.", True)
+
+    if not (0.0 <= threshold <= 1.0):
+        return ("Threshold must be between 0.0 and 1.0.", True)
+
+    # Build row_id -> set of lemma keys
+    row_lemmas: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
+    for token in session.index.tokens:
+        row_lemmas[(token.file, token.row_index)].add(token.lemma_key)
+
+    row_ids = list(row_lemmas.keys())
+    n = len(row_ids)
+
+    if n == 0:
+        return ("No rows in index.", False)
+
+    # Inverted index: lemma_key -> list of row indices (into row_ids)
+    inv: Dict[str, List[int]] = defaultdict(list)
+    for i, rid in enumerate(row_ids):
+        for lk in row_lemmas[rid]:
+            inv[lk].append(i)
+
+    # Candidate pairs sharing >= 1 lemma key
+    candidate_pairs: Set[Tuple[int, int]] = set()
+    for lk, idxs in inv.items():
+        for a in range(len(idxs)):
+            for b in range(a + 1, len(idxs)):
+                i, j = idxs[a], idxs[b]
+                if i > j:
+                    i, j = j, i
+                candidate_pairs.add((i, j))
+
+    # Union-Find
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx == ry:
+            return
+        if rank[rx] < rank[ry]:
+            rx, ry = ry, rx
+        parent[ry] = rx
+        if rank[rx] == rank[ry]:
+            rank[rx] += 1
+
+    # Similarity cache: (i, j) -> jaccard
+    pair_sim: Dict[Tuple[int, int], float] = {}
+
+    for i, j in candidate_pairs:
+        a_set = row_lemmas[row_ids[i]]
+        b_set = row_lemmas[row_ids[j]]
+        sa, sb = len(a_set), len(b_set)
+        # Upper-bound prune
+        if min(sa, sb) / max(sa, sb) < threshold:
+            continue
+        intersection = len(a_set & b_set)
+        jaccard = intersection / (sa + sb - intersection)
+        if jaccard >= threshold:
+            pair_sim[(i, j)] = jaccard
+            union(i, j)
+
+    # Group by cluster root; only keep clusters with > 1 member
+    clusters: Dict[int, List[int]] = defaultdict(list)
+    for i in range(n):
+        clusters[find(i)].append(i)
+
+    multi = {root: members for root, members in clusters.items() if len(members) > 1}
+
+    if not multi:
+        return (f"No duplicate clusters found at threshold {threshold}.", False)
+
+    # Build output
+    output_lines = [f"dupes (threshold: {threshold}):"]
+    for cluster_num, (root, members) in enumerate(
+        sorted(multi.items(), key=lambda x: row_ids[x[0]]), start=1
+    ):
+        output_lines.append(f"\ncluster {cluster_num}:")
+        anchor = members[0]
+        anchor_id = row_ids[anchor]
+        anchor_size = len(row_lemmas[anchor_id])
+        output_lines.append(
+            f"    - {anchor_id[0]}:{anchor_id[1]}  ({anchor_size} tokens)"
+        )
+        for member in members[1:]:
+            mid = row_ids[member]
+            msize = len(row_lemmas[mid])
+            i, j = (anchor, member) if anchor < member else (member, anchor)
+            sim = pair_sim.get((i, j), 0.0)
+            output_lines.append(
+                f"    - {mid[0]}:{mid[1]}  ({msize} tokens)  similarity: {sim:.2f}"
+            )
+
+    return ("\n".join(output_lines), False)
+
+
 def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """List all available commands."""
     commands = [
@@ -908,6 +1018,7 @@ def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
         ("validate", "Validate rows in target file"),
         ("contradict", "Report labeling contradictions"),
         ("contradict-repl", "Report replacement contradictions"),
+        ("dupes <threshold>", "Report near-duplicate sentence clusters"),
         ("replace", "List available replacement lemma keys"),
         ("stats", "Print aggregate and per-file statistics"),
         ("mode <baseline|extended>", "Change or show active mode"),
@@ -1016,6 +1127,7 @@ def run_assistant(
         "validate": cmd_validate,
         "contradict": cmd_contradict,
         "contradict-repl": cmd_contradict_repl,
+        "dupes": cmd_dupes,
         "replace": cmd_replace,
         "stats": cmd_stats,
         "mode": cmd_mode,
