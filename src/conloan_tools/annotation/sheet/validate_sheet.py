@@ -19,8 +19,22 @@ class RowResult:
 
 # Mode configurations
 MODE_CONFIG = {
-    "baseline": {"allowed_prefixes": {"L", "N"}, "pairs": [("L", "N")]},
-    "extended": {"allowed_prefixes": {"L", "N", "CS", "CN", "NE"}, "pairs": [("L", "N"), ("CS", "CN"), ("NE", "NE")]},
+    "baseline": {
+        "allowed_prefixes": {"L", "N"},
+        "column_prefixes": {
+            "Label sentence": {"L"},
+            "Replacement sentence": {"N"},
+        },
+        "pairs": [("L", "N")],
+    },
+    "extended": {
+        "allowed_prefixes": {"L", "N", "CS", "CN", "NE"},
+        "column_prefixes": {
+            "Label sentence": {"L", "CS", "NE"},
+            "Replacement sentence": {"N", "CN", "NE"},
+        },
+        "pairs": [("L", "N"), ("CS", "CN"), ("NE", "NE")],
+    },
 }
 
 REQUIRED_COLUMNS = {"Label sentence", "Replacement sentence", "Target", "Valid", "Reason"}
@@ -40,7 +54,7 @@ def get_tag_spans(text: str) -> List[Tuple[str, str, int, int]]:
             spans.append((prefix, content, start, end))
     return spans
 
-def get_tag_stats(text: str, field_name: str, allowed_prefixes: Set[str]) -> Tuple[List[str], List[ValidationError]]:
+def get_tag_stats(text: str, field_name: str, allowed_prefixes: Set[str], column_prefixes: Optional[Set[str]] = None) -> Tuple[List[str], List[ValidationError]]:
     """Returns list of opening tags and list of ValidationErrors."""
     errors = []
     if not isinstance(text, str) or pd.isna(text):
@@ -62,6 +76,9 @@ def get_tag_stats(text: str, field_name: str, allowed_prefixes: Set[str]) -> Tup
             errors.append(ValidationError("V1.2", field_name, f"Illegal digit-free tag: {full_tag}"))
         elif prefix not in allowed_prefixes:
             errors.append(ValidationError("V1.3", field_name, f"Illegal tag prefix: {full_tag}"))
+        elif column_prefixes is not None and prefix not in column_prefixes:
+            errors.append(ValidationError("V1.8", field_name,
+                f"Tag prefix '{prefix}' is not allowed in this column (allowed: {sorted(column_prefixes)})."))
         else:
             open_tags.append(f"{prefix}{digits}")
 
@@ -198,13 +215,14 @@ def validate_row(row: pd.Series, mode: str, warn_undecided: bool = True) -> List
         errors.append(ValidationError("V4.1", "Target", "Target must not contain tags."))
 
     # V1: Tag syntax and legality for sentences
-    loan_tags, l_errors = get_tag_stats(loan_sent, "Loanword sentence", allowed_prefixes)
-    native_tags, n_errors = get_tag_stats(native_sent, "Native sentence", allowed_prefixes)
+    column_prefixes = config.get("column_prefixes", {})
+    loan_tags, l_errors = get_tag_stats(loan_sent, "Label sentence", allowed_prefixes, column_prefixes.get("Label sentence"))
+    native_tags, n_errors = get_tag_stats(native_sent, "Replacement sentence", allowed_prefixes, column_prefixes.get("Replacement sentence"))
     errors.extend(l_errors)
     errors.extend(n_errors)
 
     # V2: Within-sentence tag set integrity
-    for tags, field in [(loan_tags, "Loanword sentence"), (native_tags, "Native sentence")]:
+    for tags, field in [(loan_tags, "Label sentence"), (native_tags, "Replacement sentence")]:
         counts = Counter(tags)
         for tag, count in counts.items():
             if count > 1:
