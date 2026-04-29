@@ -77,6 +77,7 @@ class AssistantSession:
     active_target: Optional[str]              # name-no-ext
     index: CorpusIndex
     watch_queue: List[str]
+    lemma_cache: Dict[str, str] = field(default_factory=dict)  # surface -> lemma_key
     _file_paths: Dict[str, str] = field(default_factory=dict)  # name-no-ext -> path
 
 
@@ -110,16 +111,32 @@ def strip_tags(text: str) -> str:
     return re.sub(r'<[^>]+>', '', text)
 
 
+def _resolve_lemma_key(
+    surface: str,
+    lemmatizer: Lemmatizer,
+    cache: Dict[str, str],
+) -> str:
+    """Return cached lemma key for surface, computing and storing if absent."""
+    if surface not in cache:
+        lemmas = lemmatizer.lemmatize(surface)
+        cache[surface] = " ".join(lemmas).lower()
+    return cache[surface]
+
+
 def build_corpus_index(
     files: Dict[str, pd.DataFrame],
     row_hashes: Dict[str, Dict[str, int]],
     lemmatizer: Lemmatizer,
     mode: str,
-    validate_all: bool
+    validate_all: bool,
+    lemma_cache: Optional[Dict[str, str]] = None,
 ) -> CorpusIndex:
     """Build the complete corpus index from all loaded files."""
+    if lemma_cache is None:
+        lemma_cache = {}
+
     index = CorpusIndex()
-    
+
     for file_name, df in files.items():
         valid_rows = [
             (idx, row) for idx, row in df.iterrows()
@@ -127,13 +144,37 @@ def build_corpus_index(
             or str(row.get("Valid", "")).strip().lower() == "+"
         ]
 
-        texts = [
+        # Bulk-process label sentences (plain text) for token-level NLP.
+        label_texts = [
             strip_tags(str(row.get("Label sentence", "")))
             for _, row in valid_rows
         ]
-        docs = lemmatizer._nlp.bulk_process(texts) if texts else []
+        label_docs = lemmatizer._nlp.bulk_process(label_texts) if label_texts else []
 
-        for (idx, row), doc in zip(valid_rows, docs):
+        # Bulk-process replacement sentences for span-level lemmatisation.
+        # This pre-populates lemma_cache so _process_paired_sentence never
+        # calls the lemmatizer individually for a surface it has seen before.
+        all_span_surfaces: List[str] = []
+        for _, row in valid_rows:
+            for sent_col in ("Label sentence", "Replacement sentence"):
+                sent = str(row.get(sent_col, ""))
+                for _, content, _, _ in get_tag_spans(sent):
+                    if content not in lemma_cache:
+                        all_span_surfaces.append(content)
+
+        unique_new = list(dict.fromkeys(all_span_surfaces))  # preserve order, dedupe
+        if unique_new:
+            span_docs = lemmatizer._nlp.bulk_process(unique_new)
+            for surface, doc in zip(unique_new, span_docs):
+                if surface not in lemma_cache:
+                    lemmas = [
+                        w.lemma.lower()
+                        for sent in doc.sentences
+                        for w in sent.words
+                    ]
+                    lemma_cache[surface] = " ".join(lemmas)
+
+        for (idx, row), doc in zip(valid_rows, label_docs):
             row_index = idx + 2  # 1-based Excel row number
             label_sent = str(row.get("Label sentence", ""))
             replacement_sent = str(row.get("Replacement sentence", ""))
@@ -144,9 +185,9 @@ def build_corpus_index(
             )
             _process_paired_sentence(
                 index, file_name, row_index, replacement_sent,
-                label_sent, lemmatizer
+                label_sent, lemmatizer, lemma_cache
             )
-    
+
     return index
 
 
@@ -246,9 +287,13 @@ def _process_paired_sentence(
     row_index: int,
     paired_sentence: str,
     original_sentence: str,
-    lemmatizer: Lemmatizer
+    lemmatizer: Lemmatizer,
+    lemma_cache: Optional[Dict[str, str]] = None,
 ) -> None:
     """Process paired sentence to build corpus entries."""
+    if lemma_cache is None:
+        lemma_cache = {}
+
     # Get tag spans from original sentence
     original_spans = {}
     for prefix, content, start, end in get_tag_spans(original_sentence):
@@ -256,7 +301,7 @@ def _process_paired_sentence(
         if num_match:
             tag_id = f"{prefix}{num_match.group(1)}"
             original_spans[tag_id] = (prefix, content, start, end)
-    
+
     # Get tag spans from paired sentence
     paired_spans = {}
     for prefix, content, start, end in get_tag_spans(paired_sentence):
@@ -264,45 +309,38 @@ def _process_paired_sentence(
         if num_match:
             tag_id = f"{prefix}{num_match.group(1)}"
             paired_spans[tag_id] = (prefix, content, start, end)
-    
+
     # Build corpus entries for labeled spans in original
     for tag_id, (prefix, content, start, end) in original_spans.items():
-        # Lemmatize the span content
-        span_lemmas = lemmatizer.lemmatize(content)
-        lemma_key = " ".join(span_lemmas).lower()
-        
+        lemma_key = _resolve_lemma_key(content, lemmatizer, lemma_cache)
+
         # Find paired tag
         paired_tag_id = None
         paired_content = ""
         paired_lemma_key = ""
-        
+
         if prefix == "L" and f"N{tag_id[1:]}" in paired_spans:
             paired_tag_id = f"N{tag_id[1:]}"
             paired_content = paired_spans[paired_tag_id][1]
-            paired_lemmas = lemmatizer.lemmatize(paired_content)
-            paired_lemma_key = " ".join(paired_lemmas).lower()
+            paired_lemma_key = _resolve_lemma_key(paired_content, lemmatizer, lemma_cache)
         elif prefix == "N" and f"L{tag_id[1:]}" in paired_spans:
             paired_tag_id = f"L{tag_id[1:]}"
             paired_content = paired_spans[paired_tag_id][1]
-            paired_lemmas = lemmatizer.lemmatize(paired_content)
-            paired_lemma_key = " ".join(paired_lemmas).lower()
+            paired_lemma_key = _resolve_lemma_key(paired_content, lemmatizer, lemma_cache)
         elif prefix == "CS" and f"CN{tag_id[2:]}" in paired_spans:
             paired_tag_id = f"CN{tag_id[2:]}"
             paired_content = paired_spans[paired_tag_id][1]
-            paired_lemmas = lemmatizer.lemmatize(paired_content)
-            paired_lemma_key = " ".join(paired_lemmas).lower()
+            paired_lemma_key = _resolve_lemma_key(paired_content, lemmatizer, lemma_cache)
         elif prefix == "CN" and f"CS{tag_id[2:]}" in paired_spans:
             paired_tag_id = f"CS{tag_id[2:]}"
             paired_content = paired_spans[paired_tag_id][1]
-            paired_lemmas = lemmatizer.lemmatize(paired_content)
-            paired_lemma_key = " ".join(paired_lemmas).lower()
+            paired_lemma_key = _resolve_lemma_key(paired_content, lemmatizer, lemma_cache)
         elif prefix == "NE":
             # NE is identity pair
             if tag_id in paired_spans:
                 paired_tag_id = tag_id
                 paired_content = paired_spans[tag_id][1]
-                paired_lemmas = lemmatizer.lemmatize(paired_content)
-                paired_lemma_key = " ".join(paired_lemmas).lower()
+                paired_lemma_key = _resolve_lemma_key(paired_content, lemmatizer, lemma_cache)
         
         is_replaced = paired_content != content if paired_content else False
         # If paired_content is empty but tag existed, there was no actual content to compare
@@ -403,7 +441,7 @@ def _reload_file(session: AssistantSession, file_name: str) -> None:
             )
             _process_paired_sentence(
                 session.index, file_name, row_index, replacement_sent,
-                label_sent, session.lemmatizer
+                label_sent, session.lemmatizer, session.lemma_cache
             )
 
         summary = (
@@ -603,29 +641,23 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> str:
     NE_words = sum(1 for t in session.index.tokens if t.prefix == "NE")
     NE_lemma_variants = len(set(t.lemma_key for t in session.index.tokens if t.prefix == "NE"))
     
-    # Sentence counts (unique file+row combinations)
-    total_sentences = len(set((e.file, e.row_index) for e in session.index.entries))
-    validated_sentences = 0
-    for (file_name, row_index) in set((e.file, e.row_index) for e in session.index.entries):
-        df = session.files.get(file_name)
-        if df is not None:
-            idx = row_index - 2
-            if idx >= 0 and idx < len(df):
-                row_valid = str(df.iloc[idx].get("Valid", "")).strip().lower()
-                if row_valid == "+":
-                    validated_sentences += 1
-    
-    # Duplicate lemma variants for labeled words (lemmas appearing more than once in label_occurrences)
-    lemma_counts = defaultdict(int)
-    for file_name, df in session.files.items():
+    # Precompute validated (file, row_index) pairs in one pass per file.
+    validated_pairs: Set[Tuple[str, int]] = set()
+    for fn, df in session.files.items():
         for idx, row in df.iterrows():
-            label_sent = str(row.get("Label sentence", ""))
-            spans = get_tag_spans(label_sent)
-            for prefix, content, start, end in spans:
-                lemmas = session.lemmatizer.lemmatize(content)
-                lemma_key = " ".join(lemmas).lower()
-                lemma_counts[lemma_key] += 1
-    duplicate_lemma_variants = sum(1 for c in lemma_counts.values() if c > 1)
+            if str(row.get("Valid", "")).strip().lower() == "+":
+                validated_pairs.add((fn, idx + 2))
+
+    # Sentence counts (unique file+row combinations)
+    sentence_pairs = set((e.file, e.row_index) for e in session.index.entries)
+    total_sentences = len(sentence_pairs)
+    validated_sentences = sum(1 for p in sentence_pairs if p in validated_pairs)
+    
+    # Duplicate lemma variants: lemma keys appearing in more than one span entry.
+    global_lemma_counts: Dict[str, int] = defaultdict(int)
+    for e in session.index.entries:
+        global_lemma_counts[e.lemma_key] += 1
+    duplicate_lemma_variants = sum(1 for c in global_lemma_counts.values() if c > 1)
     
     # Total span count
     total_spans = len(session.index.entries)
@@ -678,19 +710,14 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> str:
         f_NE_lemma = len(set(t.lemma_key for t in f_tokens if t.prefix == "NE"))
         
         f_sentences = len(set(e.row_index for e in f_entries))
-        f_df = session.files[file_name]
-        f_validated = 0
-        for row_idx in set(e.row_index for e in f_entries):
-            idx = row_idx - 2
-            if 0 <= idx < len(f_df):
-                row_valid = str(f_df.iloc[idx].get("Valid", "")).strip().lower()
-                if row_valid == "+":
-                    f_validated += 1
+        f_validated = sum(
+            1 for row_idx in set(e.row_index for e in f_entries)
+            if (file_name, row_idx) in validated_pairs
+        )
         
-        f_labeled_lemmas = [e.lemma_key for e in f_entries]
-        f_lemma_counts = {}
-        for lemma in f_labeled_lemmas:
-            f_lemma_counts[lemma] = f_lemma_counts.get(lemma, 0) + 1
+        f_lemma_counts: Dict[str, int] = defaultdict(int)
+        for e in f_entries:
+            f_lemma_counts[e.lemma_key] += 1
         f_duplicate_lemma_variants = sum(1 for c in f_lemma_counts.values() if c > 1)
         
         f_total_spans = len(f_entries)
@@ -747,9 +774,10 @@ def cmd_mode(session: AssistantSession, args: List[str]) -> str:
         session.row_hashes,
         session.lemmatizer,
         session.mode,
-        session.validate_all
+        session.validate_all,
+        session.lemma_cache,
     )
-    
+
     return f"Mode set to '{new_mode}'. Rebuilding index...\nIndex rebuilt: {total_rows} rows processed across {len(session.files)} files."
 
 
@@ -834,9 +862,10 @@ def cmd_validate_mode(session: AssistantSession, args: List[str]) -> str:
         session.row_hashes,
         session.lemmatizer,
         session.mode,
-        session.validate_all
+        session.validate_all,
+        session.lemma_cache,
     )
-    
+
     return f"Validate-mode set to '{new_mode}'. Index rebuilt: {total_rows} rows."
 
 
@@ -995,8 +1024,9 @@ def run_assistant(
             click.echo(f"  Warning: Hash collision detected in {file_name}.xlsx")
     
     # 3.5: Build corpus index
+    lemma_cache: Dict[str, str] = {}
     click.echo(f"\nBuilding index...")
-    index = build_corpus_index(session_files, session_hashes, lemmatizer, mode, validate_all)
+    index = build_corpus_index(session_files, session_hashes, lemmatizer, mode, validate_all, lemma_cache)
     
     total_rows = len([e for e in index.entries if e.prefix == "L"])
     click.echo(f"Index built: {total_rows} labeled spans, {len(index.tokens)} tokens across {len(session_files)} files.")
@@ -1015,6 +1045,7 @@ def run_assistant(
         active_target=None,
         index=index,
         watch_queue=[],
+        lemma_cache=lemma_cache,
         _file_paths=file_paths
     )
     
