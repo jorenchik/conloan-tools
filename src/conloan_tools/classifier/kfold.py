@@ -45,6 +45,7 @@ def run_kfold(
     word_level: bool,
     max_samples: int | None,
     quiet: bool,
+    use_class_weights: bool = False,
 ) -> Path:
     """K-fold CV — estimates generalisation, produces no model artifact.
 
@@ -57,6 +58,7 @@ def run_kfold(
     from .train import (
         _build_trainer,
         _generate_run_name,
+        _make_class_weights,
         _make_training_args,
         _silence_hf,
         _load_tokenizer,
@@ -112,13 +114,20 @@ def run_kfold(
             precision=precision,
             use_cpu=use_cpu,
         )
+        train_split = tokenized_full.select(train_idx)
+        class_weights = (
+            _make_class_weights(train_split, schema)
+            if use_class_weights
+            else None
+        )
         trainer = _build_trainer(
             model_name=model_name,
             schema=schema,
-            train_dataset=tokenized_full.select(train_idx),
+            train_dataset=train_split,
             eval_dataset=tokenized_full.select(val_idx),
             training_args=args,
             tokenizer=tokenizer,
+            class_weights=class_weights,
         )
         trainer.train()
         fold_results.append(trainer.evaluate())
@@ -150,6 +159,7 @@ def run_kfold(
             "max_length": max_length,
             "precision": precision,
             "word_level": word_level,
+            "use_class_weights": use_class_weights,
         },
         "folds": fold_results,
         "aggregate": aggregate,

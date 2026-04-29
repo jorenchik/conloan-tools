@@ -104,6 +104,35 @@ def _make_compute_metrics(schema: "LabelSchema"):
     return compute_metrics
 
 
+def _make_class_weights(train_dataset, schema: "LabelSchema"):
+    import warnings
+
+    import torch
+
+    label_ids = schema.label_to_id
+    counts = {i: 0 for i in range(len(label_ids))}
+    for example in train_dataset:
+        for lid in example["labels"]:
+            if lid != -100 and lid in counts:
+                counts[lid] += 1
+
+    total = sum(counts.values())
+    n_classes = len(counts)
+    weights = [0.0] * n_classes
+    for i in range(n_classes):
+        weights[i] = total / (n_classes * counts[i]) if counts[i] > 0 else 1.0
+
+    warnings.warn(
+        "Class weights computed from training split. "
+        "Per-class counts: "
+        + ", ".join(
+            f"{schema.id_to_label[i]}={counts[i]}" for i in range(n_classes)
+        ),
+        stacklevel=2,
+    )
+    return torch.tensor(weights, dtype=torch.float)
+
+
 def _build_trainer(
     model_name: str,
     schema: "LabelSchema",
@@ -111,6 +140,7 @@ def _build_trainer(
     eval_dataset,
     training_args,
     tokenizer,
+    class_weights=None,
 ):
     from transformers import (
         AutoModelForTokenClassification,
@@ -118,16 +148,37 @@ def _build_trainer(
     )
     from transformers.trainer import Trainer
 
+    class _WeightedTrainer(Trainer):
+        def __init__(self, *args, class_weights=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._class_weights = class_weights
+
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            import torch.nn as nn
+
+            labels = inputs.get("labels")
+            outputs = model(**inputs)
+            logits = outputs.logits
+            loss_fn = nn.CrossEntropyLoss(
+                weight=self._class_weights.to(logits.device)
+                if self._class_weights is not None
+                else None,
+                ignore_index=-100,
+            )
+            loss = loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
+            return (loss, outputs) if return_outputs else loss
+
     model = AutoModelForTokenClassification.from_pretrained(
         model_name, num_labels=len(schema.label_to_id)
     )
-    return Trainer(
+    return _WeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=DataCollatorForTokenClassification(tokenizer),
         compute_metrics=_make_compute_metrics(schema),
+        class_weights=class_weights,
     )
 
 
@@ -202,6 +253,7 @@ def run_train(
     precision: str,
     word_level: bool,
     quiet: bool,
+    use_class_weights: bool = False,
 ) -> Path:
     """Train on the pre-built train split; evaluate and save artifact.
 
@@ -221,9 +273,20 @@ def run_train(
     tokenizer = _load_tokenizer(model_name)
     tokenized = _tokenize_splits(splits, tokenizer, schema, max_length, word_level)
 
+    import warnings
+
     use_cpu = not torch.cuda.is_available()
     run_dir = output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    if not use_class_weights:
+        warnings.warn(
+            "Class weighting is disabled (use_class_weights=False). "
+            "The model may under-predict minority entity classes due to O-token dominance. "
+            "Pass use_class_weights=True to enable inverse-frequency weighting.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     args = _make_training_args(
         output_dir=str(run_dir),
@@ -237,6 +300,11 @@ def run_train(
         precision=precision,
         use_cpu=use_cpu,
     )
+    class_weights = (
+        _make_class_weights(tokenized["train"], schema)
+        if use_class_weights
+        else None
+    )
     trainer = _build_trainer(
         model_name=model_name,
         schema=schema,
@@ -244,6 +312,7 @@ def run_train(
         eval_dataset=None,
         training_args=args,
         tokenizer=tokenizer,
+        class_weights=class_weights,
     )
 
     trainer.train()

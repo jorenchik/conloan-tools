@@ -119,6 +119,13 @@ def _hyperparams(f):
             "--token-level", is_flag=True,
             help="Label all subword tokens; default is first-subword only.",
         ),
+        click.option(
+            "--class-weights", is_flag=True,
+            help=(
+                "Weight loss by inverse class frequency computed from the "
+                "training split. Recommended for imbalanced datasets."
+            ),
+        ),
     ]
     for o in reversed(opts):
         f = o(f)
@@ -206,6 +213,7 @@ def train_cmd(
     max_length: int,
     precision: str,
     token_level: bool,
+    class_weights: bool,
     splits_dir: str,
     output_dir: str,
 ) -> None:
@@ -240,6 +248,7 @@ def train_cmd(
         precision=precision,
         word_level=not token_level,
         quiet=quiet,
+        use_class_weights=class_weights,
     )
 
 
@@ -278,6 +287,7 @@ def kfold_cmd(
     max_length: int,
     precision: str,
     token_level: bool,
+    class_weights: bool,
     output_dir: str,
     k_folds: int,
 ) -> None:
@@ -306,6 +316,7 @@ def kfold_cmd(
         word_level=not token_level,
         max_samples=max_samples,
         quiet=quiet,
+        use_class_weights=class_weights,
     )
 
 
