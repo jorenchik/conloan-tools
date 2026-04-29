@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 from typing import List, Set, Optional, Dict, Tuple
 from collections import defaultdict
 from pathlib import Path
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import InMemoryHistory
 
 from conloan_tools.stz.lemmatize import Lemmatizer
 from conloan_tools.wordnet.query import WordNet
@@ -71,12 +71,10 @@ class AssistantSession:
     wordnet: Optional[WordNet]
     mode: str
     validate_all: bool
-    warn_undecided: bool
     output_target: str                        # "stdout" or file path
     output_mode: str                           # "append" or "replace"
     active_target: Optional[str]              # name-no-ext
     index: CorpusIndex
-    watch_queue: List[str]
     lemma_cache: Dict[str, str] = field(default_factory=dict)  # surface -> lemma_key
     _file_paths: Dict[str, str] = field(default_factory=dict)  # name-no-ext -> path
 
@@ -364,17 +362,8 @@ def _process_paired_sentence(
 
 
 # =============================================================================
-# File Watching
+# File Reload
 # =============================================================================
-
-def process_watch_queue(session: AssistantSession) -> None:
-    """Process any pending file reload events."""
-    while session.watch_queue:
-        event = session.watch_queue.pop(0)
-        if event.startswith("RELOAD:"):
-            file_name = event.split(":", 1)[1]
-            _reload_file(session, file_name)
-
 
 def _reload_file(session: AssistantSession, file_name: str) -> None:
     """Reload a single file and update the corpus index."""
@@ -444,50 +433,50 @@ def _reload_file(session: AssistantSession, file_name: str) -> None:
                 label_sent, session.lemmatizer, session.lemma_cache
             )
 
-        summary = (
+        return (
             f"[reload] {file_name}.xlsx: "
-            f"+{added_count} added, -{removed_count} removed rows."
+            f"+{added_count} added, -{removed_count} removed rows.",
+            False,
         )
-        session.watch_queue.append(summary)
-        
+
     except Exception as e:
-        session.watch_queue.append(f"[watch] Error reloading {file_name}: {str(e)}")
+        return (f"Error reloading {file_name}: {str(e)}", True)
 
 
 # =============================================================================
 # REPL Commands
 # =============================================================================
 
-def cmd_target(session: AssistantSession, args: List[str]) -> str:
+def cmd_target(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Set or show active target file."""
     if not args:
         if session.active_target:
-            return f"Current target: '{session.active_target}'"
-        return "No target set."
-    
+            return (f"Current target: '{session.active_target}'", False)
+        return ("No target set.", False)
+
     target_name = args[0].lower()
     matched = None
     for name in session.files.keys():
         if name.lower() == target_name:
             matched = name
             break
-    
+
     if not matched:
         available = ", ".join(sorted(session.files.keys()))
-        return f"Unknown target '{args[0]}'. Available: {available}"
-    
+        return (f"Unknown target '{args[0]}'. Available: {available}", True)
+
     session.active_target = matched
-    return f"Target set to '{matched}'."
+    return (f"Target set to '{matched}'.", False)
 
 
-def cmd_validate(session: AssistantSession, args: List[str]) -> str:
+def cmd_validate(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Validate rows in target file."""
     if not session.active_target:
-        return "No target selected. Use 'target <name>' first."
-    
+        return ("No target selected. Use 'target <name>' first.", True)
+
     file_name = session.active_target
     df = session.files[file_name]
-    
+
     results = []
     for idx, row in df.iterrows():
         row_index = idx + 2
@@ -495,25 +484,29 @@ def cmd_validate(session: AssistantSession, args: List[str]) -> str:
             row_valid = str(row.get("Valid", "")).strip().lower()
             if row_valid != "+":
                 continue
-        
-        errors = validate_row(row, session.mode, session.warn_undecided)
+
+        errors = validate_row(row, session.mode)
         if errors:
             results.append(RowResult(row_index=row_index, errors=errors))
-    
+
     if not results:
-        return "No issues found."
-    
-    output_lines = []
+        return ("No issues found.", False)
+
+    error_rows = sum(1 for r in results if any(e.severity == "error" for e in r.errors))
+    warn_rows = sum(1 for r in results if all(e.severity == "warning" for e in r.errors))
+    summary = f"{len(results)} rows with issues ({error_rows} errors, {warn_rows} warnings)"
+
+    output_lines = [summary]
     for result in results:
         output_lines.append(f"{result.row_index}:")
         for err in result.errors:
-            prefix = "[warn]" if err.severity == "warning" else ""
+            prefix = "[warn] " if err.severity == "warning" else ""
             output_lines.append(f"    - {prefix}[{err.rule_id}] {err.field}: {err.message}")
-    
-    return "\n".join(output_lines)
+
+    return ("\n".join(output_lines), False)
 
 
-def cmd_contradict(session: AssistantSession, args: List[str]) -> str:
+def cmd_contradict(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Report labeling contradictions across all loaded files."""
     # Collect tokens with their lemma_key and label status
     # lemma_key -> list of (file, row_index, prefix, surface)
@@ -539,7 +532,7 @@ def cmd_contradict(session: AssistantSession, args: List[str]) -> str:
             })
 
     if not contradictions:
-        return "No contradictions found."
+        return ("No contradictions found.", False)
 
     output_lines = []
     for c in sorted(contradictions, key=lambda x: x['lemma_key']):
@@ -552,13 +545,13 @@ def cmd_contradict(session: AssistantSession, args: List[str]) -> str:
                 f"    - {file_name}:{row_index}: {prefix}, {surface}"
             )
 
-    return "\n".join(output_lines)
+    return ("\n".join(output_lines), False)
 
 
-def cmd_replace(session: AssistantSession, args: List[str]) -> str:
+def cmd_replace(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """List available replacement lemma keys."""
     if not session.active_target:
-        return "No target selected. Use 'target <name>' first."
+        return ("No target selected. Use 'target <name>' first.", True)
     
     file_name = session.active_target
     
@@ -590,7 +583,7 @@ def cmd_replace(session: AssistantSession, args: List[str]) -> str:
                                 ).add(syn_lemma.lower())
 
     if not lemma_replacements:
-        return "No labeled spans found in specified rows."
+        return ("No labeled spans found in specified rows.", False)
 
     output_lines = []
     for lemma_key in sorted(lemma_replacements.keys()):
@@ -606,7 +599,6 @@ def cmd_replace(session: AssistantSession, args: List[str]) -> str:
                 for repl_key in sorted(repl_keys):
                     output_lines.append(f"    - {repl_key} ({file_name})")
             else:
-                # src_name is 'wordnet:<word>'
                 constituent = src_name.split(':', 1)[1]
                 for repl_key in sorted(repl_keys):
                     output_lines.append(
@@ -616,10 +608,10 @@ def cmd_replace(session: AssistantSession, args: List[str]) -> str:
         if not has_replacements:
             output_lines.append("    (no replacements found)")
 
-    return "\n".join(output_lines)
+    return ("\n".join(output_lines), False)
 
 
-def cmd_stats(session: AssistantSession, args: List[str]) -> str:
+def cmd_stats(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Print aggregate and per-file statistics."""
     # Compute global stats
     total_words = len(session.index.tokens)
@@ -743,24 +735,23 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> str:
             lines.append(f"    - NE words:              {f_NE_words}")
             lines.append(f"    - NE lemma variants:     {f_NE_lemma}")
     
-    return "\n".join(lines)
+    return ("\n".join(lines), False)
 
 
-def cmd_mode(session: AssistantSession, args: List[str]) -> str:
+def cmd_mode(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Change or show the active mode."""
     if not args:
-        return f"Current mode: {session.mode}"
-    
+        return (f"Current mode: {session.mode}", False)
+
     new_mode = args[0].lower()
     if new_mode not in ("baseline", "extended"):
-        return f"Invalid mode '{new_mode}'. Use 'baseline' or 'extended'."
-    
+        return (f"Invalid mode '{new_mode}'. Use 'baseline' or 'extended'.", True)
+
     if new_mode == session.mode:
-        return f"Mode already set to '{new_mode}'."
-    
+        return (f"Mode already set to '{new_mode}'.", False)
+
     session.mode = new_mode
-    
-    # Rebuild corpus index
+
     total_rows = 0
     for df in session.files.values():
         for idx, row in df.iterrows():
@@ -768,7 +759,8 @@ def cmd_mode(session: AssistantSession, args: List[str]) -> str:
             if not session.validate_all and row_valid != "+":
                 continue
             total_rows += 1
-    
+
+    click.echo("Rebuilding index...")
     session.index = build_corpus_index(
         session.files,
         session.row_hashes,
@@ -778,77 +770,72 @@ def cmd_mode(session: AssistantSession, args: List[str]) -> str:
         session.lemma_cache,
     )
 
-    return f"Mode set to '{new_mode}'. Rebuilding index...\nIndex rebuilt: {total_rows} rows processed across {len(session.files)} files."
+    return (f"Mode set to '{new_mode}'. Index rebuilt: {total_rows} rows processed across {len(session.files)} files.", False)
 
 
-def cmd_output(session: AssistantSession, args: List[str]) -> str:
+def cmd_output(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Change output target."""
     if not args:
-        return f"Current output: {session.output_target}"
-    
+        return (f"Current output: {session.output_target}", False)
+
     new_target = args[0]
-    if new_target != "stdout" and not new_target.endswith('.txt'):
-        return "Output target must be 'stdout' or a .txt file path."
-    
+    if new_target != "stdout":
+        p = Path(new_target)
+        if not p.parent.exists():
+            return (f"Directory '{p.parent}' does not exist.", True)
+        try:
+            with open(p, "a"):
+                pass
+        except OSError as e:
+            return (f"Cannot write to '{new_target}': {e}", True)
+
     session.output_target = new_target
-    
-    return f"Output set to '{new_target}'."
+    return (f"Output set to '{new_target}'.", False)
 
 
-def cmd_output_mode(session: AssistantSession, args: List[str]) -> str:
+def cmd_output_mode(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Change or show output mode (append or replace)."""
     if not args:
-        return f"Current output-mode: {session.output_mode}"
-    
+        return (f"Current output-mode: {session.output_mode}", False)
+
     new_mode = args[0].lower()
     if new_mode not in ("append", "replace"):
-        return f"Invalid output-mode '{new_mode}'. Use 'append' or 'replace'."
-    
+        return (f"Invalid output-mode '{new_mode}'. Use 'append' or 'replace'.", True)
+
     if new_mode == session.output_mode:
-        return f"Output-mode already set to '{new_mode}'."
-    
+        return (f"Output-mode already set to '{new_mode}'.", False)
+
     session.output_mode = new_mode
-    return f"Output-mode set to '{new_mode}'."
+    return (f"Output-mode set to '{new_mode}'.", False)
 
 
-def cmd_reload(session: AssistantSession, args: List[str]) -> str:
+def cmd_reload(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Reload the target file from disk."""
     if not session.active_target:
-        return "No target selected. Use 'target <name>' first."
-    
-    file_name = session.active_target
-    _reload_file(session, file_name)
-    
-    # Build change summary from queue
-    summary_lines = []
-    while session.watch_queue:
-        summary_lines.append(session.watch_queue.pop(0))
-    
-    if summary_lines:
-        return "\n".join(summary_lines)
-    return f"{file_name} reloaded."
+        return ("No target selected. Use 'target <name>' first.", True)
+
+    return _reload_file(session, session.active_target)
 
 
-def cmd_validate_mode(session: AssistantSession, args: List[str]) -> str:
+def cmd_validate_mode(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Change or show the validate mode (which rows are included in search)."""
     if not args:
         mode = "all" if session.validate_all else "valid"
-        return f"Current validate-mode: {mode}"
-    
+        return (f"Current validate-mode: {mode}", False)
+
     new_mode = args[0].lower()
     if new_mode not in ("valid", "all"):
-        return f"Invalid validate-mode '{new_mode}'. Use 'valid' or 'all'."
-    
+        return (f"Invalid validate-mode '{new_mode}'. Use 'valid' or 'all'.", True)
+
     if new_mode == "valid":
         if not session.validate_all:
-            return "Validate-mode already set to 'valid'."
+            return ("Validate-mode already set to 'valid'.", False)
         session.validate_all = False
     else:
         if session.validate_all:
-            return "Validate-mode already set to 'all'."
+            return ("Validate-mode already set to 'all'.", False)
         session.validate_all = True
-    
-    # Rebuild index with new filter
+
     total_rows = 0
     for df in session.files.values():
         for idx, row in df.iterrows():
@@ -856,7 +843,8 @@ def cmd_validate_mode(session: AssistantSession, args: List[str]) -> str:
             if not session.validate_all and row_valid != "+":
                 continue
             total_rows += 1
-    
+
+    click.echo("Rebuilding index...")
     session.index = build_corpus_index(
         session.files,
         session.row_hashes,
@@ -866,10 +854,10 @@ def cmd_validate_mode(session: AssistantSession, args: List[str]) -> str:
         session.lemma_cache,
     )
 
-    return f"Validate-mode set to '{new_mode}'. Index rebuilt: {total_rows} rows."
+    return (f"Validate-mode set to '{new_mode}'. Index rebuilt: {total_rows} rows.", False)
 
 
-def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> str:
+def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Report replacement contradictions across all loaded files."""
     # lemma_key -> {paired_lemma_key -> [(file, row_index), ...]}
     source_to_repls: Dict[str, Dict[str, List[Tuple[str, int]]]] = defaultdict(lambda: defaultdict(list))
@@ -920,12 +908,12 @@ def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> str:
                 output_lines.append(f"    - {source_key} ({locs_str})")
 
     if not output_lines:
-        return "No replacement contradictions found."
+        return ("No replacement contradictions found.", False)
 
-    return "\n".join(output_lines)
+    return ("\n".join(output_lines), False)
 
 
-def cmd_help(session: AssistantSession, args: List[str]) -> str:
+def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """List all available commands."""
     commands = [
         ("target <name>", "Set active target file"),
@@ -942,12 +930,12 @@ def cmd_help(session: AssistantSession, args: List[str]) -> str:
         ("help", "Show this help message"),
         ("exit / quit", "Exit the assistant"),
     ]
-    
+
     lines = ["Available commands:"]
     for cmd, desc in commands:
         lines.append(f"  {cmd:<25} {desc}")
-    
-    return "\n".join(lines)
+
+    return ("\n".join(lines), False)
 
 
 # =============================================================================
@@ -960,24 +948,23 @@ def run_assistant(
     wordnet_path: Optional[str],
     mode: str,
     validate_all: bool,
-    warn_undecided: bool,
-    output: str
+    output: str,
 ) -> None:
     """Run the interactive assistant session."""
-    
+
     # 3.1: Validate file paths
     for f in files:
         if not Path(f).exists():
             click.secho(f"Error: File not found: {f}", fg="red")
             return
-    
+
     # 3.2: Construct Lemmatizer
     try:
         lemmatizer = Lemmatizer(language)
     except ValueError as e:
         click.secho(f"Error: {e}", fg="red")
         return
-    
+
     # 3.3: Load WordNet if provided
     wordnet = None
     if wordnet_path:
@@ -986,51 +973,46 @@ def run_assistant(
         except Exception as e:
             click.secho(f"Error loading WordNet: {e}", fg="red")
             return
-    
+
     # 3.4: Load and validate each Excel file
     session_files = {}
     session_hashes = {}
     file_paths = {}
-    
+
     for f in files:
-        file_name = Path(f).stem  # name without extension
+        file_name = Path(f).stem
         file_paths[file_name] = f
-        
-        # Validate file
-        results = validate_file(f, mode, validate_all, warn_undecided)
-        
+
+        results = validate_file(f, mode, validate_all)
+
         error_count = sum(1 for r in results if any(e.severity == "error" for e in r.errors))
         warn_count = sum(1 for r in results if all(e.severity == "warning" for e in r.errors))
-        
+
         click.echo(f"{file_name}.xlsx: {len(results)} issues ({error_count} errors, {warn_count} warnings)")
-        
-        # Load DataFrame
+
         df = pd.read_excel(f)
         session_files[file_name] = df
-        
-        # Compute hashes
+
         hashes = {}
         for idx, row in df.iterrows():
             label_sent = str(row.get("Label sentence", ""))
             replacement_sent = str(row.get("Replacement sentence", ""))
             row_hash = compute_row_hash(label_sent, replacement_sent)
-            # Collision policy: last-occurring wins
             hashes[row_hash] = idx + 2
-        
+
         session_hashes[file_name] = hashes
-        
-        # Check for hash collisions
+
         if len(hashes) != len(df):
             click.echo(f"  Warning: Hash collision detected in {file_name}.xlsx")
-    
+
     # 3.5: Build corpus index
     lemma_cache: Dict[str, str] = {}
-    click.echo(f"\nBuilding index...")
+    click.echo("\nBuilding index...")
     index = build_corpus_index(session_files, session_hashes, lemmatizer, mode, validate_all, lemma_cache)
-    
+
     total_rows = len([e for e in index.entries if e.prefix == "L"])
     click.echo(f"Index built: {total_rows} labeled spans, {len(index.tokens)} tokens across {len(session_files)} files.")
-    
+
     # Create session
     session = AssistantSession(
         files=session_files,
@@ -1039,104 +1021,71 @@ def run_assistant(
         wordnet=wordnet,
         mode=mode,
         validate_all=validate_all,
-        warn_undecided=warn_undecided,
         output_target=output,
         output_mode="append",
         active_target=None,
         index=index,
-        watch_queue=[],
         lemma_cache=lemma_cache,
-        _file_paths=file_paths
+        _file_paths=file_paths,
     )
-    
-    # 3.7: Enter REPL
+
+    # 3.6: Enter REPL
     click.echo("\nConLoan Assistant (type 'help' for commands)")
-    
-    output_lines = []
-    
+
+    prompt_session = PromptSession(history=InMemoryHistory())
+
+    COMMANDS = {
+        "target": cmd_target,
+        "reload": cmd_reload,
+        "validate-mode": cmd_validate_mode,
+        "validate": cmd_validate,
+        "contradict": cmd_contradict,
+        "contradict-repl": cmd_contradict_repl,
+        "replace": cmd_replace,
+        "stats": cmd_stats,
+        "mode": cmd_mode,
+        "output": cmd_output,
+        "output-mode": cmd_output_mode,
+        "help": cmd_help,
+    }
+
     while True:
         try:
-            # Flush watch queue before prompt
-            if session.watch_queue:
-                for line in session.watch_queue:
-                    output_lines.append(line)
-                session.watch_queue.clear()
-            
-            # Show prompt
-            command = input("> ").strip()
-            
+            target_label = session.active_target or "none"
+            prompt_text = f"[{session.mode}|{target_label}]> "
+            command = prompt_session.prompt(prompt_text).strip()
+
             if not command:
                 continue
-            
-            # Parse command
+
             parts = command.split()
             cmd = parts[0].lower()
             args = parts[1:]
-            
-            # Process watch queue first
-            if session.watch_queue:
-                for line in session.watch_queue:
-                    output_lines.append(line)
-                session.watch_queue.clear()
-            
-            # Execute command
+
             if cmd in ("exit", "quit"):
-                output_lines.append("Exiting assistant...")
+                click.echo("Exiting assistant...")
                 break
-            elif cmd == "target":
-                result = cmd_target(session, args)
-                output_lines.append(result)
-            elif cmd == "reload":
-                result = cmd_reload(session, args)
-                output_lines.append(result)
-            elif cmd == "validate-mode":
-                result = cmd_validate_mode(session, args)
-                output_lines.append(result)
-            elif cmd == "validate":
-                result = cmd_validate(session, args)
-                output_lines.append(result)
-            elif cmd == "contradict":
-                result = cmd_contradict(session, args)
-                output_lines.append(result)
-            elif cmd == "contradict-repl":
-                result = cmd_contradict_repl(session, args)
-                output_lines.append(result)
-            elif cmd == "replace":
-                result = cmd_replace(session, args)
-                output_lines.append(result)
-            elif cmd == "stats":
-                result = cmd_stats(session, args)
-                output_lines.append(result)
-            elif cmd == "mode":
-                result = cmd_mode(session, args)
-                output_lines.append(result)
-            elif cmd == "output":
-                result = cmd_output(session, args)
-                output_lines.append(result)
-            elif cmd == "output-mode":
-                result = cmd_output_mode(session, args)
-                output_lines.append(result)
-            elif cmd == "help":
-                result = cmd_help(session, args)
-                output_lines.append(result)
-            else:
-                output_lines.append(f"Unknown command '{cmd}'. Type 'help' for list.")
-            
-            # Flush output
+
+            if cmd not in COMMANDS:
+                click.secho(f"Unknown command '{cmd}'. Type 'help' for list.", fg="yellow")
+                continue
+
+            result, is_error = COMMANDS[cmd](session, args)
+
+            if is_error:
+                click.secho(result, fg="yellow")
+                continue
+
             if session.output_target == "stdout":
-                for line in output_lines:
-                    click.echo(line)
+                click.echo(result)
             else:
-                mode = "a" if session.output_mode == "append" else "w"
-                with open(session.output_target, mode) as f:
-                    if output_lines:
-                        f.write("=" * 60 + "\n")
-                        f.write("\n".join(output_lines) + "\n")
-                        f.write("=" * 60 + "\n")
-                if output_lines:
-                    click.echo(f"Output written to '{session.output_target}'.")
-            output_lines.clear()
-            
+                file_mode = "a" if session.output_mode == "append" else "w"
+                with open(session.output_target, file_mode) as fh:
+                    fh.write("=" * 60 + "\n")
+                    fh.write(result + "\n")
+                    fh.write("=" * 60 + "\n")
+                click.echo(f"Output written to '{session.output_target}'.")
+
         except KeyboardInterrupt:
             click.echo("\nUse 'exit' to quit.")
         except EOFError:
@@ -1155,10 +1104,6 @@ def run_assistant(
 )
 @click.option("--validate-all", is_flag=True, help="Include all rows in index")
 @click.option(
-    "--warn-undecided/--no-warn-undecided",
-    default=True,
-)
-@click.option(
     "--output",
     default="stdout",
     help="Output target (stdout or file path)",
@@ -1169,8 +1114,7 @@ def assistant(
     wordnet,
     mode,
     validate_all,
-    warn_undecided,
-    output
+    output,
 ):
     """Interactive CLI for loanword annotation management."""
     run_assistant(
@@ -1179,8 +1123,7 @@ def assistant(
         wordnet,
         mode,
         validate_all,
-        warn_undecided,
-        output
+        output,
     )
 
 
