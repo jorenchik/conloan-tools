@@ -1386,6 +1386,7 @@ def run_assistant(
                     fh.write("=" * 60 + "\n")
                     fh.write(result + "\n")
                     fh.write("=" * 60 + "\n")
+                click.echo(result)
                 click.echo(f"Output written to '{session.output_target}'.")
 
         except KeyboardInterrupt:
