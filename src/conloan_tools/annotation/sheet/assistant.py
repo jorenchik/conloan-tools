@@ -1282,6 +1282,10 @@ def run_assistant(
         warn_count = sum(1 for r in results if all(e.severity == "warning" for e in r.errors))
 
         click.echo(f"{file_name}.xlsx: {len(results)} issues ({error_count} errors, {warn_count} warnings)")
+        for result in results:
+            for err in result.errors:
+                prefix = "[warn] " if err.severity == "warning" else "[error] "
+                click.echo(f"  row {result.row_index}: {prefix}[{err.rule_id}] {err.field}: {err.message}")
 
         df = pd.read_excel(f)
         session_files[file_name] = df
