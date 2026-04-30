@@ -626,10 +626,15 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
             if str(row.get("Valid", "")).strip().lower() == "+":
                 validated_pairs.add((fn, idx + 2))
 
-    # Sentence counts (unique file+row combinations)
-    sentence_pairs = set((e.file, e.row_index) for e in session.index.entries)
-    total_sentences = len(sentence_pairs)
-    validated_sentences = sum(1 for p in sentence_pairs if p in validated_pairs)
+    # Sentence counts: total = any row with "+" or "-" in Valid column.
+    total_sentence_pairs: Set[Tuple[str, int]] = set()
+    for fn, df in session.files.items():
+        for idx, row in df.iterrows():
+            valid_val = str(row.get("Valid", "")).strip().lower()
+            if valid_val in ("+", "-"):
+                total_sentence_pairs.add((fn, idx + 2))
+    total_sentences = len(total_sentence_pairs)
+    validated_sentences = sum(1 for p in total_sentence_pairs if p in validated_pairs)
     
     # Duplicate lemma variants: lemma keys appearing in more than one span entry.
     global_lemma_counts: Dict[str, int] = defaultdict(int)
@@ -687,9 +692,15 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
         f_NE_words = sum(1 for t in f_tokens if t.prefix == "NE")
         f_NE_lemma = len(set(t.lemma_key for t in f_tokens if t.prefix == "NE"))
         
-        f_sentences = len(set(e.row_index for e in f_entries))
+        f_df = session.files[file_name]
+        f_sentence_pairs: Set[int] = set()
+        for idx, row in f_df.iterrows():
+            valid_val = str(row.get("Valid", "")).strip().lower()
+            if valid_val in ("+", "-"):
+                f_sentence_pairs.add(idx + 2)
+        f_sentences = len(f_sentence_pairs)
         f_validated = sum(
-            1 for row_idx in set(e.row_index for e in f_entries)
+            1 for row_idx in f_sentence_pairs
             if (file_name, row_idx) in validated_pairs
         )
         
@@ -1040,15 +1051,12 @@ def cmd_dupes(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
 
 def _parse_freq_args(args: List[str]):
     """Parse arguments for the freq command."""
-    if not args:
-        return None, "Usage: freq <span_type> [--file <name>] [--by surface|lemma|both] [--scope word|span|both]"
-
-    span_type = args[0].upper()
     file_filter = None
+    span_type = None
     by = "both"
     scope = "both"
 
-    i = 1
+    i = 0
     while i < len(args):
         if args[i] == "--file" and i + 1 < len(args):
             file_filter = args[i + 1]
@@ -1063,6 +1071,9 @@ def _parse_freq_args(args: List[str]):
             if scope not in ("word", "span", "both"):
                 return None, f"Invalid --scope value '{args[i + 1]}'. Use word, span, or both."
             i += 2
+        elif args[i] == "--span" and i + 1 < len(args):
+            span_type = args[i + 1].upper()
+            i += 2
         else:
             return None, f"Unknown argument '{args[i]}'."
 
@@ -1075,19 +1086,37 @@ def cmd_freq(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     if err:
         return (err, True)
 
-    span_type = params["span_type"]
+    span_type = params["span_type"]  # None means all span types
     file_filter = params["file"]
     by = params["by"]
     scope = params["scope"]
 
+    # --file all overrides to no filter; no --file uses active target
     if file_filter is not None:
-        matched = next(
-            (n for n in session.files if n.lower() == file_filter.lower()), None
-        )
-        if matched is None:
-            available = ", ".join(sorted(session.files.keys()))
-            return (f"Unknown file '{file_filter}'. Available: {available}", True)
-        file_filter = matched
+        if file_filter.lower() == "all":
+            file_filter = None
+        else:
+            matched = next(
+                (n for n in session.files if n.lower() == file_filter.lower()), None
+            )
+            if matched is None:
+                available = ", ".join(sorted(session.files.keys()))
+                return (f"Unknown file '{file_filter}'. Available: {available}", True)
+            file_filter = matched
+    else:
+        if session.active_target:
+            file_filter = session.active_target
+
+    # Determine which span types to report.
+    # "o" tokens only exist in index.tokens (no CorpusEntry for unlabeled).
+    all_token_prefixes = sorted(set(t.prefix for t in session.index.tokens))
+    all_entry_prefixes = sorted(set(e.prefix for e in session.index.entries))
+    if span_type is None:
+        token_types = all_token_prefixes
+        entry_types = all_entry_prefixes
+    else:
+        token_types = [span_type] if span_type in all_token_prefixes else []
+        entry_types = [span_type] if span_type in all_entry_prefixes else []
 
     def _freq_block(
         tokens: List[TokenEntry],
@@ -1096,85 +1125,96 @@ def cmd_freq(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     ) -> List[str]:
         lines = [f"{label}:"]
 
-        if scope in ("word", "both"):
-            relevant_tokens = [t for t in tokens if t.prefix == span_type]
-            if by in ("surface", "both"):
-                counts: Dict[str, int] = defaultdict(int)
-                for t in relevant_tokens:
-                    counts[t.surface] += 1
-                lines.append("  word / surface:")
-                if counts:
-                    for form, cnt in sorted(counts.items(), key=lambda x: -x[1]):
-                        lines.append(f"    {cnt:>5}  {form}")
-                else:
-                    lines.append("    (none)")
+        types_for_word = token_types
+        types_for_span = entry_types
 
-            if by in ("lemma", "both"):
-                counts = defaultdict(int)
-                for t in relevant_tokens:
-                    counts[t.lemma_key] += 1
-                lines.append("  word / lemma:")
-                if counts:
-                    for lk, cnt in sorted(counts.items(), key=lambda x: -x[1]):
-                        lines.append(f"    {cnt:>5}  {lk}")
-                else:
-                    lines.append("    (none)")
+        if scope in ("word", "both"):
+            for st in types_for_word:
+                relevant_tokens = [t for t in tokens if t.prefix == st]
+                lines.append(f"  [{st}] word:")
+                if by in ("surface", "both"):
+                    counts: Dict[str, int] = defaultdict(int)
+                    for t in relevant_tokens:
+                        counts[t.surface] += 1
+                    lines.append("    surface:")
+                    if counts:
+                        for form, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+                            lines.append(f"      {cnt:>5}  {form}")
+                    else:
+                        lines.append("      (none)")
+                if by in ("lemma", "both"):
+                    counts = defaultdict(int)
+                    for t in relevant_tokens:
+                        counts[t.lemma_key] += 1
+                    lines.append("    lemma:")
+                    if counts:
+                        for lk, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+                            lines.append(f"      {cnt:>5}  {lk}")
+                    else:
+                        lines.append("      (none)")
 
         if scope in ("span", "both"):
-            relevant_entries = [e for e in entries if e.prefix == span_type]
-            if by in ("surface", "both"):
-                counts = defaultdict(int)
-                for e in relevant_entries:
-                    counts[e.surface] += 1
-                lines.append("  span / surface:")
-                if counts:
-                    for form, cnt in sorted(counts.items(), key=lambda x: -x[1]):
-                        lines.append(f"    {cnt:>5}  {form}")
-                else:
-                    lines.append("    (none)")
-
-            if by in ("lemma", "both"):
-                counts = defaultdict(int)
-                for e in relevant_entries:
-                    counts[e.lemma_key] += 1
-                lines.append("  span / lemma:")
-                if counts:
-                    for lk, cnt in sorted(counts.items(), key=lambda x: -x[1]):
-                        lines.append(f"    {cnt:>5}  {lk}")
-                else:
-                    lines.append("    (none)")
+            for st in types_for_span:
+                if st == "o":
+                    continue  # no span-level entries for unlabeled tokens
+                relevant_entries = [e for e in entries if e.prefix == st]
+                lines.append(f"  [{st}] span:")
+                if by in ("surface", "both"):
+                    counts = defaultdict(int)
+                    for e in relevant_entries:
+                        counts[e.surface] += 1
+                    lines.append("    surface:")
+                    if counts:
+                        for form, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+                            lines.append(f"      {cnt:>5}  {form}")
+                    else:
+                        lines.append("      (none)")
+                if by in ("lemma", "both"):
+                    counts = defaultdict(int)
+                    for e in relevant_entries:
+                        counts[e.lemma_key] += 1
+                    lines.append("    lemma:")
+                    if counts:
+                        for lk, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+                            lines.append(f"      {cnt:>5}  {lk}")
+                    else:
+                        lines.append("      (none)")
 
         return lines
 
-    output_lines: List[str] = []
 
-    # Global block
-    if file_filter is None:
-        block = _freq_block(session.index.tokens, session.index.entries, "all files")
-        output_lines.extend(block)
+def cmd_collisions(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
+    """Report hash collisions across all loaded files."""
+    output_lines = []
+    total_collisions = 0
 
-        # Per-file breakdown
-        for file_name in sorted(session.files.keys()):
-            f_tokens = [t for t in session.index.tokens if t.file == file_name]
-            f_entries = [e for e in session.index.entries if e.file == file_name]
-            block = _freq_block(f_tokens, f_entries, file_name)
-            output_lines.append("")
-            output_lines.extend(block)
-    else:
-        f_tokens = [t for t in session.index.tokens if t.file == file_filter]
-        f_entries = [e for e in session.index.entries if e.file == file_filter]
-        block = _freq_block(f_tokens, f_entries, file_filter)
-        output_lines.extend(block)
+    for file_name, df in sorted(session.files.items()):
+        hashes: Dict[str, List[int]] = defaultdict(list)
+        for idx, row in df.iterrows():
+            label_sent = str(row.get("Label sentence", ""))
+            replacement_sent = str(row.get("Replacement sentence", ""))
+            row_hash = compute_row_hash(label_sent, replacement_sent)
+            hashes[row_hash].append(idx + 2)
+
+        colliding = {h: rows for h, rows in hashes.items() if len(rows) > 1}
+        if colliding:
+            count = sum(len(rows) - 1 for rows in colliding.values())
+            total_collisions += count
+            output_lines.append(f"{file_name}: {count} collision(s)")
+            for h, rows in sorted(colliding.items()):
+                output_lines.append(f"    hash {h[:12]}...: rows {', '.join(str(r) for r in rows)}")
 
     if not output_lines:
-        return (f"No data found for span type '{span_type}'.", False)
+        return ("No hash collisions found.", False)
 
+    output_lines.append(f"\ntotal: {total_collisions} collision(s) across {len(session.files)} file(s)")
     return ("\n".join(output_lines), False)
 
 
 def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """List all available commands."""
     commands = [
+        ("collisions", "Report hash collisions across all loaded files"),
         ("target <name>", "Set active target file"),
         ("reload", "Reload target file from disk"),
         ("validate-mode <valid|all>", "Set search scope (valid=+ only, or all rows)"),
@@ -1183,8 +1223,8 @@ def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
         ("contradict-repl", "Report replacement contradictions"),
         ("multiword <span_type>", "Find spans with multiple tokens"),
         ("dupes <threshold>", "Report near-duplicate sentence clusters"),
-        ("freq <span_type> [--file <name>] [--by surface|lemma|both] [--scope word|span|both]",
-         "Print frequency lists for a span type"),
+        ("freq [--span <type|o>] [--file <name|all>] [--by surface|lemma|both] [--scope word|span|both]",
+         "Print frequency lists (all spans by default, defaults to active target)"),
         ("replace", "List available replacement lemma keys"),
         ("stats", "Print aggregate and per-file statistics"),
         ("mode <baseline|extended>", "Change or show active mode"),
@@ -1255,8 +1295,9 @@ def run_assistant(
 
         session_hashes[file_name] = hashes
 
-        if len(hashes) != len(df):
-            click.echo(f"  Warning: Hash collision detected in {file_name}.xlsx")
+        collision_count = len(df) - len(hashes)
+        if collision_count > 0:
+            click.echo(f"  Warning: {collision_count} hash collision(s) detected in {file_name}.xlsx")
 
     # 3.5: Build corpus index
     lemma_cache: Dict[str, str] = {}
@@ -1264,7 +1305,12 @@ def run_assistant(
     index = build_corpus_index(session_files, session_hashes, lemmatizer, mode, validate_all, lemma_cache)
 
     total_rows = len([e for e in index.entries if e.prefix == "L"])
-    click.echo(f"Index built: {total_rows} labeled spans, {len(index.tokens)} tokens across {len(session_files)} files.")
+    total_collisions = sum(
+        max(0, len(df) - len(session_hashes[fn]))
+        for fn, df in session_files.items()
+    )
+    collision_msg = f"  ({total_collisions} total hash collision(s))" if total_collisions else ""
+    click.echo(f"Index built: {total_rows} labeled spans, {len(index.tokens)} tokens across {len(session_files)} files.{collision_msg}")
 
     # Create session
     session = AssistantSession(
@@ -1292,6 +1338,7 @@ def run_assistant(
         "validate-mode": cmd_validate_mode,
         "validate": cmd_validate,
         "contradict": cmd_contradict,
+        "collisions": cmd_collisions,
         "freq": cmd_freq,
         "contradict-repl": cmd_contradict_repl,
         "multiword": cmd_multiword,
