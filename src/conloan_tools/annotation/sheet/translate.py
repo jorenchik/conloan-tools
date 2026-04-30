@@ -6,23 +6,13 @@ import click
 import pandas as pd
 from tqdm import tqdm
 
-from conloan_tools.translate.nt_translate import (
-    ModelFamily,
-    ModelSize,
-    Translator,
-)
+from conloan_tools.translate.nt_translate import Translator
 from .excel import write_sheet
-
-
-# ── helpers ──────────────────────────────────────────────────────────
 
 
 def strip_tags(sentence: str) -> str:
     """Remove ``<L1></L1>`` / ``<N1></N1>`` tags for translation."""
     return re.sub(r"</?[LN]\d+>", "", sentence)
-
-
-# ── CLI ──────────────────────────────────────────────────────────────
 
 
 @click.command("translate")
@@ -38,31 +28,10 @@ def strip_tags(sentence: str) -> str:
     help="Target language (ISO code or canonical name, e.g. 'en')",
 )
 @click.option(
-    "--family",
-    type=click.Choice([f.value for f in ModelFamily], case_sensitive=False),
-    default=ModelFamily.OPUS.value,
+    "--model",
+    default=None,
     show_default=True,
-    help="Model family",
-)
-@click.option(
-    "--distilled/--no-distilled",
-    default=True,
-    show_default=True,
-    help="Use distilled model variant",
-)
-@click.option(
-    "--size",
-    type=click.Choice([s.value for s in ModelSize], case_sensitive=False),
-    default=ModelSize.SMALL.value,
-    show_default=True,
-    help="Model size",
-)
-@click.option(
-    "--prefer-big",
-    is_flag=True,
-    default=False,
-    show_default=True,
-    help="Prefer larger model when available",
+    help="Override default Opus-MT model with any HF seq2seq model id.",
 )
 @click.option(
     "--device",
@@ -90,7 +59,7 @@ def strip_tags(sentence: str) -> str:
 )
 @click.option(
     "--source-col",
-    default="Loanword sentence",
+    default="Label sentence",
     show_default=True,
     help="Column containing sentences to translate",
 )
@@ -117,10 +86,7 @@ def translate_sheet(
     input_file,
     src_lang,
     tgt_lang,
-    family,
-    distilled,
-    size,
-    prefer_big,
+    model,
     device,
     max_new_tokens,
     batch_size,
@@ -152,13 +118,15 @@ def translate_sheet(
         df[target_col] = ""
 
     # identify rows needing translation
+    empty = df[target_col].isna() | (
+        df[target_col].astype(str).str.strip() == ""
+    )
     if overwrite:
         indices = df.index.tolist()
     else:
-        empty = df[target_col].isna() | (
-            df[target_col].astype(str).str.strip() == ""
-        )
         indices = df[empty].index.tolist()
+
+    skipped_nonempty = (~empty).sum() if not overwrite else 0
 
     if not indices:
         click.echo("No rows to translate.")
@@ -174,15 +142,11 @@ def translate_sheet(
             text = strip_tags(text)
         sentences.append(text)
 
-    # init translator
     click.echo("Loading translation model…")
     translator = Translator(
         src_lang=src_lang,
         tgt_lang=tgt_lang,
-        family=ModelFamily(family),
-        distilled=distilled,
-        size=ModelSize(size),
-        prefer_big=prefer_big,
+        model=model,
         device=device,
         max_new_tokens=max_new_tokens,
         quiet=True,
@@ -202,4 +166,8 @@ def translate_sheet(
     df["Target"] = translations
 
     write_sheet(df, output)
-    click.echo(f"Done. Translated {len(translations)} rows → {output}.")
+    click.echo(
+        f"Processed: {len(translations)} translated, "
+        f"{skipped_nonempty} skipped (non-empty)."
+    )
+    click.echo(f"Output written to: {output}")
