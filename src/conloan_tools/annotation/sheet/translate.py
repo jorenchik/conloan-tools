@@ -11,8 +11,8 @@ from .excel import write_sheet
 
 
 def strip_tags(sentence: str) -> str:
-    """Remove ``<L1></L1>`` / ``<N1></N1>`` tags for translation."""
-    return re.sub(r"</?[LN]\d+>", "", sentence)
+    """Remove ``<TAG123>``/``</TAG123>`` style numbered tags before translation."""
+    return re.sub(r"</?[A-Za-z]+\d+>", "", sentence)
 
 
 @click.command("translate")
