@@ -514,8 +514,46 @@ def cmd_validate(session: AssistantSession, args: List[str]) -> Tuple[str, bool]
     return ("\n".join(output_lines), False)
 
 
+def _get_sentence_context(
+    sentence: str,
+    surface: str,
+    context_size: int,
+) -> List[str]:
+    """Return context snippets for each occurrence of surface in sentence.
+
+    Each snippet is a plain-text window of context_size words on either side
+    of the matched word, with the matched word wrapped in <...>.
+    Whitespace-split tokens are used for window calculation; the original
+    spacing is preserved by joining with a single space.
+    """
+    words = sentence.split()
+    snippets = []
+    surface_lower = surface.lower()
+
+    for i, word in enumerate(words):
+        if word.lower() == surface_lower:
+            left = words[max(0, i - context_size) : i]
+            right = words[i + 1 : i + 1 + context_size]
+            parts = []
+            if left:
+                parts.append(" ".join(left))
+            parts.append(f"<{word}>")
+            if right:
+                parts.append(" ".join(right))
+            snippets.append(" ".join(parts))
+
+    return snippets
+
+
 def cmd_contradict(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Report labeling contradictions across all loaded files."""
+    context_size = 2
+    if args:
+        try:
+            context_size = int(args[0])
+        except ValueError:
+            return (f"Invalid context size '{args[0]}': must be an integer.", True)
+
     # Collect tokens with their lemma_key and label status
     # lemma_key -> list of (file, row_index, prefix, surface)
     token_occurrences: Dict[str, List[Tuple[str, int, str, str]]] = defaultdict(list)
@@ -542,6 +580,14 @@ def cmd_contradict(session: AssistantSession, args: List[str]) -> Tuple[str, boo
     if not contradictions:
         return ("No contradictions found.", False)
 
+    # Pre-build (file, row_index) -> plain label sentence for context lookup.
+    row_sentences: Dict[Tuple[str, int], str] = {}
+    for file_name, df in session.files.items():
+        for idx, row in df.iterrows():
+            row_sentences[(file_name, idx + 2)] = strip_tags(
+                str(row.get("Label sentence", ""))
+            )
+
     output_lines = []
     for c in sorted(contradictions, key=lambda x: x['lemma_key']):
         output_lines.append(f"{c['lemma_key']}:")
@@ -549,8 +595,12 @@ def cmd_contradict(session: AssistantSession, args: List[str]) -> Tuple[str, boo
         for file_name, row_index, prefix, surface in sorted(
             c['labeling'], key=lambda x: (x[0], x[1])
         ):
+            sentence = row_sentences.get((file_name, row_index), "")
+            snippets = _get_sentence_context(sentence, surface, context_size)
+            context_str = " | ".join(snippets) if snippets else "(no context)"
             output_lines.append(
                 f"    - {file_name}:{row_index}: {prefix}, {surface}"
+                f"  [{context_str}]"
             )
 
     return ("\n".join(output_lines), False)
@@ -1219,7 +1269,7 @@ def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
         ("reload", "Reload target file from disk"),
         ("validate-mode <valid|all>", "Set search scope (valid=+ only, or all rows)"),
         ("validate", "Validate rows in target file"),
-        ("contradict", "Report labeling contradictions"),
+        ("contradict [context_size]", "Report labeling contradictions (default context: 2 words)"),
         ("contradict-repl", "Report replacement contradictions"),
         ("multiword <span_type>", "Find spans with multiple tokens"),
         ("dupes <threshold>", "Report near-duplicate sentence clusters"),
