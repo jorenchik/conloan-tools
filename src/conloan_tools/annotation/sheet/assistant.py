@@ -1277,11 +1277,7 @@ def run_assistant(
         file_paths[file_name] = f
 
         results = validate_file(f, mode, validate_all)
-
-        error_count = sum(1 for r in results if any(e.severity == "error" for e in r.errors))
-        warn_count = sum(1 for r in results if all(e.severity == "warning" for e in r.errors))
-
-        click.echo(f"{file_name}.xlsx: {len(results)} issues ({error_count} errors, {warn_count} warnings)")
+        click.echo(f"{file_name}.xlsx: validation done")
         for result in results:
             for err in result.errors:
                 prefix = "[warn] " if err.severity == "warning" else "[error] "

@@ -291,9 +291,6 @@ def validate_file(input_file: str, mode: str, validate_all: bool = False, warn_u
         if missing_columns:
             errors.append(ValidationError("V0.0", "file",
                 f"Missing required columns: {sorted(missing_columns)}"))
-        if extra_columns:
-            errors.append(ValidationError("V0.0", "file",
-                f"Extra columns present: {sorted(extra_columns)}"))
         # V0.0 gates all further validation
         return [RowResult(row_index=1, errors=errors)]
 
