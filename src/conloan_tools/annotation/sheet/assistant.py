@@ -899,6 +899,35 @@ def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> Tuple[str
     return ("\n".join(output_lines), False)
 
 
+def cmd_multiword(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
+    """Find all spans with multiple tokens for a given span type."""
+    if not args:
+        return ("Usage: multiword <span_type> (e.g. multiword L)", True)
+
+    span_type = args[0].upper()
+
+    # Group tokens by (file, row_index, tag_id)
+    span_tokens: Dict[Tuple[str, int, str], List[str]] = defaultdict(list)
+    for token in session.index.tokens:
+        if token.prefix == span_type:
+            span_tokens[(token.file, token.row_index, token.tag_id)].append(token.surface)
+
+    multiword_spans = {
+        key: tokens for key, tokens in span_tokens.items() if len(tokens) > 1
+    }
+
+    if not multiword_spans:
+        return (f"No multiword spans found for type '{span_type}'.", False)
+
+    output_lines = [f"multiword spans ({span_type}):"]
+    for (file_name, row_index, tag_id), tokens in sorted(multiword_spans.items()):
+        output_lines.append(
+            f"    - {file_name}:{row_index} [{tag_id}]: {' '.join(tokens)}"
+        )
+
+    return ("\n".join(output_lines), False)
+
+
 def cmd_dupes(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Report clusters of near-duplicate sentences by token-level Jaccard similarity."""
     if not args:
@@ -1018,6 +1047,7 @@ def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
         ("validate", "Validate rows in target file"),
         ("contradict", "Report labeling contradictions"),
         ("contradict-repl", "Report replacement contradictions"),
+        ("multiword <span_type>", "Find spans with multiple tokens"),
         ("dupes <threshold>", "Report near-duplicate sentence clusters"),
         ("replace", "List available replacement lemma keys"),
         ("stats", "Print aggregate and per-file statistics"),
@@ -1127,6 +1157,7 @@ def run_assistant(
         "validate": cmd_validate,
         "contradict": cmd_contradict,
         "contradict-repl": cmd_contradict_repl,
+        "multiword": cmd_multiword,
         "dupes": cmd_dupes,
         "replace": cmd_replace,
         "stats": cmd_stats,
