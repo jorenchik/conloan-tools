@@ -126,6 +126,12 @@ def _hyperparams(f):
                 "training split. Recommended for imbalanced datasets."
             ),
         ),
+        click.option(
+            "--eval-mode",
+            type=click.Choice(["strict", "relaxed"]),
+            default="strict", show_default=True,
+            help="strict: B-/I- must match exactly; relaxed: entity boundary match only.",
+        ),
     ]
     for o in reversed(opts):
         f = o(f)
@@ -214,6 +220,7 @@ def train_cmd(
     precision: str,
     token_level: bool,
     class_weights: bool,
+    eval_mode: str,
     splits_dir: str,
     output_dir: str,
 ) -> None:
@@ -249,6 +256,7 @@ def train_cmd(
         word_level=not token_level,
         quiet=quiet,
         use_class_weights=class_weights,
+        eval_mode=eval_mode,
     )
 
 
@@ -288,6 +296,7 @@ def kfold_cmd(
     precision: str,
     token_level: bool,
     class_weights: bool,
+    eval_mode: str,
     output_dir: str,
     k_folds: int,
 ) -> None:
@@ -317,6 +326,7 @@ def kfold_cmd(
         max_samples=max_samples,
         quiet=quiet,
         use_class_weights=class_weights,
+        eval_mode=eval_mode,
     )
 
 
@@ -342,6 +352,12 @@ def kfold_cmd(
     "--batch-size", type=int,
     default=_DEFAULT_BATCH, show_default=True,
 )
+@click.option(
+    "--eval-mode",
+    type=click.Choice(["strict", "relaxed"]),
+    default="strict", show_default=True,
+    help="strict: B-/I- must match exactly; relaxed: entity boundary match only.",
+)
 @click.option("--token-level", is_flag=True)
 @click.option("--quiet", is_flag=True)
 def eval_cmd(
@@ -349,6 +365,7 @@ def eval_cmd(
     splits_dir: str,
     split: str,
     batch_size: int,
+    eval_mode: str,
     token_level: bool,
     quiet: bool,
 ) -> None:
@@ -365,6 +382,7 @@ def eval_cmd(
         batch_size=batch_size,
         word_level=not token_level,
         quiet=quiet,
+        eval_mode=eval_mode,
     )
 
 
@@ -461,6 +479,11 @@ def inspect_tokens_cmd(
     type=click.Choice(["train", "test", "both"]),
     default="test", show_default=True,
 )
+@click.option(
+    "--relaxed",
+    is_flag=True,
+    help="Compare entity spans instead of individual B-/I- tokens.",
+)
 @click.option("--token-level", is_flag=True)
 @click.option("--max-samples", type=int, default=None)
 @click.option("--seed", type=int, default=42, show_default=True)
@@ -470,6 +493,7 @@ def inspect_predictions_cmd(
     inputs: tuple[str, ...],
     splits_dir: str | None,
     split: str,
+    relaxed: bool,
     token_level: bool,
     max_samples: int | None,
     seed: int,
@@ -556,13 +580,36 @@ def inspect_predictions_cmd(
 
         click.echo(f"\n[{i}] {raw_row['source_annotated_loanwords']}")
         click.echo(f"{sep}\n  {'token':<{col_w}} {'gold':<12} pred\n{sep}")
-        for tok, lid, pid in zip(
-            tokens[:pad_start], labels[:pad_start], sample_preds[:pad_start]
-        ):
-            gold = "~~" if lid == -100 else schema.id_to_label[lid]
-            pred = "~~" if lid == -100 else schema.id_to_label[pid]
-            flag = " !" if gold != pred and gold != "~~" else ""
-            click.echo(f"  {tok:<{col_w}} {gold:<12} {pred}{flag}")
+
+        if relaxed:
+            from seqeval.metrics import sequence_accuracy_score
+
+            true_seq = [
+                "~~" if lid == -100 else schema.id_to_label[lid]
+                for lid in labels[:pad_start]
+            ]
+            pred_seq = [
+                "~~" if lid == -100 else schema.id_to_label[pid]
+                for lid, pid in zip(labels[:pad_start], sample_preds[:pad_start])
+            ]
+            acc = sequence_accuracy_score([true_seq], [pred_seq])
+            click.echo(f"  (relaxed entity accuracy: {acc:.2%})")
+            # Fall through to token-level display for reference
+            for tok, lid, pid in zip(
+                tokens[:pad_start], labels[:pad_start], sample_preds[:pad_start]
+            ):
+                gold = "~~" if lid == -100 else schema.id_to_label[lid]
+                pred = "~~" if lid == -100 else schema.id_to_label[pid]
+                flag = " !" if gold != pred and gold != "~~" else ""
+                click.echo(f"  {tok:<{col_w}} {gold:<12} {pred}{flag}")
+        else:
+            for tok, lid, pid in zip(
+                tokens[:pad_start], labels[:pad_start], sample_preds[:pad_start]
+            ):
+                gold = "~~" if lid == -100 else schema.id_to_label[lid]
+                pred = "~~" if lid == -100 else schema.id_to_label[pid]
+                flag = " !" if gold != pred and gold != "~~" else ""
+                click.echo(f"  {tok:<{col_w}} {gold:<12} {pred}{flag}")
         if n_pad:
             click.echo(f"  {'...':<{col_w}} ({n_pad} padding tokens)")
         click.echo(sep)
