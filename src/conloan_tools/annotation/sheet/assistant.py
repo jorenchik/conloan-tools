@@ -1038,6 +1038,140 @@ def cmd_dupes(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     return ("\n".join(output_lines), False)
 
 
+def _parse_freq_args(args: List[str]):
+    """Parse arguments for the freq command."""
+    if not args:
+        return None, "Usage: freq <span_type> [--file <name>] [--by surface|lemma|both] [--scope word|span|both]"
+
+    span_type = args[0].upper()
+    file_filter = None
+    by = "both"
+    scope = "both"
+
+    i = 1
+    while i < len(args):
+        if args[i] == "--file" and i + 1 < len(args):
+            file_filter = args[i + 1]
+            i += 2
+        elif args[i] == "--by" and i + 1 < len(args):
+            by = args[i + 1].lower()
+            if by not in ("surface", "lemma", "both"):
+                return None, f"Invalid --by value '{args[i + 1]}'. Use surface, lemma, or both."
+            i += 2
+        elif args[i] == "--scope" and i + 1 < len(args):
+            scope = args[i + 1].lower()
+            if scope not in ("word", "span", "both"):
+                return None, f"Invalid --scope value '{args[i + 1]}'. Use word, span, or both."
+            i += 2
+        else:
+            return None, f"Unknown argument '{args[i]}'."
+
+    return {"span_type": span_type, "file": file_filter, "by": by, "scope": scope}, None
+
+
+def cmd_freq(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
+    """Print frequency lists per span type (word-level and span-level)."""
+    params, err = _parse_freq_args(args)
+    if err:
+        return (err, True)
+
+    span_type = params["span_type"]
+    file_filter = params["file"]
+    by = params["by"]
+    scope = params["scope"]
+
+    if file_filter is not None:
+        matched = next(
+            (n for n in session.files if n.lower() == file_filter.lower()), None
+        )
+        if matched is None:
+            available = ", ".join(sorted(session.files.keys()))
+            return (f"Unknown file '{file_filter}'. Available: {available}", True)
+        file_filter = matched
+
+    def _freq_block(
+        tokens: List[TokenEntry],
+        entries: List[CorpusEntry],
+        label: str,
+    ) -> List[str]:
+        lines = [f"{label}:"]
+
+        if scope in ("word", "both"):
+            relevant_tokens = [t for t in tokens if t.prefix == span_type]
+            if by in ("surface", "both"):
+                counts: Dict[str, int] = defaultdict(int)
+                for t in relevant_tokens:
+                    counts[t.surface] += 1
+                lines.append("  word / surface:")
+                if counts:
+                    for form, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+                        lines.append(f"    {cnt:>5}  {form}")
+                else:
+                    lines.append("    (none)")
+
+            if by in ("lemma", "both"):
+                counts = defaultdict(int)
+                for t in relevant_tokens:
+                    counts[t.lemma_key] += 1
+                lines.append("  word / lemma:")
+                if counts:
+                    for lk, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+                        lines.append(f"    {cnt:>5}  {lk}")
+                else:
+                    lines.append("    (none)")
+
+        if scope in ("span", "both"):
+            relevant_entries = [e for e in entries if e.prefix == span_type]
+            if by in ("surface", "both"):
+                counts = defaultdict(int)
+                for e in relevant_entries:
+                    counts[e.surface] += 1
+                lines.append("  span / surface:")
+                if counts:
+                    for form, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+                        lines.append(f"    {cnt:>5}  {form}")
+                else:
+                    lines.append("    (none)")
+
+            if by in ("lemma", "both"):
+                counts = defaultdict(int)
+                for e in relevant_entries:
+                    counts[e.lemma_key] += 1
+                lines.append("  span / lemma:")
+                if counts:
+                    for lk, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+                        lines.append(f"    {cnt:>5}  {lk}")
+                else:
+                    lines.append("    (none)")
+
+        return lines
+
+    output_lines: List[str] = []
+
+    # Global block
+    if file_filter is None:
+        block = _freq_block(session.index.tokens, session.index.entries, "all files")
+        output_lines.extend(block)
+
+        # Per-file breakdown
+        for file_name in sorted(session.files.keys()):
+            f_tokens = [t for t in session.index.tokens if t.file == file_name]
+            f_entries = [e for e in session.index.entries if e.file == file_name]
+            block = _freq_block(f_tokens, f_entries, file_name)
+            output_lines.append("")
+            output_lines.extend(block)
+    else:
+        f_tokens = [t for t in session.index.tokens if t.file == file_filter]
+        f_entries = [e for e in session.index.entries if e.file == file_filter]
+        block = _freq_block(f_tokens, f_entries, file_filter)
+        output_lines.extend(block)
+
+    if not output_lines:
+        return (f"No data found for span type '{span_type}'.", False)
+
+    return ("\n".join(output_lines), False)
+
+
 def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """List all available commands."""
     commands = [
@@ -1049,6 +1183,8 @@ def cmd_help(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
         ("contradict-repl", "Report replacement contradictions"),
         ("multiword <span_type>", "Find spans with multiple tokens"),
         ("dupes <threshold>", "Report near-duplicate sentence clusters"),
+        ("freq <span_type> [--file <name>] [--by surface|lemma|both] [--scope word|span|both]",
+         "Print frequency lists for a span type"),
         ("replace", "List available replacement lemma keys"),
         ("stats", "Print aggregate and per-file statistics"),
         ("mode <baseline|extended>", "Change or show active mode"),
@@ -1156,6 +1292,7 @@ def run_assistant(
         "validate-mode": cmd_validate_mode,
         "validate": cmd_validate,
         "contradict": cmd_contradict,
+        "freq": cmd_freq,
         "contradict-repl": cmd_contradict_repl,
         "multiword": cmd_multiword,
         "dupes": cmd_dupes,
