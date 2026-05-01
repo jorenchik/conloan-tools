@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 models = [
     "accelerate>=1.1.0",   # Required to run 'Trainer' with 'PyTorch'.
+    "bitsandbytes",
     "datasets", 
     "huggingface-hub",
     "markupsafe==2.1.5",
