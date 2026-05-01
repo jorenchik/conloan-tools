@@ -94,6 +94,19 @@ def strip_tags(sentence: str) -> str:
     help="Overwrite existing translations in target column",
 )
 @click.option(
+    "--validated-only",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Only translate rows where Valid column is '+'.",
+)
+@click.option(
+    "--valid-col",
+    default="Valid",
+    show_default=True,
+    help="Column name containing validation marks.",
+)
+@click.option(
     "--keep-tags/--strip-tags",
     default=False,
     show_default=True,
@@ -115,6 +128,8 @@ def translate_sheet(
     target_col,
     overwrite,
     keep_tags,
+    validated_only,
+    valid_col,
 ):
     """Translate a column of sentences in an annotation sheet.
 
@@ -137,16 +152,26 @@ def translate_sheet(
     if target_col not in df.columns:
         df[target_col] = ""
 
+    if validated_only:
+        if valid_col not in df.columns:
+            raise click.ClickException(
+                f"Column '{valid_col}' not found. "
+                f"Available: {list(df.columns)}"
+            )
+        valid_mask = df[valid_col].astype(str).str.strip() == "+"
+    else:
+        valid_mask = pd.Series(True, index=df.index)
+
     # identify rows needing translation
     empty = df[target_col].isna() | (
         df[target_col].astype(str).str.strip() == ""
     )
     if overwrite:
-        indices = df.index.tolist()
+        indices = df[valid_mask].index.tolist()
     else:
-        indices = df[empty].index.tolist()
+        indices = df[valid_mask & empty].index.tolist()
 
-    skipped_nonempty = (~empty).sum() if not overwrite else 0
+    skipped_nonempty = (valid_mask & ~empty).sum() if not overwrite else 0
 
     if not indices:
         click.echo("No rows to translate.")
@@ -186,7 +211,8 @@ def translate_sheet(
         batch = sentences[i : i + batch_size]
         translations.extend(translator.batch_translate(batch))
 
-    df["Target"] = translations
+    for idx, translation in zip(indices, translations):
+        df.at[idx, target_col] = translation
 
     write_sheet(df, output)
     click.echo(
