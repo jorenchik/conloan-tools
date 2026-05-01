@@ -186,6 +186,7 @@ def translate_sheet(
 
     if target_col not in df.columns:
         df[target_col] = ""
+    df[target_col] = df[target_col].astype(object)
 
     if validated_only:
         if valid_col not in df.columns:
