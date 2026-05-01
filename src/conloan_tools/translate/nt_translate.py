@@ -10,6 +10,7 @@ from conloan_tools.resources import load_known_languages
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 
 DEFAULT_MODEL = "Helsinki-NLP/opus-mt-{src}-{tgt}"
+NLLB_MODEL_PREFIX = "facebook/nllb"
 
 
 def resolve_model_name(src_code: str, tgt_code: str, model: str | None = None) -> str:
@@ -21,6 +22,10 @@ def resolve_model_name(src_code: str, tgt_code: str, model: str | None = None) -
     if model:
         return model
     return DEFAULT_MODEL.format(src=src_code, tgt=tgt_code)
+
+
+def _is_nllb(model_name: str) -> bool:
+    return model_name.startswith(NLLB_MODEL_PREFIX)
 
 
 class Translator:
@@ -44,6 +49,8 @@ class Translator:
         device: str | None = None,
         max_new_tokens: int = 512,
         quiet: bool = True,
+        nllb_src: str | None = None,
+        nllb_tgt: str | None = None,
     ) -> None:
         import torch
 
@@ -57,6 +64,19 @@ class Translator:
         self._tgt_code = self._resolve_code(tgt_lang, name_to_code, known)
 
         model_name = resolve_model_name(self._src_code, self._tgt_code, model)
+        self._nllb = _is_nllb(model_name)
+
+        if self._nllb:
+            if not nllb_src or not nllb_tgt:
+                raise ValueError(
+                    "NLLB models require --nllb-src and --nllb-tgt "
+                    "(e.g. 'lvs_Latn', 'eng_Latn')."
+                )
+            self._nllb_src = nllb_src
+            self._nllb_tgt = nllb_tgt
+        else:
+            self._nllb_src = self._nllb_tgt = None
+
         self._tokenizer, self._model = self._load(model_name)
 
     def translate(self, text: str) -> str:
@@ -73,21 +93,29 @@ class Translator:
         """Translate a list of strings without sentence splitting."""
         import torch
 
-        inputs = self._tokenizer(
-            texts,
+        tokenizer_kwargs = dict(
             return_tensors="pt",
             padding=True,
             truncation=True,
-        ).to(self._device)
+        )
+        if self._nllb:
+            tokenizer_kwargs["src_lang"] = self._nllb_src
+
+        inputs = self._tokenizer(texts, **tokenizer_kwargs).to(self._device)
+
+        generate_kwargs: dict = dict(
+            max_new_tokens=self.max_new_tokens,
+            num_beams=4,
+            length_penalty=1.0,
+            early_stopping=None,
+        )
+        if self._nllb:
+            generate_kwargs["forced_bos_token_id"] = (
+                self._tokenizer.convert_tokens_to_ids(self._nllb_tgt)
+            )
 
         with torch.no_grad():
-            tokens = self._model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                num_beams=4,
-                length_penalty=1.0,
-                early_stopping=None,
-            )
+            tokens = self._model.generate(**inputs, **generate_kwargs)
 
         return self._tokenizer.batch_decode(tokens, skip_special_tokens=True)
 
@@ -107,7 +135,7 @@ class Translator:
             f"name from load_known_languages()."
         )
 
-    def _load(self, model_name: str) -> tuple:
+    def _load(self, model_name: str) -> tuple:  # noqa: C901
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
         from transformers import logging as tf_logging
@@ -119,7 +147,12 @@ class Translator:
         click.echo(f"Loading model: {model_name} ({self._device})")
 
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            tokenizer_kwargs = {}
+            if self._nllb:
+                tokenizer_kwargs["src_lang"] = self._nllb_src
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name, **tokenizer_kwargs
+            )
             model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
         except OSError as exc:
             raise ValueError(
@@ -150,6 +183,16 @@ class Translator:
     ),
 )
 @click.option(
+    "--nllb-src",
+    default=None,
+    help="NLLB source language code (e.g. 'lvs_Latn'). Required for NLLB models.",
+)
+@click.option(
+    "--nllb-tgt",
+    default=None,
+    help="NLLB target language code (e.g. 'eng_Latn'). Required for NLLB models.",
+)
+@click.option(
     "--max-new-tokens",
     type=int,
     default=512,
@@ -166,6 +209,8 @@ def interactive(
     src: str,
     tgt: str,
     model: str | None,
+    nllb_src: str | None,
+    nllb_tgt: str | None,
     max_new_tokens: int,
     verbose: bool,
 ) -> None:
@@ -174,6 +219,8 @@ def interactive(
         src_lang=src,
         tgt_lang=tgt,
         model=model,
+        nllb_src=nllb_src,
+        nllb_tgt=nllb_tgt,
         max_new_tokens=max_new_tokens,
         quiet=not verbose,
     )

@@ -34,6 +34,16 @@ def strip_tags(sentence: str) -> str:
     help="Override default Opus-MT model with any HF seq2seq model id.",
 )
 @click.option(
+    "--nllb-src",
+    default=None,
+    help="NLLB source language code (e.g. 'lvs_Latn'). Required for NLLB models.",
+)
+@click.option(
+    "--nllb-tgt",
+    default=None,
+    help="NLLB target language code (e.g. 'eng_Latn'). Required for NLLB models.",
+)
+@click.option(
     "--device",
     default=None,
     help="Torch device (e.g. 'cuda', 'cpu'); auto-detected if omitted",
@@ -87,6 +97,8 @@ def translate_sheet(
     src_lang,
     tgt_lang,
     model,
+    nllb_src,
+    nllb_tgt,
     device,
     max_new_tokens,
     batch_size,
@@ -147,6 +159,8 @@ def translate_sheet(
         src_lang=src_lang,
         tgt_lang=tgt_lang,
         model=model,
+        nllb_src=nllb_src,
+        nllb_tgt=nllb_tgt,
         device=device,
         max_new_tokens=max_new_tokens,
         quiet=True,
