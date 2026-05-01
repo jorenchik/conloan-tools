@@ -7,6 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from conloan_tools.translate.nt_translate import Translator
+from conloan_tools.translate.llm_translate import LLMTranslator
 from .excel import write_sheet
 
 
@@ -141,6 +142,13 @@ def restore_protected(sentence: str, mapping: dict[str, str]) -> str:
     help="Column name containing validation marks.",
 )
 @click.option(
+    "--backend",
+    type=click.Choice(["opus-mt", "llm"]),
+    default="opus-mt",
+    show_default=True,
+    help="Translation backend: seq2seq Opus-MT or decoder-only LLM.",
+)
+@click.option(
     "--keep-tags/--strip-tags",
     default=False,
     show_default=True,
@@ -165,6 +173,7 @@ def translate_sheet(
     validated_only,
     valid_col,
     protect_terms,
+    backend,
 ):
     """Translate a column of sentences in an annotation sheet.
 
@@ -230,17 +239,28 @@ def translate_sheet(
         mappings.append(mapping)
 
     click.echo("Loading translation model…")
-    translator = Translator(
-        src_lang=src_lang,
-        tgt_lang=tgt_lang,
-        model=model,
-        nllb_src=nllb_src,
-        nllb_tgt=nllb_tgt,
-        device=device,
-        max_new_tokens=max_new_tokens,
-        precision=precision,
-        quiet=True,
-    )
+    if backend == "llm":
+        translator = LLMTranslator(
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
+            model=model,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            precision=precision,
+            quiet=True,
+        )
+    else:
+        translator = Translator(
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
+            model=model,
+            nllb_src=nllb_src,
+            nllb_tgt=nllb_tgt,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            precision=precision,
+            quiet=True,
+        )
 
     # translate in batches
     click.echo(f"Translating {len(sentences)} sentences…")
