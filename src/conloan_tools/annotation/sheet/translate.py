@@ -56,6 +56,13 @@ def strip_tags(sentence: str) -> str:
     help="Maximum new tokens per translation",
 )
 @click.option(
+    "--precision",
+    type=click.Choice(["fp32", "fp16", "bf16"]),
+    default="fp16",
+    show_default=True,
+    help="Model precision (fp32 on CPU, fp16/bf16 on CUDA).",
+)
+@click.option(
     "--batch-size",
     type=int,
     default=32,
@@ -101,6 +108,7 @@ def translate_sheet(
     nllb_tgt,
     device,
     max_new_tokens,
+    precision,
     batch_size,
     output,
     source_col,
@@ -163,6 +171,7 @@ def translate_sheet(
         nllb_tgt=nllb_tgt,
         device=device,
         max_new_tokens=max_new_tokens,
+        precision=precision,
         quiet=True,
     )
 

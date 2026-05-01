@@ -51,11 +51,13 @@ class Translator:
         quiet: bool = True,
         nllb_src: str | None = None,
         nllb_tgt: str | None = None,
+        precision: str = "fp16",
     ) -> None:
         import torch
 
         self.max_new_tokens = max_new_tokens
         self.quiet = quiet
+        self._precision = precision
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         known = load_known_languages()
@@ -172,7 +174,10 @@ class Translator:
                 tf_logging.set_verbosity(prev_verbosity)
 
         if self._device == "cuda":
-            model = model.half()
+            if self._precision == "fp16":
+                model = model.half()
+            elif self._precision == "bf16":
+                model = model.bfloat16()
         model = model.to(self._device).eval()
 
         return tokenizer, model
@@ -207,6 +212,13 @@ class Translator:
     help="Maximum tokens to generate per segment.",
 )
 @click.option(
+    "--precision",
+    type=click.Choice(["fp32", "fp16", "bf16"]),
+    default="fp16",
+    show_default=True,
+    help="Model precision (fp32 on CPU, fp16/bf16 on CUDA).",
+)
+@click.option(
     "--verbose",
     is_flag=True,
     default=False,
@@ -219,6 +231,7 @@ def interactive(
     nllb_src: str | None,
     nllb_tgt: str | None,
     max_new_tokens: int,
+    precision: str,
     verbose: bool,
 ) -> None:
     """Interactive REPL for translating text line by line."""
@@ -229,6 +242,7 @@ def interactive(
         nllb_src=nllb_src,
         nllb_tgt=nllb_tgt,
         max_new_tokens=max_new_tokens,
+        precision=precision,
         quiet=not verbose,
     )
 
