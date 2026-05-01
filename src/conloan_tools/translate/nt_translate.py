@@ -115,7 +115,14 @@ class Translator:
             )
 
         with torch.no_grad():
-            tokens = self._model.generate(**inputs, **generate_kwargs)
+            tokens = self._model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                num_beams=4,
+                length_penalty=1.0,
+                early_stopping=True,
+                repetition_penalty=1.3,
+            )
 
         return self._tokenizer.batch_decode(tokens, skip_special_tokens=True)
 
