@@ -66,7 +66,7 @@ def _make_training_args(
     )
 
 
-def _make_compute_metrics(schema: "LabelSchema"):
+def _make_compute_metrics(schema: "LabelSchema", eval_mode: str = "strict"):
     import numpy as np
     from seqeval.metrics import classification_report, f1_score
 
@@ -87,11 +87,11 @@ def _make_compute_metrics(schema: "LabelSchema"):
             pred_seqs.append(pred_seq_out)
 
         report = classification_report(
-            true_seqs, pred_seqs, output_dict=True, zero_division=0
+            true_seqs, pred_seqs, output_dict=True, zero_division=0, mode=eval_mode
         )
         metrics: dict = {
             "f1_macro": f1_score(
-                true_seqs, pred_seqs, average="macro", zero_division=0
+                true_seqs, pred_seqs, average="macro", zero_division=0, mode=eval_mode
             )
         }
         for label in schema.report_labels:
@@ -141,6 +141,7 @@ def _build_trainer(
     training_args,
     tokenizer,
     class_weights=None,
+    eval_mode: str = "strict",
 ):
     from transformers import (
         AutoModelForTokenClassification,
@@ -177,7 +178,7 @@ def _build_trainer(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=DataCollatorForTokenClassification(tokenizer),
-        compute_metrics=_make_compute_metrics(schema),
+        compute_metrics=_make_compute_metrics(schema, eval_mode=eval_mode),
         class_weights=class_weights,
     )
 
@@ -254,6 +255,7 @@ def run_train(
     word_level: bool,
     quiet: bool,
     use_class_weights: bool = False,
+    eval_mode: str = "strict",
 ) -> Path:
     """Train on the pre-built train split; evaluate and save artifact.
 
@@ -313,6 +315,7 @@ def run_train(
         training_args=args,
         tokenizer=tokenizer,
         class_weights=class_weights,
+        eval_mode=eval_mode,
     )
 
     trainer.train()

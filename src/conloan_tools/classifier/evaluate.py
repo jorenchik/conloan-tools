@@ -37,6 +37,7 @@ def run_evaluate(
     batch_size: int,
     word_level: bool,
     quiet: bool,
+    eval_mode: str = "strict",
 ) -> dict[str, dict]:
     """Load a saved model, evaluate on requested splits, write eval_results.json."""
     import torch
@@ -77,7 +78,7 @@ def run_evaluate(
         model=clf_model,
         args=args,
         data_collator=DataCollatorForTokenClassification(tokenizer),
-        compute_metrics=_make_compute_metrics(schema),
+        compute_metrics=_make_compute_metrics(schema, eval_mode=eval_mode),
     )
 
     results: dict[str, dict] = {}

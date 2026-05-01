@@ -46,6 +46,7 @@ def run_kfold(
     max_samples: int | None,
     quiet: bool,
     use_class_weights: bool = False,
+    eval_mode: str = "strict",
 ) -> Path:
     """K-fold CV — estimates generalisation, produces no model artifact.
 
@@ -128,6 +129,7 @@ def run_kfold(
             training_args=args,
             tokenizer=tokenizer,
             class_weights=class_weights,
+            eval_mode=eval_mode,
         )
         trainer.train()
         fold_results.append(trainer.evaluate())
