@@ -15,6 +15,33 @@ def strip_tags(sentence: str) -> str:
     return re.sub(r"</?[A-Za-z]+\d+>", "", sentence)
 
 
+_PROTECTED_TAG_RE = re.compile(r"<(CN|CS)(\d+)>(.*?)</(CN|CS)\2>", re.DOTALL)
+_PLACEHOLDER = "TERM_{}"
+
+
+def extract_protected(sentence: str) -> tuple[str, dict[str, str]]:
+    """Replace CN/CS tagged spans with placeholders, return modified sentence
+    and a mapping of placeholder -> original content."""
+    mapping: dict[str, str] = {}
+    counter = 0
+
+    def replace(m: re.Match) -> str:
+        nonlocal counter
+        placeholder = _PLACEHOLDER.format(counter)
+        mapping[placeholder] = m.group(3)
+        counter += 1
+        return placeholder
+
+    return _PROTECTED_TAG_RE.sub(replace, sentence), mapping
+
+
+def restore_protected(sentence: str, mapping: dict[str, str]) -> str:
+    """Substitute placeholders back with their original content."""
+    for placeholder, original in mapping.items():
+        sentence = sentence.replace(placeholder, original)
+    return sentence
+
+
 @click.command("translate")
 @click.argument("input_file", type=click.Path(exists=True))
 @click.option(
@@ -94,6 +121,13 @@ def strip_tags(sentence: str) -> str:
     help="Overwrite existing translations in target column",
 )
 @click.option(
+    "--protect-terms",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Extract CN/CS tagged spans before translation and restore after.",
+)
+@click.option(
     "--validated-only",
     is_flag=True,
     default=False,
@@ -130,6 +164,7 @@ def translate_sheet(
     keep_tags,
     validated_only,
     valid_col,
+    protect_terms,
 ):
     """Translate a column of sentences in an annotation sheet.
 
@@ -181,11 +216,17 @@ def translate_sheet(
 
     # prepare source texts
     sentences: list[str] = []
+    mappings: list[dict[str, str]] = []
     for idx in indices:
         text = str(df.at[idx, source_col])
+        if protect_terms:
+            text, mapping = extract_protected(text)
+        else:
+            mapping = {}
         if not keep_tags:
             text = strip_tags(text)
         sentences.append(text)
+        mappings.append(mapping)
 
     click.echo("Loading translation model…")
     translator = Translator(
@@ -211,7 +252,9 @@ def translate_sheet(
         batch = sentences[i : i + batch_size]
         translations.extend(translator.batch_translate(batch))
 
-    for idx, translation in zip(indices, translations):
+    for idx, translation, mapping in zip(indices, translations, mappings):
+        if protect_terms and mapping:
+            translation = restore_protected(translation, mapping)
         df.at[idx, target_col] = translation
 
     write_sheet(df, output)
