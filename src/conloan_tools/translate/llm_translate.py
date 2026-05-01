@@ -45,11 +45,23 @@ class LLMTranslator:
                 f"Supported: {sorted(SUPPORTED_MODELS)}"
             )
 
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if self._device == "cpu":
+            raise ValueError(
+                "LLM backend requires a CUDA device. "
+                "bitsandbytes 4-bit quantization is not supported on CPU."
+            )
+
+        precision_map = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }
+        self._compute_dtype = precision_map[precision]
         self.max_new_tokens = max_new_tokens
         self._system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
             src=src_lang, tgt=tgt_lang
         )
-        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self._tokenizer, self._model = self._load(model_id, quiet)
 
@@ -101,7 +113,6 @@ class LLMTranslator:
         from transformers import (
             AutoModelForCausalLM,
             AutoTokenizer,
-            BitsAndBytesConfig,
         )
         from transformers import logging as tf_logging
 
@@ -116,18 +127,10 @@ class LLMTranslator:
             tokenizer.padding_side = "left"
             tokenizer.pad_token = tokenizer.eos_token
 
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
-
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                quantization_config=bnb_config,
                 device_map="auto",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=self._compute_dtype,
             )
             model.eval()
         except OSError as exc:
