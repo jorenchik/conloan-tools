@@ -943,42 +943,74 @@ def cmd_validate_mode(session: AssistantSession, args: List[str]) -> Tuple[str, 
 
 def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Report replacement contradictions across all loaded files."""
-    # lemma_key -> {paired_lemma_key -> [(file, row_index), ...]}
-    source_to_repls: Dict[str, Dict[str, List[Tuple[str, int]]]] = defaultdict(lambda: defaultdict(list))
-    # paired_lemma_key -> {lemma_key -> [(file, row_index), ...]}
-    repl_to_sources: Dict[str, Dict[str, List[Tuple[str, int]]]] = defaultdict(lambda: defaultdict(list))
+    context_size = 2
+    if args:
+        try:
+            context_size = int(args[0])
+        except ValueError:
+            return (f"Invalid context size '{args[0]}': must be an integer.", True)
+
+    # Pre-build (file, row_index) -> plain label sentence for context lookup.
+    row_sentences: Dict[Tuple[str, int], str] = {}
+    for file_name, df in session.files.items():
+        for idx, row in df.iterrows():
+            row_sentences[(file_name, idx + 2)] = strip_tags(
+                str(row.get("Label sentence", ""))
+            )
+
+    # lemma_key -> {paired_lemma_key -> [(file, row_index, surface), ...]}
+    source_to_repls: Dict[str, Dict[str, List[Tuple[str, int, str]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    # paired_lemma_key -> {lemma_key -> [(file, row_index, surface), ...]}
+    repl_to_sources: Dict[str, Dict[str, List[Tuple[str, int, str]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    # lemma_key -> list of (file, row_index, surface) where is_replaced is False
+    non_replaced: Dict[str, List[Tuple[str, int, str]]] = defaultdict(list)
 
     for entry in session.index.entries:
         if entry.prefix != "L":
             continue
+
+        if not entry.is_replaced:
+            non_replaced[entry.lemma_key].append(
+                (entry.file, entry.row_index, entry.surface)
+            )
+            continue
+
         if not entry.paired_lemma_key:
             continue
 
-        source_to_repls[entry.lemma_key][entry.paired_lemma_key].append((entry.file, entry.row_index))
-        repl_to_sources[entry.paired_lemma_key][entry.lemma_key].append((entry.file, entry.row_index))
+        source_to_repls[entry.lemma_key][entry.paired_lemma_key].append(
+            (entry.file, entry.row_index, entry.surface)
+        )
+        repl_to_sources[entry.paired_lemma_key][entry.lemma_key].append(
+            (entry.file, entry.row_index, entry.surface)
+        )
 
     output_lines = []
 
     # 1. Same loanword, different replacements
     same_source_conflicts = {
-        lk: repls
-        for lk, repls in source_to_repls.items()
-        if len(repls) > 1
+        lk: repls for lk, repls in source_to_repls.items() if len(repls) > 1
     }
     if same_source_conflicts:
         output_lines.append("same loanword, different replacements:")
         for lemma_key in sorted(same_source_conflicts):
             output_lines.append(f"  {lemma_key}:")
             for paired_key in sorted(same_source_conflicts[lemma_key]):
-                locs = sorted(set(same_source_conflicts[lemma_key][paired_key]))
-                locs_str = ", ".join(f"{f}:{r}" for f, r in locs)
-                output_lines.append(f"    - {paired_key} ({locs_str})")
+                output_lines.append(f"    - replace with '{paired_key}':")
+                loc_data = sorted(set(same_source_conflicts[lemma_key][paired_key]))
+                for f, r, surf in loc_data:
+                    sentence = row_sentences.get((f, r), "")
+                    snippets = _get_sentence_context(sentence, surf, context_size)
+                    ctx = " | ".join(snippets) if snippets else "(no context)"
+                    output_lines.append(f"      - {f}:{r} [{ctx}]")
 
     # 2. Same replacement, different sources
     same_repl_conflicts = {
-        rk: sources
-        for rk, sources in repl_to_sources.items()
-        if len(sources) > 1
+        rk: sources for rk, sources in repl_to_sources.items() if len(sources) > 1
     }
     if same_repl_conflicts:
         if output_lines:
@@ -987,9 +1019,43 @@ def cmd_contradict_repl(session: AssistantSession, args: List[str]) -> Tuple[str
         for repl_key in sorted(same_repl_conflicts):
             output_lines.append(f"  {repl_key}:")
             for source_key in sorted(same_repl_conflicts[repl_key]):
-                locs = sorted(set(same_repl_conflicts[repl_key][source_key]))
-                locs_str = ", ".join(f"{f}:{r}" for f, r in locs)
-                output_lines.append(f"    - {source_key} ({locs_str})")
+                output_lines.append(f"    - source '{source_key}':")
+                loc_data = sorted(set(same_repl_conflicts[repl_key][source_key]))
+                for f, r, surf in loc_data:
+                    sentence = row_sentences.get((f, r), "")
+                    snippets = _get_sentence_context(sentence, surf, context_size)
+                    ctx = " | ".join(snippets) if snippets else "(no context)"
+                    output_lines.append(f"      - {f}:{r} [{ctx}]")
+
+    # 3. Replaced vs Non-replaced contradictions
+    logic_conflicts = {
+        lk: repls
+        for lk, repls in source_to_repls.items()
+        if lk in non_replaced
+    }
+    if logic_conflicts:
+        if output_lines:
+            output_lines.append("")
+        output_lines.append("loanword sometimes replaced, sometimes not:")
+        for lemma_key in sorted(logic_conflicts):
+            output_lines.append(f"  {lemma_key}:")
+            # Show non-replaced instances
+            output_lines.append("    - (NOT REPLACED):")
+            nr_data = sorted(set(non_replaced[lemma_key]))
+            for f, r, surf in nr_data:
+                sentence = row_sentences.get((f, r), "")
+                snippets = _get_sentence_context(sentence, surf, context_size)
+                ctx = " | ".join(snippets) if snippets else "(no context)"
+                output_lines.append(f"      - {f}:{r} [{ctx}]")
+            # Show replaced instances
+            for paired_key in sorted(logic_conflicts[lemma_key]):
+                output_lines.append(f"    - replace with '{paired_key}':")
+                r_data = sorted(set(logic_conflicts[lemma_key][paired_key]))
+                for f, r, surf in r_data:
+                    sentence = row_sentences.get((f, r), "")
+                    snippets = _get_sentence_context(sentence, surf, context_size)
+                    ctx = " | ".join(snippets) if snippets else "(no context)"
+                    output_lines.append(f"      - {f}:{r} [{ctx}]")
 
     if not output_lines:
         return ("No replacement contradictions found.", False)
