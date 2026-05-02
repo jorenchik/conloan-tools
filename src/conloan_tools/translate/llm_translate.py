@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import click
 
 SUPPORTED_MODELS = {
@@ -37,6 +39,26 @@ _TOWER_MODELS = {
     "Unbabel/TowerInstruct-13B-v0.2",
     "Unbabel/TowerInstruct-7B-v0.2",
 }
+
+# Language names Tower commonly hallucinates as next-pair headers.
+_TOWER_STOP_LANGS = [
+    "Russian", "English", "German", "French", "Spanish",
+    "Chinese", "Italian", "Portuguese", "Dutch", "Polish",
+]
+
+_LANGS_RE = "|".join(_TOWER_STOP_LANGS)
+
+# Strips corpus-noise language-labeled segments (e.g. " Russian: …") from input.
+_TOWER_NOISE_RE: re.Pattern[str] = re.compile(
+    r"\s+(?:" + _LANGS_RE + r")\s*:.*",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Strips hallucinated few-shot continuations from Tower output.
+_TOWER_OUTPUT_NOISE_RE: re.Pattern[str] = re.compile(
+    r"\n\s*(?:" + _LANGS_RE + r")\s*:.*",
+    re.DOTALL,
+)
 
 
 class LLMTranslator:
@@ -96,6 +118,22 @@ class LLMTranslator:
 
     def batch_translate(self, texts: list[str]) -> list[str]:
         import torch
+        from transformers import StoppingCriteria, StoppingCriteriaList
+
+        class _TowerStop(StoppingCriteria):
+            def __init__(self, tokenizer, device):
+                self._seqs = [
+                    tokenizer.encode(f"\n{lang}:", add_special_tokens=False)
+                    for lang in _TOWER_STOP_LANGS
+                ]
+                self._seqs = [s for s in self._seqs if s]
+
+            def __call__(self, input_ids, scores, **kwargs):
+                for i in range(input_ids.shape[0]):
+                    tail = input_ids[i, -10:].tolist()
+                    if any(tail[-len(s) :] == s for s in self._seqs):
+                        return True
+                return False
 
         prompts = self._build_prompts(texts)
         inputs = self._tokenizer(
@@ -107,23 +145,42 @@ class LLMTranslator:
 
         input_len = inputs["input_ids"].shape[1]
 
-        with torch.no_grad():
-            outputs = self._model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                pad_token_id=self._tokenizer.eos_token_id,
+        generate_kwargs: dict = dict(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=False,
+            pad_token_id=self._tokenizer.eos_token_id,
+        )
+        if self._is_tower:
+            generate_kwargs["stopping_criteria"] = StoppingCriteriaList(
+                [_TowerStop(self._tokenizer, self._device)]
             )
+
+        with torch.no_grad():
+            outputs = self._model.generate(**generate_kwargs)
 
         new_tokens = outputs[:, input_len:]
         decoded = self._tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+        if self._is_tower:
+            decoded = [_TOWER_OUTPUT_NOISE_RE.sub("", t) for t in decoded]
         return [t.strip() for t in decoded]
+
+    @staticmethod
+    def _sanitize_for_tower(text: str) -> str:
+        """Remove embedded few-shot pairs and normalize whitespace."""
+        # Strip patterns like "Russian: ...\nEnglish: ..." that derail Tower.
+        cleaned = _TOWER_NOISE_RE.sub("", text)
+        # Collapse internal newlines so Tower's line-based format stays intact.
+        cleaned = " ".join(cleaned.split())
+        return cleaned.strip()
 
     def _build_prompts(self, texts: list[str]) -> list[str]:
         if self._is_tower:
             return [
                 _TOWER_PROMPT_TEMPLATE.format(
-                    src=self._src_lang, tgt=self._tgt_lang, text=text
+                    src=self._src_lang,
+                    tgt=self._tgt_lang,
+                    text=self._sanitize_for_tower(text),
                 )
                 for text in texts
             ]
@@ -159,16 +216,24 @@ class LLMTranslator:
             tokenizer.padding_side = "left"
             tokenizer.pad_token = tokenizer.eos_token
 
-            load_kwargs: dict = {"device_map": "auto"}
             if self._use_4bit:
-                load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=self._compute_dtype,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                )
+                load_kwargs: dict = {
+                    "device_map": "auto",
+                    "torch_dtype": self._compute_dtype,
+                    "quantization_config": BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=self._compute_dtype,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                    ),
+                    "low_cpu_mem_usage": True,
+                }
             else:
-                load_kwargs["torch_dtype"] = self._compute_dtype
+                load_kwargs: dict = {
+                    "device_map": "auto",
+                    "torch_dtype": self._compute_dtype,
+                    "low_cpu_mem_usage": True,
+                }
 
             model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
             model.eval()
