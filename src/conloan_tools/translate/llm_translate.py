@@ -6,18 +6,37 @@ import click
 
 SUPPORTED_MODELS = {
     "mistralai/Mistral-Nemo-Instruct-2407",
+    "Unbabel/TowerInstruct-13B-v0.2",
+    "Unbabel/TowerInstruct-7B-v0.2",
 }
 
 DEFAULT_LLM_MODEL = "mistralai/Mistral-Nemo-Instruct-2407"
 
+# Used by Mistral-style chat models.
 _SYSTEM_PROMPT_TEMPLATE = (
     "You are a professional translator from {src} to {tgt}. "
     "Translate with strict word-for-word fidelity, preserving the original "
     "sentence structure as closely as {tgt} grammar allows. "
     "Do not paraphrase, summarize, or interpret. "
     "Preserve adjectives, physical descriptors, and literary tone exactly as written. "
+    "The input may contain XML-like tags such as <CS1>, <NE1>, <L1>, etc. "
+    "These tags are structural markers — preserve them exactly as-is, in their "
+    "original positions, wrapping the same content. "
+    "Do NOT translate, remove, or alter any tag names or their content. "
     "Output ONLY the translated text — no explanations, no quotes, no labels."
 )
+
+# Tower-Instruct expects a rigid source/target template — no system prompt.
+_TOWER_PROMPT_TEMPLATE = (
+    "Translate the following text from {src} into {tgt}.\n"
+    "{src}: {text}\n"
+    "{tgt}:"
+)
+
+_TOWER_MODELS = {
+    "Unbabel/TowerInstruct-13B-v0.2",
+    "Unbabel/TowerInstruct-7B-v0.2",
+}
 
 
 class LLMTranslator:
@@ -35,6 +54,7 @@ class LLMTranslator:
         nllb_src: str | None = None,
         nllb_tgt: str | None = None,
         precision: str = "fp16",
+        use_4bit: bool = False,
     ) -> None:
         import torch
 
@@ -58,7 +78,11 @@ class LLMTranslator:
             "fp32": torch.float32,
         }
         self._compute_dtype = precision_map[precision]
+        self._use_4bit = use_4bit
+        self._is_tower = model_id in _TOWER_MODELS
         self.max_new_tokens = max_new_tokens
+        self._src_lang = src_lang
+        self._tgt_lang = tgt_lang
         self._system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
             src=src_lang, tgt=tgt_lang
         )
@@ -96,6 +120,13 @@ class LLMTranslator:
         return [t.strip() for t in decoded]
 
     def _build_prompts(self, texts: list[str]) -> list[str]:
+        if self._is_tower:
+            return [
+                _TOWER_PROMPT_TEMPLATE.format(
+                    src=self._src_lang, tgt=self._tgt_lang, text=text
+                )
+                for text in texts
+            ]
         prompts = []
         for text in texts:
             messages = [
@@ -113,6 +144,7 @@ class LLMTranslator:
         from transformers import (
             AutoModelForCausalLM,
             AutoTokenizer,
+            BitsAndBytesConfig,
         )
         from transformers import logging as tf_logging
 
@@ -127,11 +159,18 @@ class LLMTranslator:
             tokenizer.padding_side = "left"
             tokenizer.pad_token = tokenizer.eos_token
 
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                device_map="auto",
-                torch_dtype=self._compute_dtype,
-            )
+            load_kwargs: dict = {"device_map": "auto"}
+            if self._use_4bit:
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=self._compute_dtype,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            else:
+                load_kwargs["torch_dtype"] = self._compute_dtype
+
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
             model.eval()
         except OSError as exc:
             raise ValueError(

@@ -149,6 +149,13 @@ def restore_protected(sentence: str, mapping: dict[str, str]) -> str:
     help="Translation backend: seq2seq Opus-MT or decoder-only LLM.",
 )
 @click.option(
+    "--use-4bit",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Load LLM in 4-bit quantization (bitsandbytes NF4). Recommended for Tower-13B on A10.",
+)
+@click.option(
     "--keep-tags/--strip-tags",
     default=False,
     show_default=True,
@@ -174,6 +181,7 @@ def translate_sheet(
     valid_col,
     protect_terms,
     backend,
+    use_4bit,
 ):
     """Translate a column of sentences in an annotation sheet.
 
@@ -247,6 +255,7 @@ def translate_sheet(
             device=device,
             max_new_tokens=max_new_tokens,
             precision=precision,
+            use_4bit=use_4bit,
             quiet=True,
         )
     else:
