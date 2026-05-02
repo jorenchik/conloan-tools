@@ -581,35 +581,20 @@ def inspect_predictions_cmd(
         click.echo(f"\n[{i}] {raw_row['source_annotated_loanwords']}")
         click.echo(f"{sep}\n  {'token':<{col_w}} {'gold':<12} pred\n{sep}")
 
-        if relaxed:
-            from seqeval.metrics import sequence_accuracy_score
+        for tok, lid, pid in zip(
+            tokens[:pad_start], labels[:pad_start], sample_preds[:pad_start]
+        ):
+            gold = "~~" if lid == -100 else schema.id_to_label[lid]
+            pred = "~~" if lid == -100 else schema.id_to_label[pid]
 
-            true_seq = [
-                "~~" if lid == -100 else schema.id_to_label[lid]
-                for lid in labels[:pad_start]
-            ]
-            pred_seq = [
-                "~~" if lid == -100 else schema.id_to_label[pid]
-                for lid, pid in zip(labels[:pad_start], sample_preds[:pad_start])
-            ]
-            acc = sequence_accuracy_score([true_seq], [pred_seq])
-            click.echo(f"  (relaxed entity accuracy: {acc:.2%})")
-            # Fall through to token-level display for reference
-            for tok, lid, pid in zip(
-                tokens[:pad_start], labels[:pad_start], sample_preds[:pad_start]
-            ):
-                gold = "~~" if lid == -100 else schema.id_to_label[lid]
-                pred = "~~" if lid == -100 else schema.id_to_label[pid]
+            if relaxed:
+                gold_cmp = gold.split("-")[-1] if gold != "~~" else "~~"
+                pred_cmp = pred.split("-")[-1] if pred != "~~" else "~~"
+                flag = " !" if gold_cmp != pred_cmp and gold_cmp != "~~" else ""
+            else:
                 flag = " !" if gold != pred and gold != "~~" else ""
-                click.echo(f"  {tok:<{col_w}} {gold:<12} {pred}{flag}")
-        else:
-            for tok, lid, pid in zip(
-                tokens[:pad_start], labels[:pad_start], sample_preds[:pad_start]
-            ):
-                gold = "~~" if lid == -100 else schema.id_to_label[lid]
-                pred = "~~" if lid == -100 else schema.id_to_label[pid]
-                flag = " !" if gold != pred and gold != "~~" else ""
-                click.echo(f"  {tok:<{col_w}} {gold:<12} {pred}{flag}")
+
+            click.echo(f"  {tok:<{col_w}} {gold:<12} {pred}{flag}")
         if n_pad:
             click.echo(f"  {'...':<{col_w}} ({n_pad} padding tokens)")
         click.echo(sep)

@@ -647,6 +647,30 @@ def cmd_replace(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     return ("\n".join(output_lines), False)
 
 
+def _sentence_len_stats(tokens: List["TokenEntry"], pairs: Set[Tuple[str, int]]) -> Dict[str, float]:
+    """Compute mean/median/min/max sentence length in tokens."""
+    lengths: Dict[Tuple[str, int], int] = defaultdict(int)
+    for t in tokens:
+        key = (t.file, t.row_index)
+        if key in pairs:
+            lengths[key] += 1
+    vals = list(lengths.values()) if lengths else [0]
+    vals_sorted = sorted(vals)
+    n = len(vals_sorted)
+    mean = sum(vals_sorted) / n
+    median = (
+        vals_sorted[n // 2]
+        if n % 2 == 1
+        else (vals_sorted[n // 2 - 1] + vals_sorted[n // 2]) / 2
+    )
+    return {
+        "mean": round(mean, 2),
+        "median": median,
+        "min": vals_sorted[0],
+        "max": vals_sorted[-1],
+    }
+
+
 def cmd_stats(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     """Print aggregate and per-file statistics."""
     # Compute global stats
@@ -685,6 +709,7 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
                 total_sentence_pairs.add((fn, idx + 2))
     total_sentences = len(total_sentence_pairs)
     validated_sentences = sum(1 for p in total_sentence_pairs if p in validated_pairs)
+    global_len_stats = _sentence_len_stats(session.index.tokens, total_sentence_pairs)
     
     # Duplicate lemma variants: lemma keys appearing in more than one span entry.
     global_lemma_counts: Dict[str, int] = defaultdict(int)
@@ -703,6 +728,10 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
     lines = ["total:"]
     lines.append(f"    - total sentences:       {total_sentences}")
     lines.append(f"    - validated sentences:   {validated_sentences}")
+    lines.append(f"    - sent len mean:         {global_len_stats['mean']}")
+    lines.append(f"    - sent len median:       {global_len_stats['median']}")
+    lines.append(f"    - sent len min:          {global_len_stats['min']}")
+    lines.append(f"    - sent len max:          {global_len_stats['max']}")
     lines.append(f"    - total words:           {total_words}")
     lines.append(f"    - total lemma variants: {total_lemma_variants}")
     lines.append(f"    - total spans:           {total_spans}")
@@ -743,16 +772,20 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
         f_NE_lemma = len(set(t.lemma_key for t in f_tokens if t.prefix == "NE"))
         
         f_df = session.files[file_name]
-        f_sentence_pairs: Set[int] = set()
+        f_sentence_pairs_raw: Set[int] = set()
         for idx, row in f_df.iterrows():
             valid_val = str(row.get("Valid", "")).strip().lower()
             if valid_val in ("+", "-"):
-                f_sentence_pairs.add(idx + 2)
-        f_sentences = len(f_sentence_pairs)
+                f_sentence_pairs_raw.add(idx + 2)
+        f_sentence_pairs: Set[Tuple[str, int]] = {
+            (file_name, r) for r in f_sentence_pairs_raw
+        }
+        f_sentences = len(f_sentence_pairs_raw)
         f_validated = sum(
-            1 for row_idx in f_sentence_pairs
+            1 for row_idx in f_sentence_pairs_raw
             if (file_name, row_idx) in validated_pairs
         )
+        f_len_stats = _sentence_len_stats(f_tokens, f_sentence_pairs)
         
         f_lemma_counts: Dict[str, int] = defaultdict(int)
         for e in f_entries:
@@ -764,6 +797,10 @@ def cmd_stats(session: AssistantSession, args: List[str]) -> Tuple[str, bool]:
         lines.append(f"\n{file_name}:")
         lines.append(f"    - total sentences:       {f_sentences}")
         lines.append(f"    - validated sentences:   {f_validated}")
+        lines.append(f"    - sent len mean:         {f_len_stats['mean']}")
+        lines.append(f"    - sent len median:       {f_len_stats['median']}")
+        lines.append(f"    - sent len min:          {f_len_stats['min']}")
+        lines.append(f"    - sent len max:          {f_len_stats['max']}")
         lines.append(f"    - total words:           {f_total}")
         lines.append(f"    - total lemma variants: {f_total_lemma}")
         lines.append(f"    - total spans:           {f_total_spans}")
