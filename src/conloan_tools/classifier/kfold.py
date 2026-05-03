@@ -40,6 +40,7 @@ def run_kfold(
     batch_size: int,
     weight_decay: float,
     warmup_ratio: float,
+    dropout: float,
     max_length: int,
     precision: str,
     word_level: bool,
@@ -111,6 +112,7 @@ def run_kfold(
             epochs=epochs,
             weight_decay=weight_decay,
             warmup_ratio=warmup_ratio,
+            dropout=dropout,
             train_size=len(train_idx),
             precision=precision,
             use_cpu=use_cpu,
@@ -130,6 +132,7 @@ def run_kfold(
             tokenizer=tokenizer,
             class_weights=class_weights,
             eval_mode=eval_mode,
+            dropout=dropout,
         )
         trainer.train()
         fold_results.append(trainer.evaluate())
@@ -142,9 +145,10 @@ def run_kfold(
     all_keys = {k for r in fold_results for k in r}
     aggregate: dict = {}
     for key in all_keys:
-        if key in _skip_keys:
-            continue
         vals = [r[key] for r in fold_results if key in r]
+        if not vals or not isinstance(vals[0], (int, float, np.number)):
+            continue
+
         aggregate[f"{key}_mean"] = float(np.mean(vals))
         aggregate[f"{key}_std"] = float(np.std(vals))
 
@@ -181,6 +185,7 @@ def run_kfold(
             "batch_size": batch_size,
             "weight_decay": weight_decay,
             "warmup_ratio": warmup_ratio,
+            "dropout": dropout,
             "max_length": max_length,
             "precision": precision,
             "word_level": word_level,

@@ -12,6 +12,7 @@ _DEFAULT_LR = 5e-5
 _DEFAULT_WD = 0.01
 _DEFAULT_WARMUP = 0.1
 _DEFAULT_MAX_LEN = 128
+_DEFAULT_DROPOUT = 0.1
 _DRY_RUN_EPOCHS = 1
 _DRY_RUN_SAMPLES = 64
 
@@ -104,6 +105,10 @@ def _hyperparams(f):
         click.option(
             "--warmup-ratio", type=float,
             default=_DEFAULT_WARMUP, show_default=True,
+        ),
+        click.option(
+            "--dropout", type=float,
+            default=_DEFAULT_DROPOUT, show_default=True,
         ),
         click.option(
             "--max-length", type=int,
@@ -216,6 +221,7 @@ def train_cmd(
     batch_size: int,
     weight_decay: float,
     warmup_ratio: float,
+    dropout: float,
     max_length: int,
     precision: str,
     token_level: bool,
@@ -251,6 +257,7 @@ def train_cmd(
         batch_size=batch_size,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
+        dropout=dropout,
         max_length=max_length,
         precision=precision,
         word_level=not token_level,
@@ -292,6 +299,7 @@ def kfold_cmd(
     batch_size: int,
     weight_decay: float,
     warmup_ratio: float,
+    dropout: float,
     max_length: int,
     precision: str,
     token_level: bool,
@@ -320,6 +328,7 @@ def kfold_cmd(
         batch_size=batch_size,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
+        dropout=dropout,
         max_length=max_length,
         precision=precision,
         word_level=not token_level,

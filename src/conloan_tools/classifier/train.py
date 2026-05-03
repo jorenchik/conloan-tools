@@ -36,6 +36,7 @@ def _make_training_args(
     epochs: int,
     weight_decay: float,
     warmup_ratio: float,
+    dropout: float,
     train_size: int,
     precision: str,  # "fp32" | "fp16" | "bf16"
     use_cpu: bool,
@@ -193,8 +194,10 @@ def _build_trainer(
     tokenizer,
     class_weights=None,
     eval_mode: str = "strict",
+    dropout: float | None = None,
 ):
     from transformers import (
+        AutoConfig,
         AutoModelForTokenClassification,
         DataCollatorForTokenClassification,
     )
@@ -220,8 +223,15 @@ def _build_trainer(
             loss = loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
             return (loss, outputs) if return_outputs else loss
 
-    model = AutoModelForTokenClassification.from_pretrained(
+    config = AutoConfig.from_pretrained(
         model_name, num_labels=len(schema.label_to_id)
+    )
+    if dropout is not None:
+        config.hidden_dropout_prob = dropout
+        config.attention_probs_dropout_prob = dropout
+
+    model = AutoModelForTokenClassification.from_pretrained(
+        model_name, config=config
     )
     return _WeightedTrainer(
         model=model,
@@ -257,6 +267,7 @@ def _evaluate_saved_model(
     batch_size: int,
     target_splits: list[str],
     use_cpu: bool,
+    eval_mode: str = "strict",
 ) -> dict[str, dict]:
     from transformers import (
         AutoModelForTokenClassification,
@@ -301,6 +312,7 @@ def run_train(
     batch_size: int,
     weight_decay: float,
     warmup_ratio: float,
+    dropout: float,
     max_length: int,
     precision: str,
     word_level: bool,
@@ -349,6 +361,7 @@ def run_train(
         epochs=epochs,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
+        dropout=dropout,
         train_size=len(tokenized["train"]),
         precision=precision,
         use_cpu=use_cpu,
@@ -368,19 +381,11 @@ def run_train(
         tokenizer=tokenizer,
         class_weights=class_weights,
         eval_mode=eval_mode,
+        dropout=dropout,
     )
     trainer.add_callback(log_callback)
 
     trainer.train()
-    test_metrics = dict(results["test"])
-    conf_matrix_json = test_metrics.pop("entity_confusion_matrix", None)
-    if conf_matrix_json:
-        (run_dir / "confusion_matrix.json").write_text(
-            json.dumps(json.loads(conf_matrix_json), indent=2)
-        )
-    (run_dir / "test_metrics.json").write_text(
-        json.dumps(test_metrics, indent=2)
-    )
     trainer.save_model(str(run_dir))
     tokenizer.save_pretrained(str(run_dir))
     print(f"Model saved to {run_dir}")
@@ -394,9 +399,17 @@ def run_train(
         batch_size=batch_size,
         target_splits=["test"],
         use_cpu=use_cpu,
+        eval_mode=eval_mode,
     )
+
+    test_metrics = dict(results["test"])
+    conf_matrix_json = test_metrics.pop("entity_confusion_matrix", None)
+    if conf_matrix_json:
+        (run_dir / "confusion_matrix.json").write_text(
+            json.dumps(json.loads(conf_matrix_json), indent=2)
+        )
     (run_dir / "test_metrics.json").write_text(
-        json.dumps(results["test"], indent=2)
+        json.dumps(test_metrics, indent=2)
     )
 
     run_config = {
@@ -409,6 +422,7 @@ def run_train(
             "batch_size": batch_size,
             "weight_decay": weight_decay,
             "warmup_ratio": warmup_ratio,
+            "dropout": dropout,
             "max_length": max_length,
             "precision": precision,
             "word_level": word_level,
