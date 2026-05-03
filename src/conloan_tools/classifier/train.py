@@ -69,6 +69,7 @@ def _make_training_args(
 def _make_compute_metrics(schema: "LabelSchema", eval_mode: str = "strict"):
     import numpy as np
     from seqeval.metrics import classification_report, f1_score
+    from seqeval.metrics.sequence_labeling import get_entities
 
     def compute_metrics(p):
         predictions = np.argmax(p.predictions, axis=2)
@@ -90,15 +91,51 @@ def _make_compute_metrics(schema: "LabelSchema", eval_mode: str = "strict"):
             true_seqs, pred_seqs, output_dict=True, zero_division=0, mode=eval_mode
         )
         metrics: dict = {
+            "eval_mode": eval_mode,
             "f1_macro": f1_score(
                 true_seqs, pred_seqs, average="macro", zero_division=0, mode=eval_mode
-            )
+            ),
         }
+
+        # Per-entity metrics + raw TP/FP/FN counts
         for label in schema.report_labels:
             if label not in report:
                 continue
+            r = report[label]
             for metric in ("precision", "recall", "f1-score", "support"):
-                metrics[f"{label}_{metric}"] = report[label][metric]
+                metrics[f"{label}_{metric}"] = r[metric]
+            tp = round(r["recall"] * r["support"])
+            fp = round(tp / r["precision"] - tp) if r["precision"] > 0 else 0
+            fn = round(r["support"]) - tp
+            metrics[f"{label}_TP"] = tp
+            metrics[f"{label}_FP"] = fp
+            metrics[f"{label}_FN"] = fn
+
+        # Micro and weighted aggregates
+        for avg_key in ("micro avg", "weighted avg"):
+            if avg_key not in report:
+                continue
+            prefix = avg_key.replace(" ", "_")
+            for metric in ("precision", "recall", "f1-score"):
+                metrics[f"{prefix}_{metric}"] = report[avg_key][metric]
+
+        # Confusion matrix: true entity type → predicted type (exact span match)
+        pred_cols = list(schema.report_labels) + ["O"]
+        conf: dict[str, dict[str, int]] = {
+            t: {p: 0 for p in pred_cols} for t in schema.report_labels
+        }
+        for true_seq, pred_seq in zip(true_seqs, pred_seqs):
+            true_ents = {(s, e): t for t, s, e in get_entities(true_seq)}
+            pred_ents = {(s, e): t for t, s, e in get_entities(pred_seq)}
+            for span, t_type in true_ents.items():
+                if t_type not in conf:
+                    continue
+                p_type = pred_ents.get(span, "O")
+                if p_type not in conf[t_type]:
+                    conf[t_type][p_type] = 0
+                conf[t_type][p_type] += 1
+        metrics["entity_confusion_matrix"] = json.dumps(conf)
+
         return metrics
 
     return compute_metrics
@@ -131,6 +168,20 @@ def _make_class_weights(train_dataset, schema: "LabelSchema"):
         stacklevel=2,
     )
     return torch.tensor(weights, dtype=torch.float)
+
+
+def _make_logging_callback():
+    from transformers import TrainerCallback
+
+    class _LoggingCallback(TrainerCallback):
+        def __init__(self):
+            self.logs: list[dict] = []
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs:
+                self.logs.append({**logs, "step": state.global_step})
+
+    return _LoggingCallback()
 
 
 def _build_trainer(
@@ -224,7 +275,7 @@ def _evaluate_saved_model(
         model=clf_model,
         args=args,
         data_collator=DataCollatorForTokenClassification(tokenizer),
-        compute_metrics=_make_compute_metrics(schema),
+        compute_metrics=_make_compute_metrics(schema, eval_mode=eval_mode),
     )
 
     results: dict[str, dict] = {}
@@ -307,6 +358,7 @@ def run_train(
         if use_class_weights
         else None
     )
+    log_callback = _make_logging_callback()
     trainer = _build_trainer(
         model_name=model_name,
         schema=schema,
@@ -317,8 +369,18 @@ def run_train(
         class_weights=class_weights,
         eval_mode=eval_mode,
     )
+    trainer.add_callback(log_callback)
 
     trainer.train()
+    test_metrics = dict(results["test"])
+    conf_matrix_json = test_metrics.pop("entity_confusion_matrix", None)
+    if conf_matrix_json:
+        (run_dir / "confusion_matrix.json").write_text(
+            json.dumps(json.loads(conf_matrix_json), indent=2)
+        )
+    (run_dir / "test_metrics.json").write_text(
+        json.dumps(test_metrics, indent=2)
+    )
     trainer.save_model(str(run_dir))
     tokenizer.save_pretrained(str(run_dir))
     print(f"Model saved to {run_dir}")
