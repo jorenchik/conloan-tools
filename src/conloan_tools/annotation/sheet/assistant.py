@@ -327,20 +327,14 @@ def _process_paired_sentence(
             paired_tag_id = f"L{tag_id[1:]}"
             paired_content = paired_spans[paired_tag_id][1]
             paired_lemma_key = _resolve_lemma_key(paired_content, lemmatizer, lemma_cache)
-        elif prefix == "CS" and f"CN{tag_id[2:]}" in paired_spans:
-            paired_tag_id = f"CN{tag_id[2:]}"
-            paired_content = paired_spans[paired_tag_id][1]
-            paired_lemma_key = _resolve_lemma_key(paired_content, lemmatizer, lemma_cache)
-        elif prefix == "CN" and f"CS{tag_id[2:]}" in paired_spans:
-            paired_tag_id = f"CS{tag_id[2:]}"
-            paired_content = paired_spans[paired_tag_id][1]
-            paired_lemma_key = _resolve_lemma_key(paired_content, lemmatizer, lemma_cache)
-        elif prefix == "NE":
-            # NE is identity pair
+        elif prefix in ("CS", "NE"):
+            # CS and NE are identity pairs
             if tag_id in paired_spans:
                 paired_tag_id = tag_id
                 paired_content = paired_spans[tag_id][1]
-                paired_lemma_key = _resolve_lemma_key(paired_content, lemmatizer, lemma_cache)
+                paired_lemma_key = _resolve_lemma_key(
+                    paired_content, lemmatizer, lemma_cache
+                )
         
         is_replaced = paired_content != content if paired_content else False
         # If paired_content is empty but tag existed, there was no actual content to compare

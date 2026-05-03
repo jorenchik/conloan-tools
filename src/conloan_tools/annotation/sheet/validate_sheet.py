@@ -28,12 +28,12 @@ MODE_CONFIG = {
         "pairs": [("L", "N")],
     },
     "extended": {
-        "allowed_prefixes": {"L", "N", "CS", "CN", "NE"},
+        "allowed_prefixes": {"L", "N", "CS", "NE"},
         "column_prefixes": {
             "Label sentence": {"L", "CS", "NE"},
-            "Replacement sentence": {"N", "CN", "NE"},
+            "Replacement sentence": {"N", "CS", "NE"},
         },
-        "pairs": [("L", "N"), ("CS", "CN"), ("NE", "NE")],
+        "pairs": [("L", "N"), ("CS", "CS"), ("NE", "NE")],
     },
 }
 
@@ -267,12 +267,40 @@ def validate_row(row: pd.Series, mode: str, warn_undecided: bool = True) -> List
                         errors.append(ValidationError("V3.4", "Label/Replacement",
                             f"NE{ne_num} content mismatch: Label='{label_match.group(1)}' vs Replacement='{repl_match.group(1)}'"))
         else:
-            # L↔N and CS↔CN
+            # L↔N and CS↔CS
             l_indices = loan_indices.get(l_pref, set())
             n_indices = native_indices.get(n_pref, set())
             if l_indices != n_indices:
-                errors.append(ValidationError("V3.1" if l_pref == "L" else "V3.2", "Loanword/Native",
-                    f"{l_pref}↔{n_pref} indices mismatch: {l_pref} has {sorted(l_indices)}, {n_pref} has {sorted(n_indices)}"))
+                errors.append(
+                    ValidationError(
+                        "V3.1" if l_pref == "L" else "V3.2",
+                        "Label/Replacement",
+                        f"{l_pref} indices mismatch: Label has {sorted(l_indices)}, Replacement has {sorted(n_indices)}",
+                    )
+                )
+
+            # V3.5: Content inside matched CS index must be identical
+            if l_pref == "CS":
+                cs_nums = l_indices & n_indices
+                for cs_num in sorted(cs_nums):
+                    label_match = re.search(
+                        rf"<CS{cs_num}>(.*?)</CS{cs_num}>", loan_sent
+                    )
+                    repl_match = re.search(
+                        rf"<CS{cs_num}>(.*?)</CS{cs_num}>", native_sent
+                    )
+                    if (
+                        label_match
+                        and repl_match
+                        and label_match.group(1) != repl_match.group(1)
+                    ):
+                        errors.append(
+                            ValidationError(
+                                "V3.5",
+                                "Label/Replacement",
+                                f"CS{cs_num} content mismatch: Label='{label_match.group(1)}' vs Replacement='{repl_match.group(1)}'",
+                            )
+                        )
 
     return errors
 

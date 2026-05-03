@@ -16,7 +16,7 @@ def strip_tags(sentence: str) -> str:
     return re.sub(r"</?[A-Za-z]+\d+>", "", sentence)
 
 
-_PROTECTED_TAG_RE = re.compile(r"<(CN|CS)(\d+)>(.*?)</(CN|CS)\2>", re.DOTALL)
+_PROTECTED_TAG_RE = re.compile(r"<(CS)(\d+)>(.*?)</(CS)\2>", re.DOTALL)
 _PLACEHOLDER = "TERM_{}"
 
 

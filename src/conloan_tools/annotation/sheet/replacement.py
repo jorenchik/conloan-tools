@@ -18,12 +18,15 @@ REQUIRED_COLUMNS = {"Label sentence", "Replacement sentence", "Target", "Valid",
 
 MODE_CONFIG = {
     "baseline": {"allowed_prefixes": {"L", "N"}, "pairs": [("L", "N")]},
-    "extended": {"allowed_prefixes": {"L", "N", "CS", "CN", "NE"}, "pairs": [("L", "N"), ("CS", "CN"), ("NE", "NE")]},
+    "extended": {
+        "allowed_prefixes": {"L", "N", "CS", "CN", "NE"},
+        "pairs": [("L", "N"), ("CS", "CS"), ("NE", "NE")],
+    },
 }
 
 TRANSFORMATION_MAP = {
     "baseline": {"L": "N"},
-    "extended": {"L": "N", "CS": "CN", "NE": "NE"},
+    "extended": {"L": "N", "CS": "CS", "NE": "NE"},
 }
 
 

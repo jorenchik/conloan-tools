@@ -71,14 +71,9 @@ def normalize_slashes(sentence: str) -> str:
 def create_native_template(sentence_with_loan_tags):
     """Replace <L𝑛>word</L𝑛> with <N𝑛>word</N𝑛>."""
 
-    def replace_tag(match):
-        tag_num = match.group(1)
-        word = match.group(2)
-        return f"<N{tag_num}>{word}</N{tag_num}>"
-
     return re.sub(
-        r"<(L|CS)(\d+)>([^<]+)</\1\d+>",
-        lambda m: f"<{'CN' if m.group(1) == 'CS' else 'N'}{m.group(2)}>{m.group(3)}</{'CN' if m.group(1) == 'CS' else 'N'}{m.group(2)}>",
+        r"<(L)(\d+)>([^<]+)</\1\d+>",
+        lambda m: f"<N{m.group(2)}>{m.group(3)}</N{m.group(2)}>",
         sentence_with_loan_tags,
     )
 
