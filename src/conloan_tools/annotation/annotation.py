@@ -6,6 +6,7 @@ from conloan_tools.annotation.sheet.validate_sheet import validate
 from conloan_tools.annotation.sheet.replacement import generate_repl_placeholders 
 from conloan_tools.annotation.sheet.assistant import assistant
 from conloan_tools.annotation.sheet.extract_disqualified import extract_disqualified_cmd
+from conloan_tools.annotation.sheet.change_tag_prefix import change_tag_prefix 
 from conloan_tools.annotation.json.make_from_sheet import json_from_sheet, replacements_from_sheet
 from conloan_tools.annotation.json.sheet_from_json import sheet_from_json 
 
@@ -23,6 +24,7 @@ sheet.add_command(translate_sheet)
 sheet.add_command(generate_repl_placeholders)
 sheet.add_command(assistant)
 sheet.add_command(extract_disqualified_cmd)
+sheet.add_command(change_tag_prefix)
 
 @annotation.group()
 def json():
