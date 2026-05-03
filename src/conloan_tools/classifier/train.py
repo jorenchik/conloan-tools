@@ -224,8 +224,11 @@ def _build_trainer(
             return (loss, outputs) if return_outputs else loss
 
     config = AutoConfig.from_pretrained(
-        model_name, num_labels=len(schema.label_to_id)
+        model_name, num_labels=len(schema.label_to_id),
+        id2label=schema.id_to_label,
+        label2id=schema.label_to_id
     )
+    
     if dropout is not None:
         config.hidden_dropout_prob = dropout
         config.attention_probs_dropout_prob = dropout
