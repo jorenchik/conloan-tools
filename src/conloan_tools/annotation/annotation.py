@@ -8,6 +8,7 @@ from conloan_tools.annotation.sheet.assistant import assistant
 from conloan_tools.annotation.sheet.extract_disqualified import extract_disqualified_cmd
 from conloan_tools.annotation.sheet.change_tag_prefix import change_tag_prefix 
 from conloan_tools.annotation.json.make_from_sheet import json_from_sheet, replacements_from_sheet
+from conloan_tools.annotation.json.make_from_plaintext import make_from_plaintext 
 from conloan_tools.annotation.json.sheet_from_json import sheet_from_json 
 
 @click.group()
@@ -31,4 +32,5 @@ def json():
     """Conloan dataset json utilities."""
 
 json.add_command(json_from_sheet)
+json.add_command(make_from_plaintext)
 json.add_command(replacements_from_sheet)
