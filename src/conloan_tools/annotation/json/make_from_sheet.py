@@ -31,7 +31,10 @@ def _get_validated_df(input_xlsx, mode, all_rows):
         errors = validate_row(row, mode)
         if errors:
             error_count += 1
-            click.secho(f"Row {idx+2} invalid: {' | '.join(errors)}", fg="red")
+            error_msgs = [e.message for e in errors]
+            error_text = " | ".join(error_msgs)
+            
+            click.secho(f"Row {idx+2} invalid: {error_text}", fg="red")
             continue
         valid_rows.append(row)
     
