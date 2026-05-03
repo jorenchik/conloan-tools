@@ -152,26 +152,6 @@ def run_kfold(
         aggregate[f"{key}_mean"] = float(np.mean(vals))
         aggregate[f"{key}_std"] = float(np.std(vals))
 
-    # Pooled P/R/F1: sum TP/FP/FN across folds, then recompute
-    aggregate_pooled: dict = {}
-    for label in schema.report_labels:
-        total_tp = sum(r.get(f"{label}_TP", 0) for r in fold_results)
-        total_fp = sum(r.get(f"{label}_FP", 0) for r in fold_results)
-        total_fn = sum(r.get(f"{label}_FN", 0) for r in fold_results)
-        p = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-        r_val = (
-            total_tp / (total_tp + total_fn)
-            if (total_tp + total_fn) > 0
-            else 0.0
-        )
-        f1 = 2 * p * r_val / (p + r_val) if (p + r_val) > 0 else 0.0
-        aggregate_pooled[f"{label}_TP_total"] = total_tp
-        aggregate_pooled[f"{label}_FP_total"] = total_fp
-        aggregate_pooled[f"{label}_FN_total"] = total_fn
-        aggregate_pooled[f"{label}_precision_pooled"] = p
-        aggregate_pooled[f"{label}_recall_pooled"] = r_val
-        aggregate_pooled[f"{label}_f1_pooled"] = f1
-
     results = {
         "run_name": run_name,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -193,7 +173,6 @@ def run_kfold(
         },
         "folds": fold_results,
         "aggregate": aggregate,
-        "aggregate_pooled": aggregate_pooled,
     }
     out_path = run_dir / "kfold_results.json"
     out_path.write_text(json.dumps(results, indent=2))
