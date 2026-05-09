@@ -20,6 +20,9 @@ _DRY_RUN_SAMPLES = 64
 @click.group("classifier")
 def classifier() -> None:
     """Conloan classifier utilities."""
+    import sys
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
 
 
 @classifier.group("splits")
@@ -451,8 +454,18 @@ def inspect_tokens_cmd(
     pad_tok = tokenizer.pad_token
 
     for i, (raw_row, tok_row) in enumerate(zip(dataset, tokenized)):
-        tokens = tokenizer.convert_ids_to_tokens(tok_row["input_ids"])
+        input_ids = tok_row["input_ids"]
         labels = tok_row["labels"]
+        tokens = []
+        for tid in input_ids:
+            # decode individual tokens to bypass the corrupted string representation
+            # skip_special_tokens=False to keep [CLS], [SEP], etc.
+            t_fixed = tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            if t_fixed in tokenizer.all_special_tokens:
+                tokens.append(t_fixed)
+            else:
+                # Replace the visual space/SentencePiece marker with a visible underscore
+                tokens.append(t_fixed.replace(" ", "_"))
         pad_start = next(
             (j for j, t in enumerate(tokens) if t == pad_tok), len(tokens)
         )
@@ -492,12 +505,19 @@ def inspect_tokens_cmd(
 @click.option(
     "--relaxed",
     is_flag=True,
-    help="Compare entity spans instead of individual B-/I- tokens.",
+    help="Ignore B-/I- prefix; flag only entity-type mismatches.",
 )
 @click.option("--token-level", is_flag=True)
 @click.option("--max-samples", type=int, default=None)
 @click.option("--seed", type=int, default=42, show_default=True)
 @click.option("--quiet", is_flag=True)
+@click.option("--probs", is_flag=True, help="Show full softmax distribution.")
+@click.option("--conf", is_flag=True, help="Show prediction confidence.")
+@click.option(
+    "--max-length", type=int,
+    default=_DEFAULT_MAX_LEN, show_default=True,
+    help="Must match the value used during training.",
+)
 def inspect_predictions_cmd(
     model_dir: str,
     inputs: tuple[str, ...],
@@ -508,6 +528,9 @@ def inspect_predictions_cmd(
     max_samples: int | None,
     seed: int,
     quiet: bool,
+    probs: bool,
+    conf: bool,
+    max_length: int,
 ) -> None:
     """Print token-level gold vs predicted labels for each sample."""
     import numpy as np
@@ -555,7 +578,7 @@ def inspect_predictions_cmd(
 
     tokenized = DatasetDict({"data": dataset}).map(
         lambda x: tokenize_and_align_labels(
-            x, tokenizer, schema, word_level=not token_level
+            x, tokenizer, schema, word_level=not token_level, max_length=max_length
         ),
         batched=True,
     )["data"]
@@ -574,25 +597,47 @@ def inspect_predictions_cmd(
     raw_preds, _, _ = trainer.predict(tokenized)
     pred_ids = np.argmax(raw_preds, axis=-1)
 
+    softmax_probs = None
+    if probs or conf:
+        import torch.nn.functional as F
+        softmax_probs = F.softmax(torch.from_numpy(raw_preds), dim=-1).numpy()
+
     col_w = 30
-    sep = "-" * (col_w + 32)
+    extra = 64 if probs else 48 if conf else 40
+    sep = "-" * (col_w + extra)
     pad_tok = tokenizer.pad_token
 
     for i, (raw_row, tok_row, sample_preds) in enumerate(
         zip(dataset, tokenized, pred_ids)
     ):
-        tokens = tokenizer.convert_ids_to_tokens(tok_row["input_ids"])
+        input_ids = tok_row["input_ids"]
         labels = tok_row["labels"]
+        tokens = []
+        for tid in input_ids:
+            # Decode one-by-one to ensure the character mapping is handled by the C++ backend
+            t_fixed = tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            # Maintain special token formatting but ensure subword markers are visible
+            if t_fixed in tokenizer.all_special_tokens:
+                tokens.append(t_fixed)
+            else:
+                tokens.append(t_fixed.replace(" ", "_"))
         pad_start = next(
             (j for j, t in enumerate(tokens) if t == pad_tok), len(tokens)
         )
         n_pad = len(tokens) - pad_start
 
         click.echo(f"\n[{i}] {raw_row['source_annotated_loanwords']}")
-        click.echo(f"{sep}\n  {'token':<{col_w}} {'gold':<12} pred\n{sep}")
 
-        for tok, lid, pid in zip(
-            tokens[:pad_start], labels[:pad_start], sample_preds[:pad_start]
+        header = f"  {'token':<{col_w}} {'gold':<12} {'pred':<12}"
+        if conf:
+            header += f" {'conf':<7}"
+        if probs:
+            header += " distribution (softmax)"
+
+        click.echo(f"{sep}\n{header}\n{sep}")
+
+        for idx, (tok, lid, pid) in enumerate(
+            zip(tokens[:pad_start], labels[:pad_start], sample_preds[:pad_start])
         ):
             gold = "~~" if lid == -100 else schema.id_to_label[lid]
             pred = "~~" if lid == -100 else schema.id_to_label[pid]
@@ -604,7 +649,19 @@ def inspect_predictions_cmd(
             else:
                 flag = " !" if gold != pred and gold != "~~" else ""
 
-            click.echo(f"  {tok:<{col_w}} {gold:<12} {pred}{flag}")
+            line = f"  {tok:<{col_w}} {gold:<12} {pred:<12}{flag}"
+
+            if lid != -100 and softmax_probs is not None:
+                p_v = softmax_probs[i][idx]
+                if conf:
+                    line += f" {p_v[pid]:.4f}"
+                if probs:
+                    dist = " ".join(
+                        [f"{schema.id_to_label[k]}:{p:.2f}" for k, p in enumerate(p_v)]
+                    )
+                    line += f" [{dist}]"
+
+            click.echo(line)
         if n_pad:
             click.echo(f"  {'...':<{col_w}} ({n_pad} padding tokens)")
         click.echo(sep)
