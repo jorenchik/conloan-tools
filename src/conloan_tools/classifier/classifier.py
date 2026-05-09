@@ -431,6 +431,7 @@ def inspect_tokens_cmd(
 
     schema_obj = SCHEMAS[schema]
     tokenizer = _load_tokenizer(model)
+    click.echo(f"Tokenizer: {tokenizer.__class__.__name__}")
 
     dataset = load_conloan(list(inputs))
     if max_samples is not None:
@@ -664,3 +665,81 @@ def inspect_lengths_cmd(
         f"\n  Truncated: {truncated}/{len(lengths)} "
         f"({100 * truncated / len(lengths):.1f}%)"
     )
+
+
+@inspect_group.command("token-stats")
+@click.option(
+    "--inputs", "-i",
+    required=True, multiple=True,
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option(
+    "--models", "-m",
+    required=True, multiple=True,
+    default=[_DEFAULT_MODEL],
+)
+@click.option(
+    "--max-length", type=int, default=_DEFAULT_MAX_LEN, show_default=True,
+)
+def inspect_token_stats_cmd(
+    inputs: tuple[str, ...],
+    models: tuple[str, ...],
+    max_length: int,
+) -> None:
+    """Compare tokenization stats/distributions across multiple models."""
+    import numpy as np
+    from .data import load_conloan, _parse_all_spans
+    from .train import _load_tokenizer
+
+    dataset = load_conloan(list(inputs))
+    
+    # 1. Extract and clean the text.
+    # We must pass pure Python strings, and we strip the XML tags 
+    # to measure what the model actually "sees".
+    raw_texts = list(dataset["source_annotated_loanwords"])
+    clean_texts = [_parse_all_spans(t)[0] for t in raw_texts]
+    
+    click.echo(f"Analyzing {len(clean_texts)} samples...\n")
+
+    for model_name in models:
+        try:
+            tokenizer = _load_tokenizer(model_name)
+            
+            # 2. Compute token lengths
+            # Passing a list of strings to the tokenizer.
+            # We use is_split_into_words=False because clean_texts are full strings.
+            encodings = tokenizer(
+                clean_texts, 
+                add_special_tokens=True, 
+                truncation=False
+            )
+            lengths = np.array([len(ids) for ids in encodings["input_ids"]])
+
+            # 3. Calculate Stats
+            mean = np.mean(lengths)
+            std = np.std(lengths)
+            median = np.median(lengths)
+            p95 = np.percentile(lengths, 95)
+            p99 = np.percentile(lengths, 99)
+            trunc_rate = (lengths > max_length).mean() * 100
+
+            click.echo(f"Model: {model_name}")
+            click.echo("-" * 50)
+            click.echo(f"  Mean:   {mean:>6.2f} | Std:    {std:>6.2f}")
+            click.echo(f"  Median: {median:>6.0f} | P95/P99: {p95:>4.0f} / {p99:>4.0f}")
+            click.echo(f"  Max:    {lengths.max():>6} | Truncation (at {max_length}): {trunc_rate:.1f}%")
+
+            # 4. ASCII Histogram (Bell Curve)
+            click.echo("\n  Distribution:")
+            counts, bins = np.histogram(lengths, bins=10)
+            max_count = counts.max()
+            for i in range(len(counts)):
+                # Normalize bar width to 25 chars
+                bar_width = int((counts[i] / max_count) * 25) if max_count > 0 else 0
+                bar = "█" * bar_width
+                label = f"{int(bins[i]):>3}-{int(bins[i+1]):<3}"
+                click.echo(f"  {label}: {bar} ({counts[i]})")
+            click.echo("-" * 50 + "\n")
+            
+        except Exception as e:
+            click.echo(f"Error processing model {model_name}: {e}")
