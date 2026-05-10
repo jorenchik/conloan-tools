@@ -188,20 +188,45 @@ def tokenize_and_align_labels(
     label_ids_batch: list[list[int]] = []
     for i, word_labels in enumerate(all_word_labels):
         word_ids = tokenized_inputs.word_ids(batch_index=i)
+        tokens = tokenizer.convert_ids_to_tokens(
+            tokenized_inputs["input_ids"][i]
+        )
         label_ids: list[int] = []
         prev_word_idx: int | None = None
+        # True after a bare SentencePiece marker (▁) is seen as the first
+        # subword of a word; defers the B-/I- label to the next content token.
+        awaiting_first_content: bool = False
 
-        for word_idx in word_ids:
+        for token_idx, word_idx in enumerate(word_ids):
             if word_idx is None:
                 label_ids.append(-100)
-            elif word_idx == prev_word_idx:
-                label_ids.append(
-                    -100
-                    if word_level
-                    else schema.label_to_id[word_labels[word_idx]]
-                )
+                prev_word_idx = word_idx
+                awaiting_first_content = False
+                continue
+
+            is_new_word = word_idx != prev_word_idx
+            is_bare_marker = (tokens[token_idx] or "") == "\u2581"  # bare ▁
+
+            if is_new_word:
+                awaiting_first_content = False
+                if is_bare_marker:
+                    # Standalone prefix marker — no lexical content; defer label.
+                    label_ids.append(-100)
+                    awaiting_first_content = True
+                else:
+                    label_ids.append(schema.label_to_id[word_labels[word_idx]])
             else:
-                label_ids.append(schema.label_to_id[word_labels[word_idx]])
+                if awaiting_first_content and not is_bare_marker:
+                    # First content subword after a deferred bare marker.
+                    label_ids.append(schema.label_to_id[word_labels[word_idx]])
+                    awaiting_first_content = False
+                else:
+                    label_ids.append(
+                        -100
+                        if word_level
+                        else schema.label_to_id[word_labels[word_idx]]
+                    )
+
             prev_word_idx = word_idx
 
         label_ids_batch.append(label_ids)
