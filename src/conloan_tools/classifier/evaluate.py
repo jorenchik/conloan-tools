@@ -8,30 +8,44 @@ if TYPE_CHECKING:
     from .schema import LabelSchema
 
 
-def _load_schema_from_run_config(model_dir: Path) -> "LabelSchema":
+def _load_schema_from_run_config(model: str | Path) -> "LabelSchema":
     from .schema import LabelSchema
 
-    cfg_path = model_dir / "run_config.json"
-    if not cfg_path.exists():
+    p = Path(model)
+    if p.is_dir():
+        cfg_path = p / "run_config.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text())
+            return LabelSchema.from_dict(cfg["schema"])
+
+    # HF model ID or local dir without run_config.json: infer from model config.
+    from transformers import AutoConfig
+
+    hf_config = AutoConfig.from_pretrained(str(model))
+    label2id = getattr(hf_config, "label2id", None)
+    if not label2id:
         raise FileNotFoundError(
-            f"run_config.json not found in {model_dir}. "
-            "Cannot determine label schema."
+            f"Cannot determine label schema from {model!r}. "
+            "Ensure the model directory contains run_config.json or "
+            "the model config defines label2id."
         )
-    cfg = json.loads(cfg_path.read_text())
-    return LabelSchema.from_dict(cfg["schema"])
+    label2id = {k: int(v) for k, v in label2id.items()}
+    return LabelSchema.from_dict(
+        {"labels": list(label2id.keys()), "label_to_id": label2id}
+    )
 
 
-def _load_tokenizer_from_dir(model_dir: Path):
+def _load_tokenizer_from_dir(model: str | Path):
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(str(model_dir))
+    tok = AutoTokenizer.from_pretrained(str(model))
     if not tok.is_fast:
-        raise ValueError(f"Tokenizer at {model_dir} is not a fast tokenizer.")
+        raise ValueError(f"Tokenizer at {model!r} is not a fast tokenizer.")
     return tok
 
 
 def run_evaluate(
-    model_dir: Path,
+    model: str | Path,
     splits_dir: Path,
     target_splits: list[str],
     batch_size: int,
@@ -49,8 +63,8 @@ def run_evaluate(
     if quiet:
         _silence_hf()
 
-    schema = _load_schema_from_run_config(model_dir)
-    tokenizer = _load_tokenizer_from_dir(model_dir)
+    schema = _load_schema_from_run_config(model)
+    tokenizer = _load_tokenizer_from_dir(model)
 
     splits, _ = load_splits(splits_dir)
     tokenized = splits.map(
@@ -67,10 +81,12 @@ def run_evaluate(
     )
     from transformers.trainer import Trainer
 
+    model_p = Path(model)
+    out_dir = model_p if model_p.is_dir() else Path(".")
     use_cpu = not torch.cuda.is_available()
-    clf_model = AutoModelForTokenClassification.from_pretrained(str(model_dir))
+    clf_model = AutoModelForTokenClassification.from_pretrained(str(model))
     args = TrainingArguments(
-        output_dir=str(model_dir),
+        output_dir=str(out_dir),
         per_device_eval_batch_size=batch_size,
         use_cpu=use_cpu,
     )
@@ -86,7 +102,7 @@ def run_evaluate(
         print(f"Evaluating on '{s}' split…")
         results[s] = trainer.evaluate(eval_dataset=tokenized[s])
 
-    out_path = model_dir / "eval_results.json"
+    out_path = out_dir / "eval_results.json"
     out_path.write_text(json.dumps(results, indent=2))
     print(f"\nResults written to {out_path}")
     return results

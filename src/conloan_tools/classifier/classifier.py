@@ -344,10 +344,9 @@ def kfold_cmd(
 
 @classifier.command("eval")
 @click.option(
-    "--model-dir",
+    "--model",
     required=True,
-    type=click.Path(exists=True, file_okay=False),
-    help="Saved model artifact directory.",
+    help="Saved model directory or HuggingFace model ID.",
 )
 @click.option(
     "--splits-dir",
@@ -373,7 +372,7 @@ def kfold_cmd(
 @click.option("--token-level", is_flag=True)
 @click.option("--quiet", is_flag=True)
 def eval_cmd(
-    model_dir: str,
+    model: str,
     splits_dir: str,
     split: str,
     batch_size: int,
@@ -388,7 +387,7 @@ def eval_cmd(
 
     target = ["train", "test"] if split == "both" else [split]
     run_evaluate(
-        model_dir=Path(model_dir),
+        model=model,
         splits_dir=Path(splits_dir),
         target_splits=target,
         batch_size=batch_size,
@@ -483,9 +482,9 @@ def inspect_tokens_cmd(
 
 @inspect_group.command("predictions")
 @click.option(
-    "--model-dir",
+    "--model",
     required=True,
-    type=click.Path(exists=True, file_okay=False),
+    help="Saved model directory or HuggingFace model ID.",
 )
 @click.option(
     "--inputs", "-i",
@@ -519,7 +518,7 @@ def inspect_tokens_cmd(
     help="Must match the value used during training.",
 )
 def inspect_predictions_cmd(
-    model_dir: str,
+    model: str,
     inputs: tuple[str, ...],
     splits_dir: str | None,
     split: str,
@@ -551,9 +550,8 @@ def inspect_predictions_cmd(
     if quiet:
         _silence_hf()
 
-    model_path = __import__("pathlib").Path(model_dir)
-    schema = _load_schema_from_run_config(model_path)
-    tokenizer = _load_tokenizer_from_dir(model_path)
+    schema = _load_schema_from_run_config(model)
+    tokenizer = _load_tokenizer_from_dir(model)
 
     if splits_dir is not None:
         from pathlib import Path
@@ -584,11 +582,13 @@ def inspect_predictions_cmd(
     )["data"]
 
     use_cpu = not torch.cuda.is_available()
-    clf_model = AutoModelForTokenClassification.from_pretrained(model_dir)
+    _mp = __import__("pathlib").Path(model)
+    _model_out = str(_mp) if _mp.is_dir() else "."
+    clf_model = AutoModelForTokenClassification.from_pretrained(model)
     trainer = Trainer(
         model=clf_model,
         args=TrainingArguments(
-            output_dir=model_dir,
+            output_dir=_model_out,
             per_device_eval_batch_size=16,
             use_cpu=use_cpu,
         ),
