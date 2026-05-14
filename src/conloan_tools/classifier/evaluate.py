@@ -22,17 +22,17 @@ def _load_schema_from_run_config(model: str | Path) -> "LabelSchema":
     from transformers import AutoConfig
 
     hf_config = AutoConfig.from_pretrained(str(model))
-    label2id = getattr(hf_config, "label2id", None)
-    if not label2id:
-        raise FileNotFoundError(
-            f"Cannot determine label schema from {model!r}. "
-            "Ensure the model directory contains run_config.json or "
-            "the model config defines label2id."
-        )
     label2id = {k: int(v) for k, v in label2id.items()}
-    return LabelSchema.from_dict(
-        {"labels": list(label2id.keys()), "label_to_id": label2id}
-    )
+    id_to_label = {v: k for k, v in label2id.items()}
+    entity_types = tuple(k[2:] for k in label2id if k.startswith("B-"))
+    primary_label = entity_types[0] if entity_types else "LOAN"
+    return LabelSchema.from_dict({
+        "name": "inferred",
+        "label_to_id": label2id,
+        "id_to_label": {str(k): v for k, v in id_to_label.items()},
+        "report_labels": list(entity_types),
+        "primary_label": primary_label,
+    })
 
 
 def _load_tokenizer_from_dir(model: str | Path):
