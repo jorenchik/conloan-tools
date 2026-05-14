@@ -22,6 +22,13 @@ def _load_schema_from_run_config(model: str | Path) -> "LabelSchema":
     from transformers import AutoConfig
 
     hf_config = AutoConfig.from_pretrained(str(model))
+    label2id = getattr(hf_config, "label2id", None)
+    if not label2id:
+        raise FileNotFoundError(
+            f"Cannot determine label schema from {model!r}. "
+            "Ensure the model directory contains run_config.json or "
+            "the model config defines label2id."
+        )
     label2id = {k: int(v) for k, v in label2id.items()}
     id_to_label = {v: k for k, v in label2id.items()}
     entity_types = tuple(k[2:] for k in label2id if k.startswith("B-"))

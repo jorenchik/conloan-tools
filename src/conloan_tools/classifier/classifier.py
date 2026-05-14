@@ -800,3 +800,331 @@ def inspect_token_stats_cmd(
             
         except Exception as e:
             click.echo(f"Error processing model {model_name}: {e}")
+
+
+@inspect_group.command("errors")
+@click.option(
+    "--model", "-m",
+    required=True, multiple=True,
+    help="Saved model dir or HF model ID. Repeat for multiple models.",
+)
+@click.option(
+    "--model-alias",
+    multiple=True, default=[],
+    help="Display alias per model (same order as --model).",
+)
+@click.option(
+    "--inputs", "-i",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option(
+    "--splits-dir",
+    default=None,
+    type=click.Path(file_okay=False),
+)
+@click.option(
+    "--split",
+    type=click.Choice(["train", "test", "both"]),
+    default="test", show_default=True,
+)
+@click.option(
+    "--output", "-o",
+    required=True,
+    type=click.Path(),
+    help="Output JSON file.",
+)
+@click.option(
+    "--error-types",
+    type=click.Choice(["FN", "FP", "TYPE", "all"]),
+    multiple=True, default=("all",), show_default=True,
+    help="Error classes to include. Repeatable.",
+)
+@click.option(
+    "--context-window",
+    type=int, default=7, show_default=True,
+    help="Words of context on each side of the target span.",
+)
+@click.option("--max-samples", type=int, default=None)
+@click.option("--seed", type=int, default=42, show_default=True)
+@click.option("--token-level", is_flag=True)
+@click.option("--max-length", type=int, default=_DEFAULT_MAX_LEN, show_default=True)
+@click.option("--batch-size", type=int, default=_DEFAULT_BATCH, show_default=True)
+@click.option("--quiet", is_flag=True)
+def inspect_errors_cmd(
+    model: tuple[str, ...],
+    model_alias: tuple[str, ...],
+    inputs: tuple[str, ...],
+    splits_dir: str | None,
+    split: str,
+    output: str,
+    error_types: tuple[str, ...],
+    context_window: int,
+    max_samples: int | None,
+    seed: int,
+    token_level: bool,
+    max_length: int,
+    batch_size: int,
+    quiet: bool,
+) -> None:
+    """Export entity-level prediction errors as JSON for Typst ner_error_card."""
+    import json
+    from pathlib import Path
+
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from datasets import DatasetDict
+    from transformers import (
+        AutoModelForTokenClassification,
+        DataCollatorForTokenClassification,
+        TrainingArguments,
+    )
+    from transformers.trainer import Trainer
+
+    from .data import _parse_all_spans, load_conloan, tokenize_and_align_labels
+    from .evaluate import _load_schema_from_run_config, _load_tokenizer_from_dir
+    from .splits import load_splits
+    from .train import _silence_hf
+
+    if quiet:
+        _silence_hf()
+
+    # Pad missing aliases with the last path segment / HF repo name
+    aliases = list(model_alias)
+    for m in model[len(aliases) :]:
+        p = Path(m)
+        aliases.append(p.name if p.exists() else m.split("/")[-1])
+
+    # ── Load dataset ──────────────────────────────────────────────────────
+    if splits_dir is not None:
+        source_splits, _ = load_splits(Path(splits_dir))
+        target_splits = (
+            ["train", "test"] if split == "both" else [split]
+        )
+        if len(target_splits) == 1:
+            dataset = source_splits[target_splits[0]]
+        else:
+            from datasets import concatenate_datasets
+
+            dataset = concatenate_datasets(
+                [source_splits[s] for s in target_splits]
+            )
+    elif inputs:
+        dataset = load_conloan(list(inputs))
+    else:
+        raise click.UsageError("Provide --inputs or --splits-dir.")
+
+    if max_samples is not None:
+        dataset = dataset.shuffle(seed=seed).select(
+            range(min(max_samples, len(dataset)))
+        )
+
+    wanted: set[str] = (
+        {"FN", "FP", "TYPE"} if "all" in error_types else set(error_types)
+    )
+    use_cpu = not torch.cuda.is_available()
+    schema = None
+
+    # ── Run inference per model ───────────────────────────────────────────
+    model_runs: list[dict] = []
+
+    for m_name, m_alias in zip(model, aliases):
+        click.echo(f"[errors] running {m_name} …", err=True)
+        schema = _load_schema_from_run_config(m_name)
+        tokenizer = _load_tokenizer_from_dir(m_name)
+
+        tokenized = DatasetDict({"data": dataset}).map(
+            lambda x: tokenize_and_align_labels(
+                x,
+                tokenizer,
+                schema,
+                word_level=not token_level,
+                max_length=max_length,
+            ),
+            batched=True,
+        )["data"]
+
+        _mp = Path(m_name)
+        clf_model = AutoModelForTokenClassification.from_pretrained(m_name)
+        trainer = Trainer(
+            model=clf_model,
+            args=TrainingArguments(
+                output_dir=str(_mp) if _mp.is_dir() else ".",
+                per_device_eval_batch_size=batch_size,
+                use_cpu=use_cpu,
+            ),
+            data_collator=DataCollatorForTokenClassification(tokenizer),
+        )
+        raw_preds, _, _ = trainer.predict(tokenized)
+        model_runs.append(
+            dict(
+                name=m_name,
+                alias=m_alias,
+                tokenized=tokenized,
+                pred_ids=np.argmax(raw_preds, axis=-1),
+                softmax=F.softmax(
+                    torch.from_numpy(raw_preds), dim=-1
+                ).numpy(),
+            )
+        )
+
+    assert schema is not None  # at least one model must have loaded
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def word_triples(
+        tok_row: dict,
+        pred_ids_row: np.ndarray,
+        softmax_row: np.ndarray,
+    ) -> list[tuple[str, str, float]]:
+        """(gold_label, pred_label, pred_conf) for every non-masked position."""
+        return [
+            (
+                schema.id_to_label[lid],
+                schema.id_to_label[pid],
+                float(softmax_row[pos][pid]),
+            )
+            for pos, (lid, pid) in enumerate(
+                zip(tok_row["labels"], pred_ids_row)
+            )
+            if lid != -100
+        ]
+
+    def bio_spans(labels: list[str]) -> dict[tuple[int, int], str]:
+        """BIO sequence → {(start, end_inclusive): entity_type}."""
+        spans: dict[tuple[int, int], str] = {}
+        i = 0
+        while i < len(labels):
+            if labels[i].startswith("B-"):
+                etype = labels[i][2:]
+                j = i + 1
+                while j < len(labels) and labels[j] == f"I-{etype}":
+                    j += 1
+                spans[(i, j - 1)] = etype
+                i = j
+            else:
+                i += 1
+        return spans
+
+    def ctx_string(
+        words: list[str], start: int, end: int, window: int
+    ) -> str:
+        lo = max(0, start - window)
+        hi = min(len(words), end + window + 1)
+        target = " ".join(words[start : end + 1])
+        parts = (
+            (["..."] if lo > 0 else [])
+            + words[lo:start]
+            + [f"<{target}>"]
+            + words[end + 1 : hi]
+            + (["..."] if hi < len(words) else [])
+        )
+        return " ".join(parts)
+
+    # ── Main extraction loop ──────────────────────────────────────────────
+
+    cards: list[dict] = []
+
+    for sample_idx, raw_row in enumerate(dataset):
+        clean_text, _ = _parse_all_spans(raw_row["source_annotated_loanwords"])
+        words: list[str] = clean_text.split()
+        n_words = len(words)
+
+        per_model_triples = [
+            word_triples(
+                run["tokenized"][sample_idx],
+                run["pred_ids"][sample_idx],
+                run["softmax"][sample_idx],
+            )
+            for run in model_runs
+        ]
+
+        if any(len(t) < n_words for t in per_model_triples):
+            click.echo(
+                f"[warn] sample {sample_idx} was truncated "
+                f"({len(per_model_triples[0])}/{n_words} words recovered)",
+                err=True,
+            )
+
+        gold_spans = bio_spans([t[0] for t in per_model_triples[0]])
+        pred_spans_list = [
+            bio_spans([t[1] for t in triples]) for triples in per_model_triples
+        ]
+
+        # Union of every span position across gold + all models
+        all_positions: set[tuple[int, int]] = set(gold_spans)
+        for ps in pred_spans_list:
+            all_positions.update(ps)
+
+        for span_start, span_end in sorted(all_positions):
+            gold_type = gold_spans.get((span_start, span_end))
+
+            entries: list[dict] = []
+            has_error = False
+
+            for run, triples, pred_spans in zip(
+                model_runs, per_model_triples, pred_spans_list
+            ):
+                pred_type = pred_spans.get((span_start, span_end))
+                correct = pred_type == gold_type
+                if not correct:
+                    has_error = True
+
+                span_confs = [
+                    triples[w][2]
+                    for w in range(span_start, min(span_end + 1, len(triples)))
+                ]
+                conf = round(float(np.mean(span_confs)), 4) if span_confs else None
+
+                entries.append(
+                    dict(
+                        name=run["name"],
+                        alias=run["alias"],
+                        pred=pred_type,   # null → model predicted O
+                        correct=correct,
+                        conf=conf,
+                    )
+                )
+
+            if not has_error:
+                continue
+
+            # Classify the span-level error
+            if gold_type is None:
+                error_type = "FP"
+            elif all(e["pred"] is None for e in entries):
+                error_type = "FN"
+            elif any(
+                e["pred"] is not None and e["pred"] != gold_type
+                for e in entries
+            ):
+                error_type = "TYPE"
+            else:
+                # At least one model predicted O at a real entity
+                error_type = "FN"
+
+            if error_type not in wanted:
+                continue
+
+            target_text = " ".join(words[span_start : span_end + 1])
+            cards.append(
+                dict(
+                    error_type=error_type,
+                    ctx=ctx_string(words, span_start, span_end, context_window),
+                    target=target_text,
+                    gold=gold_type,
+                    sample_idx=sample_idx,
+                    sentence=" ".join(words),
+                    lbl=f"err-{error_type.lower()}-{target_text.replace(' ', '-')}-{sample_idx}",
+                    hypothesis=None,  # fill in manually
+                    models=entries,
+                )
+            )
+
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps(cards, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    click.echo(f"Wrote {len(cards)} error cards → {out_path}", err=True)
