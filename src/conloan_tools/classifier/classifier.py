@@ -1047,80 +1047,153 @@ def inspect_errors_cmd(
                 err=True,
             )
 
-        gold_spans = bio_spans([t[0] for t in per_model_triples[0]])
-        pred_spans_list = [
-            bio_spans([t[1] for t in triples]) for triples in per_model_triples
-        ]
+        gold_labels = [t[0] for t in per_model_triples[0]]
+        gold_spans = bio_spans(gold_labels)
 
-        # Union of every span position across gold + all models
-        all_positions: set[tuple[int, int]] = set(gold_spans)
-        for ps in pred_spans_list:
-            all_positions.update(ps)
+        # ── Pass 1: gold-driven (FN / TYPE) ──────────────────────────────
+        if "FN" in wanted or "TYPE" in wanted:
+            for (span_start, span_end), gold_type in sorted(gold_spans.items()):
+                entries: list[dict] = []
+                has_error = False
 
-        for span_start, span_end in sorted(all_positions):
-            gold_type = gold_spans.get((span_start, span_end))
+                for run, triples in zip(model_runs, per_model_triples):
+                    span_preds = []
+                    span_confs = []
+                    for w in range(
+                        span_start, min(span_end + 1, len(triples))
+                    ):
+                        raw_pred = triples[w][1]
+                        span_preds.append(
+                            raw_pred.split("-")[-1] if raw_pred != "O" else "O"
+                        )
+                        span_confs.append(triples[w][2])
 
-            entries: list[dict] = []
-            has_error = False
+                    non_o = [p for p in span_preds if p != "O"]
+                    pred_type = (
+                        max(set(non_o), key=non_o.count) if non_o else None
+                    )
+                    correct = pred_type == gold_type
+                    if not correct:
+                        has_error = True
 
-            for run, triples, pred_spans in zip(
-                model_runs, per_model_triples, pred_spans_list
-            ):
-                pred_type = pred_spans.get((span_start, span_end))
-                correct = pred_type == gold_type
-                if not correct:
-                    has_error = True
+                    conf = (
+                        round(float(np.mean(span_confs)), 4)
+                        if span_confs
+                        else None
+                    )
+                    entries.append(
+                        dict(
+                            name=run["name"],
+                            alias=run["alias"],
+                            pred=pred_type,
+                            correct=correct,
+                            conf=conf,
+                        )
+                    )
 
-                span_confs = [
-                    triples[w][2]
-                    for w in range(span_start, min(span_end + 1, len(triples)))
-                ]
-                conf = round(float(np.mean(span_confs)), 4) if span_confs else None
+                if not has_error:
+                    continue
 
-                entries.append(
+                # TYPE takes precedence when at least one model predicted a
+                # wrong entity type; otherwise every failure is a missed entity
+                error_type = "FN"
+                for e in entries:
+                    if not e["correct"] and e["pred"] is not None:
+                        error_type = "TYPE"
+                        break
+
+                if error_type not in wanted:
+                    continue
+
+                target_text = " ".join(words[span_start : span_end + 1])
+                cards.append(
                     dict(
-                        name=run["name"],
-                        alias=run["alias"],
-                        pred=pred_type,   # null → model predicted O
-                        correct=correct,
-                        conf=conf,
+                        error_type=error_type,
+                        ctx=ctx_string(
+                            words, span_start, span_end, context_window
+                        ),
+                        target=target_text,
+                        gold=gold_type,
+                        sample_idx=sample_idx,
+                        sentence=" ".join(words),
+                        lbl=f"err-{error_type.lower()}-"
+                        f"{target_text.replace(' ', '-')}-{sample_idx}",
+                        hypothesis=None,
+                        models=entries,
                     )
                 )
 
-            if not has_error:
-                continue
+        # ── Pass 2: model-driven (FP) ─────────────────────────────────────
+        if "FP" in wanted:
+            for run, triples in zip(model_runs, per_model_triples):
+                pred_labels = [t[1] for t in triples]
+                model_spans = bio_spans(pred_labels)
 
-            # Classify the span-level error
-            if gold_type is None:
-                error_type = "FP"
-            elif all(e["pred"] is None for e in entries):
-                error_type = "FN"
-            elif any(
-                e["pred"] is not None and e["pred"] != gold_type
-                for e in entries
-            ):
-                error_type = "TYPE"
-            else:
-                # At least one model predicted O at a real entity
-                error_type = "FN"
+                for (span_start, span_end), _ in sorted(model_spans.items()):
+                    # Card is anchored to this model's span; skip if any gold
+                    # label is non-O at those positions (not a pure FP)
+                    gold_at_span = gold_labels[
+                        span_start : min(span_end + 1, len(gold_labels))
+                    ]
+                    if any(g != "O" for g in gold_at_span):
+                        continue
 
-            if error_type not in wanted:
-                continue
+                    entries = []
+                    for other_run, other_triples in zip(
+                        model_runs, per_model_triples
+                    ):
+                        other_preds = []
+                        other_confs = []
+                        for w in range(
+                            span_start,
+                            min(span_end + 1, len(other_triples)),
+                        ):
+                            raw_pred = other_triples[w][1]
+                            other_preds.append(
+                                raw_pred.split("-")[-1]
+                                if raw_pred != "O"
+                                else "O"
+                            )
+                            other_confs.append(other_triples[w][2])
 
-            target_text = " ".join(words[span_start : span_end + 1])
-            cards.append(
-                dict(
-                    error_type=error_type,
-                    ctx=ctx_string(words, span_start, span_end, context_window),
-                    target=target_text,
-                    gold=gold_type,
-                    sample_idx=sample_idx,
-                    sentence=" ".join(words),
-                    lbl=f"err-{error_type.lower()}-{target_text.replace(' ', '-')}-{sample_idx}",
-                    hypothesis=None,  # fill in manually
-                    models=entries,
-                )
-            )
+                        non_o = [p for p in other_preds if p != "O"]
+                        model_pred_type = (
+                            max(set(non_o), key=non_o.count) if non_o else None
+                        )
+                        conf = (
+                            round(float(np.mean(other_confs)), 4)
+                            if other_confs
+                            else None
+                        )
+                        entries.append(
+                            dict(
+                                name=other_run["name"],
+                                alias=other_run["alias"],
+                                pred=model_pred_type,
+                                correct=False,
+                                conf=conf,
+                            )
+                        )
+
+                    target_text = " ".join(words[span_start : span_end + 1])
+                    cards.append(
+                        dict(
+                            error_type="FP",
+                            ctx=ctx_string(
+                                words, span_start, span_end, context_window
+                            ),
+                            target=target_text,
+                            gold=None,
+                            sample_idx=sample_idx,
+                            sentence=" ".join(words),
+                            lbl=f"err-fp-"
+                            f"{target_text.replace(' ', '-')}-{sample_idx}"
+                            f"-{run['alias']}",
+                            hypothesis=None,
+                            anchored_to=run["alias"],
+                            models=entries,
+                        )
+                    )
 
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
