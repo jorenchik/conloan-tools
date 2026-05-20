@@ -146,6 +146,34 @@ class WittenBellCharLM:
         self._byte_score_cache[token] = arr
         return arr
 
+    def trace_word(self, token: str) -> list[tuple[str, int, str, float]]:
+        """Return a list of (char, byte_dec, byte_bin, surprisal) for diagramting."""
+        token = token.lower()
+        pad = b" " * (self.n - 1)
+        
+        char_mapping = []
+        for _ in range(self.n - 1):
+            char_mapping.append("")
+            
+        for ch in token:
+            for _ in ch.encode("utf-8"):
+                char_mapping.append(ch)
+        char_mapping.append(" ")
+        
+        padded = pad + token.encode("utf-8") + b" "
+        trace = []
+
+        for i in range(self.n - 1, len(padded)):
+            ctx = bytes(padded[i - (self.n - 1) : i])
+            char_byte = padded[i]
+            orig_char = char_mapping[i]
+            prob = self.get_probability(ctx, char_byte, self.n)
+            if prob <= 0:
+                prob = 1e-10
+            trace.append((orig_char, char_byte, f"{char_byte:08b}", -math.log2(prob)))
+
+        return trace
+
     def sample_next_byte(self, context: bytes, temperature: float = 1.0) -> int:
         """Sample the next byte value (0-255) at the given temperature."""
         context = context[-(self.n - 1) :] if self.n > 1 else b""
@@ -260,6 +288,7 @@ def interact(wb_pkl):
     click.echo("\n[Modes]")
     click.echo("  g           : generate random words")
     click.echo("  s <word>    : score a specific word (shows all metrics)")
+    click.echo("  d <word>    : diagram trace (shows byte-level surprisals)")
     click.echo("  c <pref>    : complete a word prefix")
     click.echo("  t <float>   : set temperature (current: {})".format(state["temp"]))
     click.echo("  q           : quit")
@@ -303,6 +332,19 @@ def interact(wb_pkl):
                 click.echo(f"Token: {token}")
                 click.echo(f"  Mean Surprisal:    {mean_s:.4f}")
                 click.echo(f"  Geom Mean Prob:    {geom_p:.6f}")
+
+            elif action == 'd':
+                if len(parts) < 2:
+                    click.echo("Usage: d <token>")
+                    continue
+                token = parts[1]
+                trace = lm.trace_word(token)
+                click.echo(f"Diagram Trace: {token}")
+                click.echo(f"  {'Char':^6} | {'Byte Dec':>8} | {'Byte Bin':>8} | {'Surprisal':>9}")
+                click.echo("  " + "-" * 41)
+                for orig_char, b_val, b_bin, surp in trace:
+                    display_char = repr(orig_char) if orig_char == ' ' else orig_char
+                    click.echo(f"  {display_char:^6} | {b_val:8d} | {b_bin:8s} | {surp:9.4f}")
 
             elif action == 'c':
                 if len(parts) < 2:
