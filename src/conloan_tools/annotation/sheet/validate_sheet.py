@@ -355,7 +355,7 @@ def validate_file(input_file: str, mode: str, validate_all: bool = False, warn_u
 )
 @click.option("--verbose", is_flag=True, help="Show detailed error messages.")
 def validate(input_file, mode, validate_all, warn_undecided, verbose):
-    """Validate ConLoan XLSX for tag consistency and numbering."""
+    """Validate ConLoan annotation XLSX."""
     results = validate_file(input_file, mode, validate_all, warn_undecided)
 
     error_rows = [r for r in results if any(e.severity == "error" for e in r.errors)]

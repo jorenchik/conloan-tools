@@ -27,7 +27,7 @@ def classifier() -> None:
 
 @classifier.group("splits")
 def splits_group() -> None:
-    """Build and inspect train/test splits."""
+    """Build splits for training."""
 
 
 @splits_group.command("build")
@@ -399,7 +399,7 @@ def eval_cmd(
 
 @classifier.group("inspect")
 def inspect_group() -> None:
-    """Debug/development inspection tools."""
+    """Inspect model predictions/behavior."""
 
 
 @inspect_group.command("tokens")

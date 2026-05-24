@@ -639,6 +639,7 @@ def build_ner_index_command(
     batch_size, device, ner_output, dtype, no_spos,
     limit_lines, limit_sentences, limit_mb,
 ) -> None:
+    """Compute named entity recognition model logits/classes for each token. Streams to HDF5."""
     from conloan_tools.ner.ner import build_ner_model
 
     click.echo(f"Device {device}")

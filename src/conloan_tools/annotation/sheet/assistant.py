@@ -1564,7 +1564,7 @@ def assistant(
     validate_all,
     output,
 ):
-    """Interactive CLI for loanword annotation management."""
+    """Interactive CLI for annotation assistance."""
     run_assistant(
         list(excel_files),
         language,

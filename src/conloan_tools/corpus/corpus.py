@@ -6,7 +6,7 @@ from .inspect_index import inspect_index
 
 @click.group()
 def corpus():
-    """Corpus utilities."""
+    """Conloan corpus utilities."""
 
 corpus.add_command(query_group)
 corpus.add_command(build_index)
